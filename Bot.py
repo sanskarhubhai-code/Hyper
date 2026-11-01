@@ -770,6 +770,10 @@ class Runtime:
                 self.error = None
                 failures = 0
 
+                # ✅ SABSE PEHLE RESULT SETTLE KARO (TAAKI STICKER PEHLE QUEUE HO)
+                settle_history(self.db, history)
+
+                # Build number ngrams
                 num_ngrams = {}
                 num_freq = {}
                 for i in range(1, len(history)):
@@ -988,18 +992,10 @@ async def main():
 
             LOG.info("%s V18 Started (Recovery Engine enabled)", CFG.name)
 
-            # periodic settlement handling: check after fetch cycle
-            while not runtime.stop.is_set():
-                try:
-                    records = db.history()
-                    if records and len(records) >= CFG.min_history:
-                        settle_history(db, records)
-                    await runtime.pause(2)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    LOG.warning("Settlement cycle error: %s", exc)
-                    await runtime.pause(2)
+            # ✅ Yahan se settlement wala extra loop hata diya gaya hai
+            # kyunki ab settlement worker ke andar ho raha hai (taaki order maintain rahe)
+
+            await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
 
             runtime.stop.set()
             for task in tasks:
