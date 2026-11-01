@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (ADVANCED BEAST ENGINE V25)
+# bot.py — FTW VIP PREDICTOR (BEST PRACTICAL ADVANCED ENGINE V26)
 # Python 3.10+ | aiohttp
 
 import asyncio
@@ -32,7 +32,7 @@ class Config:
     ) or (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_v25.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v26.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -44,7 +44,7 @@ class Config:
     decay: float = 0.988
     max_pattern: int = 20
     delivery_ttl: float = 55.0
-    name: str = "FTW VIP PREDICTOR (ADVANCED V25)"
+    name: str = "FTW VIP PREDICTOR (V26)"
     min_edge: float = float(os.getenv("MIN_EDGE", "0.02"))
     recovery_min_edge: float = float(os.getenv("RECOVERY_MIN_EDGE", "0.01"))
     win_sticker: str = os.getenv("WIN_STICKER", "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E")
@@ -345,7 +345,7 @@ class Database:
         )
 
     def adapt(self, key, probability):
-        # No inversion
+        # no inversion, only proper weighting
         m = self.memory(key)
         n = m["n"]
         if n < 1:
@@ -371,14 +371,13 @@ class Database:
 
     def update_recovery_state(self, settled_result):
         consecutive_losses = int(self.get_value("consecutive_losses", 0))
+
         if settled_result == "LOSS":
             consecutive_losses += 1
         elif settled_result in ("WIN", "JACKPOT"):
             consecutive_losses = 0
 
-        # first loss triggers recovery immediately
         recovery_mode = 1 if consecutive_losses >= 1 else 0
-
         self.set_value("last_result", json.dumps(settled_result))
         self.set_value("consecutive_losses", str(consecutive_losses))
         self.set_value("recovery_mode", str(recovery_mode))
@@ -582,7 +581,6 @@ class Engine:
         evidence = 0.5 * pattern_strength + 0.5 * regime_spread
         gate = evidence >= 0.38 and abs(pattern_score - 0.5) >= 0.06
 
-        # strong reversal is only allowed in extreme evidence
         strong_reversal = (
             regime in ("ALT", "RUN", "IMBAL")
             and abs(pattern_score - 0.5) >= 0.22
@@ -640,15 +638,12 @@ class Engine:
         alpha = min(self.db.get_meta("meta_n", 0) / 100.0, 1.0)
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
 
-        consensus_side, consensus_conf, gate, strong_reversal = self._consensus_signal(
-            experts, patterns, seq, current_regime
-        )
+        consensus_side, consensus_conf, gate, strong_reversal = self._consensus_signal(experts, patterns, seq, current_regime)
 
-        # Recovery mode:
-        # - normal recovery is positive boost
-        # - strong reversal is only a small nudge, not full inversion
+        # recovery with rare strong reversal
         if recovery_mode:
             if strong_reversal:
+                # small reversal nudge, not full inversion
                 p_raw = clip(p_raw - 0.12, 0.05, 0.95)
             elif gate:
                 p_raw = clip(p_raw + 0.12 * min(loss_streak + 1, 5) + 0.05, 0.05, 0.95)
@@ -679,7 +674,6 @@ class Engine:
         side = "BIG" if side_big_score >= 0.5 else "SMALL"
         valid_nums = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
 
-        # Number distribution
         num_dist = [1.0] * 10
         if nums:
             for length in range(min(10, len(nums)), 1, -1):
@@ -1066,7 +1060,7 @@ async def main():
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
 
-            LOG.info("%s V25 Started (Advanced predictive recovery enabled)", CFG.name)
+            LOG.info("%s V26 Started (best practical advanced engine)", CFG.name)
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
 
