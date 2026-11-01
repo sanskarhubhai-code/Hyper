@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (ANTI-COLLAPSE RECOVERY ENGINE V24)
+# bot.py — FTW VIP PREDICTOR (ADVANCED BEAST ENGINE V25)
 # Python 3.10+ | aiohttp
 
 import asyncio
@@ -32,7 +32,7 @@ class Config:
     ) or (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_v24.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v25.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -44,7 +44,7 @@ class Config:
     decay: float = 0.988
     max_pattern: int = 20
     delivery_ttl: float = 55.0
-    name: str = "FTW VIP PREDICTOR (V24)"
+    name: str = "FTW VIP PREDICTOR (ADVANCED V25)"
     min_edge: float = float(os.getenv("MIN_EDGE", "0.02"))
     recovery_min_edge: float = float(os.getenv("RECOVERY_MIN_EDGE", "0.01"))
     win_sticker: str = os.getenv("WIN_STICKER", "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E")
@@ -64,7 +64,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 LOG = logging.getLogger("predictor")
 
 # -----------------------------
-# UTILS
+# COMMON HELPERS
 # -----------------------------
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
@@ -345,7 +345,7 @@ class Database:
         )
 
     def adapt(self, key, probability):
-        # NO inversion at all
+        # No inversion
         m = self.memory(key)
         n = m["n"]
         if n < 1:
@@ -371,13 +371,12 @@ class Database:
 
     def update_recovery_state(self, settled_result):
         consecutive_losses = int(self.get_value("consecutive_losses", 0))
-
         if settled_result == "LOSS":
             consecutive_losses += 1
         elif settled_result in ("WIN", "JACKPOT"):
             consecutive_losses = 0
 
-        # ANTI-COLLAPSE: first loss triggers recovery immediately
+        # first loss triggers recovery immediately
         recovery_mode = 1 if consecutive_losses >= 1 else 0
 
         self.set_value("last_result", json.dumps(settled_result))
@@ -557,7 +556,7 @@ class Engine:
 
     def _consensus_signal(self, experts, patterns, seq, regime):
         if not seq:
-            return 0.5, 0.0, False
+            return 0.5, 0.0, False, False
 
         tail_big = sum(seq[-10:]) / max(1, len(seq[-10:]))
         regime_bias, regime_spread = self._regime_bias(seq, regime)
@@ -582,7 +581,16 @@ class Engine:
 
         evidence = 0.5 * pattern_strength + 0.5 * regime_spread
         gate = evidence >= 0.38 and abs(pattern_score - 0.5) >= 0.06
-        return composite, evidence, gate
+
+        # strong reversal is only allowed in extreme evidence
+        strong_reversal = (
+            regime in ("ALT", "RUN", "IMBAL")
+            and abs(pattern_score - 0.5) >= 0.22
+            and evidence >= 0.62
+            and (tail_big <= 0.35 or tail_big >= 0.65)
+        )
+
+        return composite, evidence, gate, strong_reversal
 
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
@@ -594,7 +602,6 @@ class Engine:
         loss_streak = max(0, int(recovery["consecutive_losses"]))
         recovery_mode = bool(recovery["recovery_mode"]) or loss_streak > 0
 
-        # anti-collapse after first loss
         rec_boost = 1.0 + (0.34 if recovery_mode else 0.0) + (0.15 * min(loss_streak, 6))
 
         adjusted = []
@@ -633,10 +640,17 @@ class Engine:
         alpha = min(self.db.get_meta("meta_n", 0) / 100.0, 1.0)
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
 
-        consensus_side, consensus_conf, gate = self._consensus_signal(experts, patterns, seq, current_regime)
+        consensus_side, consensus_conf, gate, strong_reversal = self._consensus_signal(
+            experts, patterns, seq, current_regime
+        )
 
+        # Recovery mode:
+        # - normal recovery is positive boost
+        # - strong reversal is only a small nudge, not full inversion
         if recovery_mode:
-            if gate:
+            if strong_reversal:
+                p_raw = clip(p_raw - 0.12, 0.05, 0.95)
+            elif gate:
                 p_raw = clip(p_raw + 0.12 * min(loss_streak + 1, 5) + 0.05, 0.05, 0.95)
             else:
                 p_raw = clip(p_raw + 0.06, 0.05, 0.95)
@@ -655,7 +669,9 @@ class Engine:
         if current_regime in ("RUN", "ALT", "IMBAL"):
             side_big_score = clip((side_big_score * 0.75) + (regime_bias * 0.25), 0.05, 0.95)
 
-        if recovery_mode and gate:
+        if recovery_mode and strong_reversal:
+            side_big_score = clip(side_big_score - 0.10, 0.05, 0.95)
+        elif recovery_mode and gate:
             side_big_score = clip(side_big_score + 0.06 * min(loss_streak + 1, 4), 0.05, 0.95)
         elif recovery_mode:
             side_big_score = clip(side_big_score + 0.03, 0.05, 0.95)
@@ -663,7 +679,7 @@ class Engine:
         side = "BIG" if side_big_score >= 0.5 else "SMALL"
         valid_nums = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
 
-        # Number selection with strong recent signal
+        # Number distribution
         num_dist = [1.0] * 10
         if nums:
             for length in range(min(10, len(nums)), 1, -1):
@@ -715,12 +731,13 @@ class Engine:
             "edge": edge,
             "confidence": confidence,
             "regime": current_regime,
-            "source": "🧠 Anti-Collapse Recovery" if recovery_mode else "📊 Statistical Ensemble",
+            "source": "🧠 Advanced Recovery Engine" if recovery_mode else "📊 Statistical Ensemble",
             "patterns": [{"key": k, "p": p, "support": s} for _, p, s, _, k in patterns],
             "experts": experts,
             "features": features,
             "meta_feats": m_feats,
             "recovery_mode": recovery_mode,
+            "strong_reversal": strong_reversal,
             "recovery_gate": gate,
         }
 
@@ -764,7 +781,10 @@ def format_prediction(p):
 
     rec_txt = ""
     if p.get("recovery_mode"):
-        rec_txt = "\n⚡ <b>RECOVERY:</b> ACTIVE"
+        if p.get("strong_reversal"):
+            rec_txt = "\n⚡ <b>STRONG REVERSAL:</b> ACTIVE"
+        else:
+            rec_txt = "\n⚡ <b>RECOVERY:</b> ACTIVE"
 
     return (
         f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
@@ -1046,7 +1066,7 @@ async def main():
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
 
-            LOG.info("%s V24 Started (Anti-collapse recovery enabled)", CFG.name)
+            LOG.info("%s V25 Started (Advanced predictive recovery enabled)", CFG.name)
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
 
