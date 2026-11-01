@@ -42,8 +42,8 @@ from aiohttp import web
 # -----------------------------
 @dataclass(frozen=True)
 class Config:
-    token: str = os.getenv("BOT_TOKEN", "REPLACE_ME")
-    chat: str = os.getenv("CHAT_ID", "-1000000000000")
+    token: str = os.getenv("BOT_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
+    chat: str = os.getenv("CHAT_ID", "-1004485961768")
     urls: tuple = tuple(
         x.strip()
         for x in os.getenv("HISTORY_URLS", "").split(",")
