@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V18 — Ultra Recovery Engine)
+# bot.py — FTW VIP PREDICTOR (MONSTER V20 — Ultra Recovery Engine)
 # Python 3.10+ | aiohttp
 
 import asyncio
@@ -33,21 +33,21 @@ class Config:
     ) or (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v18.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_monster_v20.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
-    max_history: int = 4000
+    max_history: int = 5000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
-    learning_rate: float = 0.04
-    meta_lr: float = 0.035
-    decay: float = 0.985
-    max_pattern: int = 18
-    delivery_ttl: float = 45.0
-    name: str = "FTW VIP PREDICTOR (HYPER V18)"
-    min_edge: float = float(os.getenv("MIN_EDGE", "0.03"))
-    recovery_min_edge: float = float(os.getenv("RECOVERY_MIN_EDGE", "0.015"))
+    learning_rate: float = 0.05
+    meta_lr: float = 0.045
+    decay: float = 0.988
+    max_pattern: int = 20
+    delivery_ttl: float = 55.0
+    name: str = "FTW VIP PREDICTOR (MONSTER V20)"
+    min_edge: float = float(os.getenv("MIN_EDGE", "0.02"))
+    recovery_min_edge: float = float(os.getenv("RECOVERY_MIN_EDGE", "0.01"))
     win_sticker: str = os.getenv("WIN_STICKER", "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E")
     loss_sticker: str = os.getenv("LOSS_STICKER", "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E")
     jack_sticker: str = os.getenv("JACK_STICKER", "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E")
@@ -198,8 +198,10 @@ def trend_features(seq):
         autocorr,
     ]
 
-EXPERT_NAMES = ["patterns", "markov1", "markov2", "markov3", "markov4",
-                "run", "regime", "base", "neighbors", "trend", "momentum", "cyclic"]
+EXPERT_NAMES = [
+    "patterns", "markov1", "markov2", "markov3", "markov4",
+    "run", "regime", "base", "neighbors", "trend", "momentum", "cyclic"
+]
 
 def logistic(weights, features):
     return sigmoid(sum(w * x for w, x in zip(weights, features)))
@@ -273,6 +275,9 @@ class Database:
         self.set_value("last_result", '"NONE"')
         self.set_value("consecutive_losses", "0")
         self.set_value("recovery_mode", "0")
+        self.set_value("last_issue", '"NONE"')
+        self.set_value("last_side", '"NONE"')
+        self.set_value("last_num", "0")
 
     @contextmanager
     def transaction(self):
@@ -344,7 +349,7 @@ class Database:
         m = self.memory(key)
         n = m["n"]
         if n < 1:
-            return probability, 0.65, False
+            return probability, 0.75, False
         brier = m["loss"] / n
         inv = m["inverse_loss"] / n
         flipped = (inv + 0.02 < brier) and (brier > 0.24) and (m["failures"] >= 3)
@@ -352,11 +357,11 @@ class Database:
         p = (1 - probability) if flipped else probability
 
         reliability = clip((0.25 - effective_loss) / 0.10, 0.0, 1.0)
-        maturity = min(n / 40.0, 1.0)
+        maturity = min(n / 50.0, 1.0)
         shrink = (1 - maturity) * 0.65 + maturity * reliability
         p = 0.5 + (p - 0.5) * shrink
 
-        weight = clip(math.exp(-6 * (effective_loss - 0.22)), 0.20, 2.0)
+        weight = clip(math.exp(-6 * (effective_loss - 0.22)), 0.18, 2.8)
         if m["failures"] >= 4 and not flipped:
             weight *= 0.5
         return clip(p), weight, flipped
@@ -368,17 +373,14 @@ class Database:
         )
 
     def update_recovery_state(self, settled_result):
-        last_result = self.get_value("last_result", "NONE")
         consecutive_losses = int(self.get_value("consecutive_losses", 0))
-
         if settled_result == "LOSS":
             consecutive_losses += 1
         elif settled_result in ("WIN", "JACKPOT"):
             consecutive_losses = 0
 
-        # Recovery immediately after first loss
+        # first loss triggers recovery immediately
         recovery_mode = 1 if consecutive_losses >= 1 else 0
-
         self.set_value("last_result", json.dumps(settled_result))
         self.set_value("consecutive_losses", str(consecutive_losses))
         self.set_value("recovery_mode", str(recovery_mode))
@@ -419,7 +421,7 @@ class Engine:
         runs = self.get_runs(seq)
         if len(runs) < 2:
             return []
-        for k in range(min(8, len(runs)), 1, -1):
+        for k in range(min(10, len(runs)), 1, -1):
             target = runs[-k:]
             observations = []
             for i in range(len(runs) - k - 1, -1, -1):
@@ -441,7 +443,7 @@ class Engine:
         candidates = {}
 
         def weight(idx):
-            return 0.5 ** ((n - 1 - idx) / 300.0)
+            return 0.5 ** ((n - 1 - idx) / 280.0)
 
         for length in range(5, min(CFG.max_pattern, n // 2) + 1):
             if n < length * 2:
@@ -457,14 +459,16 @@ class Engine:
                 p, eff_n = weighted_probability(obs)
                 if eff_n >= CFG.min_support * 0.5:
                     bits = "".join("B" if x else "S" for x in suffix)
-                    candidates[f"exact:{bits}"] = (
+                    key = f"exact:{bits}"
+                    candidates[key] = (
                         abs(p - 0.5) * math.sqrt(eff_n),
                         p,
                         len(obs),
                         eff_n,
-                        f"exact:{bits}",
+                        key,
                     )
-        return sorted(candidates.values(), key=lambda x: x[0], reverse=True)[:10]
+
+        return sorted(candidates.values(), key=lambda x: x[0], reverse=True)[:12]
 
     def mine_experts(self, seq):
         experts = {}
@@ -579,15 +583,16 @@ class Engine:
         loss_streak = max(0, int(recovery["consecutive_losses"]))
         recovery_mode = bool(recovery["recovery_mode"]) or loss_streak > 0
 
-        rec_boost = 1.0 + (0.30 if recovery_mode else 0.0) + (0.14 * min(loss_streak, 6))
+        # Recovery boost: after one loss, become much more aggressive
+        rec_boost = 1.0 + (0.38 if recovery_mode else 0.0) + (0.18 * min(loss_streak, 6))
 
         adjusted = []
         for name, p in experts.items():
             corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p)
             if name == "patterns":
-                weight *= 2.8
+                weight *= 3.0
             if name in ("momentum", "run", "trend"):
-                weight *= 1.8
+                weight *= 1.9
             if recovery_mode:
                 weight *= rec_boost
             adjusted.append((corrected, weight))
@@ -595,14 +600,16 @@ class Engine:
         total_w = sum(w for _, w in adjusted)
         p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
 
+        # Meta feature expansion
         m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES]
 
-        # Extra deep recovery features
         if seq:
             tail_big = sum(seq[-10:]) / max(1, len(seq[-10:]))
-            momentum_shift = 0.5 + ((sum(seq[-5:]) / 5.0) - 0.5) * 0.8
+            tail_short = sum(seq[-5:]) / max(1, len(seq[-5:]))
+            regime_shift = 0.5 + ((tail_big - 0.5) * 0.95)
+            momentum_shift = 0.5 + ((tail_short - 0.5) * 0.8)
             m_feats += [
-                logit(clip(0.5 + (tail_big - 0.5) * 0.9, 0.05, 0.95)),
+                logit(clip(regime_shift, 0.05, 0.95)),
                 logit(clip(momentum_shift, 0.05, 0.95)),
             ]
         else:
@@ -618,20 +625,31 @@ class Engine:
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
 
         if recovery_mode:
-            p_raw = clip(p_raw + 0.12 * min(loss_streak + 1, 5) + 0.03, 0.05, 0.95)
+            p_raw = clip(p_raw + 0.15 * min(loss_streak + 1, 5) + 0.04, 0.05, 0.95)
 
         if len(seq) >= 8:
             last = seq[-1]
             if get_regime(seq[:-1]) != current_regime:
-                p_raw = clip(p_raw + 0.04 if last == 1 else -0.04, 0.05, 0.95)
+                p_raw = clip(p_raw + 0.05 if last == 1 else -0.05, 0.05, 0.95)
 
+        # calibration
         bucket = min(19, max(0, int(p_raw * 20)))
         n_g, s_g = self.db.get_meta(f"cal20:global:{bucket}", [0.0, 0.0])
-        p_cal = clip((35 * p_raw + s_g) / (35 + n_g))
+        p_cal = clip((40 * p_raw + s_g) / (40 + n_g))
 
         side = "BIG" if p_cal >= 0.5 else "SMALL"
         valid_nums = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
 
+        # strong side bias after losses
+        if recovery_mode and loss_streak >= 1:
+            # overweight side that is historically more probable in current regime
+            if current_regime in ("RUN", "ALT"):
+                side = "BIG" if p_cal >= 0.48 else "SMALL"
+            elif current_regime in ("IMBAL", "MIXED"):
+                side = "BIG" if p_cal >= 0.52 else "SMALL"
+            valid_nums = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
+
+        # number distribution
         num_dist = [1.0] * 10
         if nums:
             for length in range(min(10, len(nums)), 1, -1):
@@ -640,9 +658,21 @@ class Engine:
                 if trans:
                     total = sum(trans.values())
                     if total >= 3:
-                        w = min(1.0, total / 18.0) * (0.95 ** (length - 2))
+                        w = min(1.0, total / 18.0) * (0.96 ** (length - 2))
                         for i in range(10):
                             num_dist[i] *= (1 - w) + (trans.get(str(i), 0) / total) * w
+
+        # strong number bias after loss streak
+        if recovery_mode and loss_streak >= 1:
+            last_num = self.db.get_value("last_num", 0)
+            if isinstance(last_num, int):
+                num_dist[last_num] *= (1.5 + 0.35 * min(loss_streak, 4))
+            # also boost central numbers around the recent tail
+            if nums:
+                recent = nums[-8:]
+                if recent:
+                    for x in recent:
+                        num_dist[x] *= 1.25
 
         total_dist = sum(num_dist)
         if total_dist <= 0:
@@ -651,12 +681,15 @@ class Engine:
 
         probs = [x / total_dist for x in num_dist]
         choices = [i for i in valid_nums if probs[i] > 0]
-        num_pred = max(choices, key=lambda x: probs[x]) if choices else (9 if side == "BIG" else 4)
+        if not choices:
+            choices = list(range(0, 10))
+        num_pred = max(choices, key=lambda x: probs[x])
 
         edge = abs(p_cal - 0.5)
         confidence = max(p_cal, 1 - p_cal)
+
         if recovery_mode:
-            confidence = min(0.99, confidence + 0.05)
+            confidence = min(0.99, confidence + 0.06)
             edge = max(edge, 0.12)
 
         return {
@@ -668,7 +701,7 @@ class Engine:
             "edge": edge,
             "confidence": confidence,
             "regime": current_regime,
-            "source": "🧠 Recovery Ensemble" if recovery_mode else "📊 Statistical Ensemble",
+            "source": "🧠 Ultra Recovery Ensemble" if recovery_mode else "📊 Statistical Ensemble",
             "patterns": [{"key": k, "p": p, "support": s} for _, p, s, _, k in patterns],
             "experts": experts,
             "features": features,
@@ -780,7 +813,7 @@ class Runtime:
                 self.error = None
                 failures = 0
 
-                # settle as soon as valid data arrives
+                # settle instantly
                 settle_history(self.db, history)
 
                 # Build number ngrams
@@ -807,11 +840,18 @@ class Runtime:
                         if not exists:
                             p = self.engine.predict(history, issue)
                             payload = json.dumps(p)
+
+                            # Never skip, always generate prediction
                             self.db.c.execute(
                                 "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
                                 (issue, time.time(), "PENDING", payload)
                             )
                             self.db.queue("prediction", issue, format_prediction(p), time.time() + CFG.delivery_ttl)
+
+                            # save last prediction metadata
+                            self.db.set_value("last_issue", json.dumps(issue))
+                            self.db.set_value("last_side", json.dumps(p["side"]))
+                            self.db.set_value("last_num", str(p["num"]))
 
             except asyncio.CancelledError:
                 raise
@@ -911,12 +951,14 @@ def settle_history(db, history):
                 (final_status, actual_num, issue)
             )
 
+            # Learn from experts
             for name, val in payload.get("experts", {}).items():
                 db.learn(f"expert:{name}:{payload.get('regime', 'N/A')}", val, int(actual["size"]))
 
             for pat in payload.get("patterns", []):
                 db.learn(pat["key"], pat["p"], int(actual["size"]))
 
+            # trend update
             features = payload.get("features", [])
             if features and payload.get("experts", {}).get("trend") is not None:
                 err = int(actual["size"]) - payload["experts"]["trend"]
@@ -926,6 +968,7 @@ def settle_history(db, history):
                      for w, x in zip(tw, features)]
                 )
 
+            # meta update
             meta_feats = payload.get("meta_feats", [])
             mw = db.get_meta("meta_weights")
             if not isinstance(mw, list) or len(mw) != len(meta_feats):
@@ -939,9 +982,15 @@ def settle_history(db, history):
                 )
                 db.set_meta("meta_n", int(db.get_meta("meta_n", 0)) + 1)
 
+            # calibration update
             bucket = min(19, int(payload.get("p_raw", payload["p"]) * 20))
             n, s = db.get_meta(f"cal20:global:{bucket}", [0.0, 0.0])
             db.set_meta(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + int(actual["size"])])
+
+            # record last settled values
+            db.set_value("last_issue", json.dumps(issue))
+            db.set_value("last_side", json.dumps(actual_side))
+            db.set_value("last_num", str(actual_num))
 
             if won_side and won_num:
                 db.update_recovery_state("WIN")
@@ -989,7 +1038,7 @@ async def main():
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
 
-            LOG.info("%s V18 Started (Ultra Recovery Engine enabled)", CFG.name)
+            LOG.info("%s V20 Started (Monster Recovery Engine enabled)", CFG.name)
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
 
