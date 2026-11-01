@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (ANTI-BLIND-INVERSE MONSTER V20)
+# bot.py — FTW VIP PREDICTOR (ULTRA PRODUCTION V22)
 # Python 3.10+ | aiohttp
 
 import asyncio
@@ -32,7 +32,7 @@ class Config:
     ) or (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_monster_v20.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_ultra_v22.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -44,7 +44,7 @@ class Config:
     decay: float = 0.988
     max_pattern: int = 20
     delivery_ttl: float = 55.0
-    name: str = "FTW VIP PREDICTOR (MONSTER V20)"
+    name: str = "FTW VIP PREDICTOR (ULTRA V22)"
     min_edge: float = float(os.getenv("MIN_EDGE", "0.02"))
     recovery_min_edge: float = float(os.getenv("RECOVERY_MIN_EDGE", "0.01"))
     win_sticker: str = os.getenv("WIN_STICKER", "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E")
@@ -64,7 +64,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 LOG = logging.getLogger("predictor")
 
 # -----------------------------
-# COMMON HELPERS
+# CORE HELPERS
 # -----------------------------
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
@@ -277,6 +277,7 @@ class Database:
         self.set_value("last_issue", '"NONE"')
         self.set_value("last_side", '"NONE"')
         self.set_value("last_num", "0")
+        self.set_value("last_prediction_density", "0.0")
 
     @contextmanager
     def transaction(self):
@@ -353,8 +354,7 @@ class Database:
         brier = m["loss"] / n
         inv = m["inverse_loss"] / n
 
-        # IMPORTANT: DO NOT blindly invert. Only allow flip if model is genuinely anti-correlated
-        # and persistent at the same regime/pattern group. This avoids fake recovery noise.
+        # strict anti-fail filter: never blindly invert
         flipped = (
             (inv + 0.02 < brier)
             and (brier > 0.24)
@@ -389,7 +389,6 @@ class Database:
         elif settled_result in ("WIN", "JACKPOT"):
             consecutive_losses = 0
 
-        # first loss triggers recovery immediately
         recovery_mode = 1 if consecutive_losses >= 1 else 0
         self.set_value("last_result", json.dumps(settled_result))
         self.set_value("consecutive_losses", str(consecutive_losses))
@@ -569,6 +568,37 @@ class Engine:
 
         return clip(bias, 0.05, 0.95), spread
 
+    def _recovery_consensus(self, experts, patterns, seq, regime):
+        # evidence-gated: only yes if enough cross-signal agreement
+        if not seq:
+            return 0.5, 0.0, False
+
+        tail_big = sum(seq[-10:]) / max(1, len(seq[-10:]))
+        regime_bias, regime_spread = self._regime_side_bias(seq, regime)
+
+        pattern_score = 0.5
+        pattern_strength = 0.0
+        if patterns:
+            top = patterns[0]
+            if isinstance(top, tuple):
+                p_val = top[1]
+            else:
+                p_val = top.get("p", 0.5)
+            pattern_score = p_val
+            pattern_strength = min(1.0, abs(p_val - 0.5) * 2.0)
+
+        composite = (
+            0.45 * (0.5 + (tail_big - 0.5) * 0.9)
+            + 0.35 * pattern_score
+            + 0.20 * regime_bias
+        )
+        composite = clip(composite, 0.05, 0.95)
+
+        evidence = 0.5 * pattern_strength + 0.5 * regime_spread
+        gate = evidence >= 0.42 and abs(pattern_score - 0.5) >= 0.08
+
+        return composite, evidence, gate
+
     def _predict_number(self, seq_nums):
         freq = self.db.get_meta("num_freq", {})
         ngram_db = self.db.get_meta("num_ngrams", {})
@@ -610,8 +640,7 @@ class Engine:
         loss_streak = max(0, int(recovery["consecutive_losses"]))
         recovery_mode = bool(recovery["recovery_mode"]) or loss_streak > 0
 
-        # Recovery adds force but does NOT invert blindly
-        rec_boost = 1.0 + (0.28 if recovery_mode else 0.0) + (0.15 * min(loss_streak, 6))
+        rec_boost = 1.0 + (0.34 if recovery_mode else 0.0) + (0.15 * min(loss_streak, 6))
 
         adjusted = []
         for name, p in experts.items():
@@ -627,7 +656,7 @@ class Engine:
         total_w = sum(w for _, w in adjusted)
         p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
 
-        # Meta features
+        # meta features
         m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES]
 
         if seq:
@@ -651,10 +680,14 @@ class Engine:
         alpha = min(self.db.get_meta("meta_n", 0) / 100.0, 1.0)
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
 
-        if recovery_mode:
-            p_raw = clip(p_raw + 0.12 * min(loss_streak + 1, 5) + 0.04, 0.05, 0.95)
+        # evidence gate for recovery
+        consensus_side, consensus_conf, gate = self._recovery_consensus(experts, patterns, seq, current_regime)
 
-        # regime-based adjustment, not inversion
+        if recovery_mode and gate:
+            p_raw = clip(p_raw + 0.15 * min(loss_streak + 1, 5) + 0.04, 0.05, 0.95)
+        elif recovery_mode:
+            p_raw = clip(p_raw + 0.03, 0.05, 0.95)
+
         if len(seq) >= 8:
             last = seq[-1]
             if get_regime(seq[:-1]) != current_regime:
@@ -664,7 +697,7 @@ class Engine:
         n_g, s_g = self.db.get_meta(f"cal20:global:{bucket}", [0.0, 0.0])
         p_cal = clip((38 * p_raw + s_g) / (38 + n_g))
 
-        # Side blending with regime-aware bias instead of inversion
+        # side selection with evidence and regime bias
         side_big_score = p_cal
         side_small_score = 1.0 - p_cal
 
@@ -673,9 +706,13 @@ class Engine:
             side_big_score = clip((side_big_score * 0.75) + (regime_bias * 0.25), 0.05, 0.95)
             side_small_score = 1.0 - side_big_score
 
+        if recovery_mode and gate:
+            side_big_score = clip(side_big_score + 0.04 * min(loss_streak + 1, 4), 0.05, 0.95)
+
         side = "BIG" if side_big_score >= 0.5 else "SMALL"
         valid_nums = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
 
+        # number distribution
         num_dist = [1.0] * 10
         if nums:
             for length in range(min(10, len(nums)), 1, -1):
@@ -688,7 +725,7 @@ class Engine:
                         for i in range(10):
                             num_dist[i] *= (1 - w) + (trans.get(str(i), 0) / total) * w
 
-        # recovery-specific number stabilization (no blind inversion)
+        # recovery stabilization without fake inversion
         if recovery_mode and loss_streak >= 1:
             if nums:
                 recent = nums[-8:]
@@ -714,7 +751,6 @@ class Engine:
 
         edge = abs(p_cal - 0.5)
         confidence = max(p_cal, 1 - p_cal)
-
         if recovery_mode:
             confidence = min(0.99, confidence + 0.06)
             edge = max(edge, 0.12)
@@ -728,12 +764,14 @@ class Engine:
             "edge": edge,
             "confidence": confidence,
             "regime": current_regime,
-            "source": "🧠 Recovery Consensus" if recovery_mode else "📊 Statistical Ensemble",
+            "source": "🧠 Evidence-Gated Recovery" if recovery_mode else "📊 Statistical Ensemble",
             "patterns": [{"key": k, "p": p, "support": s} for _, p, s, _, k in patterns],
             "experts": experts,
             "features": features,
             "meta_feats": m_feats,
             "recovery_mode": recovery_mode,
+            "recovery_gate": gate,
+            "recovery_confidence": consensus_conf,
         }
 
 # -----------------------------
@@ -776,7 +814,7 @@ def format_prediction(p):
 
     rec_txt = ""
     if p.get("recovery_mode"):
-        rec_txt = "\n⚡ <b>RECOVERY MODE:</b> ACTIVE"
+        rec_txt = "\n⚡ <b>RECOVERY:</b> ACTIVE"
 
     return (
         f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
@@ -842,10 +880,8 @@ class Runtime:
                 self.error = None
                 failures = 0
 
-                # settle as soon as valid history arrives
                 settle_history(self.db, history)
 
-                # Build number ngrams
                 num_ngrams = {}
                 num_freq = {}
                 for i in range(1, len(history)):
@@ -870,7 +906,6 @@ class Runtime:
                             p = self.engine.predict(history, issue)
                             payload = json.dumps(p)
 
-                            # NEVER SKIP: always produce prediction for valid period
                             self.db.c.execute(
                                 "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
                                 (issue, time.time(), "PENDING", payload)
@@ -950,7 +985,7 @@ class Runtime:
         })
 
 # -----------------------------
-# SETTLEMENT LOGIC
+# SETTLEMENT
 # -----------------------------
 def settle_history(db, history):
     pending = db.c.execute(
@@ -1061,7 +1096,7 @@ async def main():
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
 
-            LOG.info("%s V20 Started (Anti-blind-inverse recovery engine enabled)", CFG.name)
+            LOG.info("%s V22 Started (Ultra production evidence-gated engine enabled)", CFG.name)
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
 
