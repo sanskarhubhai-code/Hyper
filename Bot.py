@@ -1,11 +1,5 @@
 # bot.py — FTW VIP PREDICTOR (HYPER V18 — Statistical Recovery Engine)
 # Python 3.10+ | aiohttp
-#
-# NOTE:
-# - NEVER hardcode secrets. Use .env or environment variables.
-# - This version adds a "recovery mode" after a loss:
-#   next prediction is forced to use higher-precision experts and stronger weight boost
-#   while staying statistically grounded.
 
 import asyncio
 import contextlib
@@ -24,7 +18,6 @@ from dataclasses import dataclass
 
 import aiohttp
 from aiohttp import web
-
 
 # -----------------------------
 # CONFIG
@@ -67,11 +60,9 @@ class Config:
         if not self.urls:
             raise ValueError("History URLs are missing")
 
-
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("predictor")
-
 
 # -----------------------------
 # UTILS
@@ -79,27 +70,22 @@ LOG = logging.getLogger("predictor")
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
 
-
 def logit(p, eps=0.02):
     p = max(eps, min(1 - eps, float(p)))
     return math.log(p / (1 - p))
-
 
 def sigmoid(z):
     z = max(-20.0, min(20.0, float(z)))
     return 1.0 / (1.0 + math.exp(-z))
 
-
 def escape(x):
     return html.escape(str(x))
-
 
 def numeric(value):
     if isinstance(value, bool):
         return None
     text = str(value).strip()
     return int(text) if text.isascii() and text.isdigit() else None
-
 
 def run_length(seq):
     if not seq:
@@ -111,7 +97,6 @@ def run_length(seq):
             break
         n += 1
     return n
-
 
 def get_regime(seq):
     tail = seq[-24:]
@@ -127,7 +112,6 @@ def get_regime(seq):
         return "IMBAL"
     return "MIXED"
 
-
 def weighted_probability(observations):
     sw = sum(w for _, w in observations)
     sw2 = sum(w * w for _, w in observations)
@@ -136,7 +120,6 @@ def weighted_probability(observations):
         return 0.5, 0.0
     probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
     return probability, effective_n
-
 
 def trend_features(seq):
     if not seq:
@@ -215,13 +198,11 @@ def trend_features(seq):
         autocorr,
     ]
 
-
 EXPERT_NAMES = ["patterns", "markov1", "markov2", "markov3", "markov4",
                 "run", "regime", "base", "neighbors", "trend", "momentum", "cyclic"]
 
 def logistic(weights, features):
     return sigmoid(sum(w * x for w, x in zip(weights, features)))
-
 
 # -----------------------------
 # HISTORY PARSER
@@ -256,7 +237,6 @@ def parse_history(payload):
         records[key] = {"issue": key, "num": number, "size": int(number >= 5)}
     return sorted(records.values(), key=lambda x: int(x["issue"]))
 
-
 # -----------------------------
 # DATABASE
 # -----------------------------
@@ -282,7 +262,6 @@ class Database:
             );
         """)
 
-        # recovery state
         self.c.execute("""
             CREATE TABLE IF NOT EXISTS state(
                 key TEXT PRIMARY KEY,
@@ -290,7 +269,6 @@ class Database:
             )
         """)
 
-        # create default state
         self.set_value("meta_n", "0")
         self.set_value("last_result", '"NONE"')
         self.set_value("consecutive_losses", "0")
@@ -362,7 +340,6 @@ class Database:
             (key, n, loss, inv, failures)
         )
 
-    # adaptive shrink for model reliability
     def adapt(self, key, probability):
         m = self.memory(key)
         n = m["n"]
@@ -374,7 +351,6 @@ class Database:
         effective_loss = inv if flipped else brier
         p = (1 - probability) if flipped else probability
 
-        # reliability: better if effective loss is below random 0.25
         reliability = clip((0.25 - effective_loss) / 0.10, 0.0, 1.0)
         maturity = min(n / 40.0, 1.0)
         shrink = (1 - maturity) * 0.65 + maturity * reliability
@@ -392,7 +368,6 @@ class Database:
         )
 
     def update_recovery_state(self, settled_result):
-        # settled_result can be "WIN", "LOSS", or None
         last_result = self.get_value("last_result", "NONE")
         consecutive_losses = int(self.get_value("consecutive_losses", 0))
 
@@ -400,10 +375,7 @@ class Database:
             consecutive_losses += 1
         elif settled_result == "WIN":
             consecutive_losses = 0
-        else:
-            consecutive_losses = consecutive_losses
 
-        # recovery mode is active after a loss
         recovery_mode = 1 if consecutive_losses >= 1 else 0
         self.set_value("last_result", json.dumps(settled_result))
         self.set_value("consecutive_losses", str(consecutive_losses))
@@ -415,7 +387,6 @@ class Database:
             "consecutive_losses": int(self.get_value("consecutive_losses", 0)),
             "recovery_mode": int(self.get_value("recovery_mode", 0)),
         }
-
 
 # -----------------------------
 # ENGINE
@@ -556,7 +527,6 @@ class Engine:
         momentum = sum(seq[-5:]) / 5.0 if seq else 0.5
         experts["momentum"] = 0.2 + (momentum * 0.6)
 
-        # cyclic heuristic
         cyc = 0.5
         if len(seq) >= 8:
             diff = abs(sum(seq[-4:]) - sum(seq[-8:-4]))
@@ -602,7 +572,6 @@ class Engine:
 
         experts, patterns, features, current_regime = self.mine_experts(seq)
 
-        # recovery boost:
         recovery = self.db.get_recovery_state()
         recovery_mode = bool(recovery["recovery_mode"])
         rec_boost = 1.0 + (0.18 if recovery_mode else 0.0) + (0.10 * min(recovery["consecutive_losses"], 4))
@@ -621,19 +590,15 @@ class Engine:
         total_w = sum(w for _, w in adjusted)
         p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
 
-        # meta blend
         m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES]
-        # Number side signal
         dist = self._predict_number(nums)
         ngram_big_prob = sum([self.db.get_meta("num_ngrams", {}).get(",".join(str(x) for x in nums[-8:]), {}).get(str(i), 0) for i in range(5, 10)]) / max(1, sum(self.db.get_meta("num_ngrams", {}).get(",".join(str(x) for x in nums[-8:]), {}).values()))
-        # More stable numeric side estimation
         tail_big = sum(nums[-10:]) / max(1, len(nums[-10:])) if nums else 0.5
         big_signal = clip(0.5 + (tail_big - 0.5) * 0.8 + (dist[1] - 0.5) * 0.4, 0.05, 0.95)
         m_feats += [logit(big_signal), 1.0]
 
         mw = self.db.get_meta("meta_weights")
         if not isinstance(mw, list) or len(mw) != len(m_feats):
-            # sane default initialization
             mw = [1.0 / len(EXPERT_NAMES)] * len(EXPERT_NAMES) + [0.5, 0.0]
 
         p_meta = sigmoid(sum(w * f for w, f in zip(mw, m_feats)))
@@ -643,7 +608,6 @@ class Engine:
         if recovery_mode:
             p_raw = clip(p_raw + 0.05 * rec_boost, 0.05, 0.95)
 
-        # Stronger regime transition handling
         if len(seq) >= 8:
             last = seq[-1]
             if get_regime(seq[:-1]) != current_regime:
@@ -653,11 +617,9 @@ class Engine:
         n_g, s_g = self.db.get_meta(f"cal20:global:{bucket}", [0.0, 0.0])
         p_cal = clip((30 * p_raw + s_g) / (30 + n_g))
 
-        # Side decision
         side = "BIG" if p_cal >= 0.5 else "SMALL"
         valid_nums = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
 
-        # number distribution from ngrams + recent bias
         num_dist = [1.0] * 10
         if nums:
             for length in range(min(10, len(nums)), 1, -1):
@@ -683,7 +645,6 @@ class Engine:
             choices = [i for i in valid_nums if probs[i] > 0]
             num_pred = max(choices, key=lambda x: probs[x]) if choices else 4
 
-        # recover confidence after loss -> stronger predictive bias
         edge = abs(p_cal - 0.5)
         confidence = max(p_cal, 1 - p_cal)
         if recovery_mode:
@@ -707,16 +668,22 @@ class Engine:
             "recovery_mode": recovery_mode,
         }
 
-
+# ✅ FIXED: Ye function ab naye dictionary format ko support karta hai
 def _pattern_str(patterns):
     if not patterns:
         return "None"
     top = patterns[0]
-    key = top[4]
+    
+    if isinstance(top, dict):
+        key = top.get("key", "")
+        p_val = top.get("p", 0.5)
+    else:
+        key = top[4]
+        p_val = top[1]
+        
     bits = key.split(":")[-1]
-    arrow = "⬆️" if top[1] >= 0.5 else "⬇️"
+    arrow = "⬆️" if p_val >= 0.5 else "⬇️"
     return f"<code>{bits}</code> {arrow}"
-
 
 # -----------------------------
 # FORMATTER
@@ -752,7 +719,6 @@ def format_prediction(p):
         f"📐 <b>EDGE:</b> {p.get('edge', 0) * 100:.1f}%{rec_txt}{shift}{pattern_text}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
-
 
 # -----------------------------
 # RUNTIME
@@ -804,7 +770,6 @@ class Runtime:
                 self.error = None
                 failures = 0
 
-                # build number ngrams
                 num_ngrams = {}
                 num_freq = {}
                 for i in range(1, len(history)):
@@ -829,20 +794,16 @@ class Runtime:
                             recovery_state = self.db.get_recovery_state()
                             p = self.engine.predict(history, issue)
 
-                            # skip only when confidence is extremely weak, unless recovery mode active
                             edge_needed = CFG.recovery_min_edge if recovery_state["recovery_mode"] else CFG.min_edge
                             if p is not None and p["edge"] < edge_needed and not recovery_state["recovery_mode"]:
                                 LOG.info("Skipping %s (edge %.3f below threshold)", issue, p["edge"])
-                                # FIXED: Removed extra None from tuple
                                 self.db.c.execute(
                                     "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
                                     (issue, time.time(), "SKIP", json.dumps({"skipped": True}))
                                 )
                                 self.db.update_recovery_state("NONE")
                             elif p is not None:
-                                # queue prediction
                                 payload = json.dumps(p)
-                                # FIXED: Removed extra None from tuple
                                 self.db.c.execute(
                                     "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
                                     (issue, time.time(), "PENDING", payload)
@@ -917,7 +878,6 @@ class Runtime:
             "recovery_mode": self.db.get_recovery_state()["recovery_mode"],
         })
 
-
 # -----------------------------
 # SETTLEMENT LOGIC
 # -----------------------------
@@ -941,7 +901,6 @@ def settle_history(db, history):
         won_side = payload["side"] == actual_side
         won_num = payload["num"] == actual_num
 
-        # status update
         final_status = "WIN" if (won_side and won_num) else ("WIN" if won_side else "LOSS")
         with db.transaction():
             db.c.execute(
@@ -955,7 +914,6 @@ def settle_history(db, history):
             for pat in payload.get("patterns", []):
                 db.learn(pat["key"], pat["p"], int(actual["size"]))
 
-            # update trend weights
             features = payload.get("features", [])
             if features and payload.get("experts", {}).get("trend") is not None:
                 err = int(actual["size"]) - payload["experts"]["trend"]
@@ -965,7 +923,6 @@ def settle_history(db, history):
                      for w, x in zip(tw, features)]
                 )
 
-            # update meta weights
             meta_feats = payload.get("meta_feats", [])
             mw = db.get_meta("meta_weights")
             if not isinstance(mw, list) or len(mw) != len(meta_feats):
@@ -979,12 +936,10 @@ def settle_history(db, history):
                 )
                 db.set_meta("meta_n", int(db.get_meta("meta_n", 0)) + 1)
 
-            # calibration bucket updates
             bucket = min(19, int(payload.get("p_raw", payload["p"]) * 20))
             n, s = db.get_meta(f"cal20:global:{bucket}", [0.0, 0.0])
             db.set_meta(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + int(actual["size"])])
 
-            # recovery mode state
             if won_side and won_num:
                 db.update_recovery_state("WIN")
                 sticker = CFG.jack_sticker
@@ -997,7 +952,6 @@ def settle_history(db, history):
             db.queue("sticker", issue, sticker)
 
             db.c.execute("UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent=0", (issue,))
-
 
 # -----------------------------
 # MAIN
