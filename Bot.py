@@ -6,17 +6,6 @@
 # - This version adds a "recovery mode" after a loss:
 #   next prediction is forced to use higher-precision experts and stronger weight boost
 #   while staying statistically grounded.
-#
-# Example env:
-# export BOT_TOKEN="..."
-# export CHAT_ID="-1001234567890"
-# export HISTORY_URLS="https://example.com/api/wingo-history-1m-1000"
-# export MIN_EDGE="0.03"
-# export DB_PATH="predictor_hyper_v18.db"
-# export PORT="8080"
-#
-# Then run:
-# python bot.py
 
 import asyncio
 import contextlib
@@ -844,17 +833,19 @@ class Runtime:
                             edge_needed = CFG.recovery_min_edge if recovery_state["recovery_mode"] else CFG.min_edge
                             if p is not None and p["edge"] < edge_needed and not recovery_state["recovery_mode"]:
                                 LOG.info("Skipping %s (edge %.3f below threshold)", issue, p["edge"])
+                                # FIXED: Removed extra None from tuple
                                 self.db.c.execute(
                                     "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                    (issue, time.time(), "SKIP", json.dumps({"skipped": True}), None)
+                                    (issue, time.time(), "SKIP", json.dumps({"skipped": True}))
                                 )
                                 self.db.update_recovery_state("NONE")
                             elif p is not None:
                                 # queue prediction
                                 payload = json.dumps(p)
+                                # FIXED: Removed extra None from tuple
                                 self.db.c.execute(
                                     "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                    (issue, time.time(), "PENDING", payload, None)
+                                    (issue, time.time(), "PENDING", payload)
                                 )
                                 self.db.queue("prediction", issue, format_prediction(p), time.time() + CFG.delivery_ttl)
 
