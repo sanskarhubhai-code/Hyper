@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (DEEP BEAST ENGINE V23)
+# bot.py — FTW VIP PREDICTOR (ANTI-COLLAPSE RECOVERY ENGINE V24)
 # Python 3.10+ | aiohttp
 
 import asyncio
@@ -32,7 +32,7 @@ class Config:
     ) or (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_deep_beast_v23.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v24.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -44,7 +44,7 @@ class Config:
     decay: float = 0.988
     max_pattern: int = 20
     delivery_ttl: float = 55.0
-    name: str = "FTW VIP PREDICTOR (DEEP BEAST V23)"
+    name: str = "FTW VIP PREDICTOR (V24)"
     min_edge: float = float(os.getenv("MIN_EDGE", "0.02"))
     recovery_min_edge: float = float(os.getenv("RECOVERY_MIN_EDGE", "0.01"))
     win_sticker: str = os.getenv("WIN_STICKER", "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E")
@@ -345,15 +345,13 @@ class Database:
         )
 
     def adapt(self, key, probability):
-        # advanced adaptation without inversion
+        # NO inversion at all
         m = self.memory(key)
         n = m["n"]
         if n < 1:
             return probability, 0.75, False
 
         brier = m["loss"] / n
-        inv = m["inverse_loss"] / n
-
         reliability = clip((0.26 - brier) / 0.12, 0.0, 1.0)
         maturity = min(n / 50.0, 1.0)
         shrink = (1 - maturity) * 0.65 + maturity * reliability
@@ -373,12 +371,15 @@ class Database:
 
     def update_recovery_state(self, settled_result):
         consecutive_losses = int(self.get_value("consecutive_losses", 0))
+
         if settled_result == "LOSS":
             consecutive_losses += 1
         elif settled_result in ("WIN", "JACKPOT"):
             consecutive_losses = 0
 
+        # ANTI-COLLAPSE: first loss triggers recovery immediately
         recovery_mode = 1 if consecutive_losses >= 1 else 0
+
         self.set_value("last_result", json.dumps(settled_result))
         self.set_value("consecutive_losses", str(consecutive_losses))
         self.set_value("recovery_mode", str(recovery_mode))
@@ -557,6 +558,7 @@ class Engine:
     def _consensus_signal(self, experts, patterns, seq, regime):
         if not seq:
             return 0.5, 0.0, False
+
         tail_big = sum(seq[-10:]) / max(1, len(seq[-10:]))
         regime_bias, regime_spread = self._regime_bias(seq, regime)
 
@@ -579,39 +581,8 @@ class Engine:
         composite = clip(composite, 0.05, 0.95)
 
         evidence = 0.5 * pattern_strength + 0.5 * regime_spread
-        gate = evidence >= 0.42 and abs(pattern_score - 0.5) >= 0.08
+        gate = evidence >= 0.38 and abs(pattern_score - 0.5) >= 0.06
         return composite, evidence, gate
-
-    def _predict_number(self, seq_nums):
-        freq = self.db.get_meta("num_freq", {})
-        ngram_db = self.db.get_meta("num_ngrams", {})
-        dist = [1.0] * 10
-
-        if freq:
-            total = sum(freq.values())
-            if total > 0:
-                base = [1.0 + 5.0 * (freq.get(str(i), 0) / total) for i in range(10)]
-                dist = base[:]
-
-        for length in range(min(10, len(seq_nums)), 1, -1):
-            seq_key = ",".join(str(x) for x in seq_nums[-length:])
-            trans = ngram_db.get(seq_key)
-            if not trans:
-                continue
-            total = sum(trans.values())
-            if total < 3:
-                continue
-            weight = min(1.0, total / 22.0) * (0.9 ** (length - 2))
-            for i in range(10):
-                dist[i] = dist[i] * (1 - weight) + (trans.get(str(i), 0) / total) * weight
-
-        total = sum(dist)
-        if total <= 0:
-            return 4, 0.10
-
-        probs = [x / total for x in dist]
-        best = max(range(10), key=lambda i: probs[i])
-        return best, probs[best]
 
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
@@ -623,7 +594,8 @@ class Engine:
         loss_streak = max(0, int(recovery["consecutive_losses"]))
         recovery_mode = bool(recovery["recovery_mode"]) or loss_streak > 0
 
-        rec_boost = 1.0 + (0.26 if recovery_mode else 0.0) + (0.12 * min(loss_streak, 6))
+        # anti-collapse after first loss
+        rec_boost = 1.0 + (0.34 if recovery_mode else 0.0) + (0.15 * min(loss_streak, 6))
 
         adjusted = []
         for name, p in experts.items():
@@ -639,7 +611,6 @@ class Engine:
         total_w = sum(w for _, w in adjusted)
         p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
 
-        # meta features
         m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES]
         if seq:
             tail_big = sum(seq[-10:]) / max(1, len(seq[-10:]))
@@ -662,12 +633,13 @@ class Engine:
         alpha = min(self.db.get_meta("meta_n", 0) / 100.0, 1.0)
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
 
-        # agreement-gated recovery
         consensus_side, consensus_conf, gate = self._consensus_signal(experts, patterns, seq, current_regime)
-        if recovery_mode and gate:
-            p_raw = clip(p_raw + 0.10 * min(loss_streak + 1, 5) + 0.04, 0.05, 0.95)
-        elif recovery_mode:
-            p_raw = clip(p_raw + 0.03, 0.05, 0.95)
+
+        if recovery_mode:
+            if gate:
+                p_raw = clip(p_raw + 0.12 * min(loss_streak + 1, 5) + 0.05, 0.05, 0.95)
+            else:
+                p_raw = clip(p_raw + 0.06, 0.05, 0.95)
 
         if len(seq) >= 8:
             last = seq[-1]
@@ -684,12 +656,14 @@ class Engine:
             side_big_score = clip((side_big_score * 0.75) + (regime_bias * 0.25), 0.05, 0.95)
 
         if recovery_mode and gate:
-            side_big_score = clip(side_big_score + 0.04 * min(loss_streak + 1, 4), 0.05, 0.95)
+            side_big_score = clip(side_big_score + 0.06 * min(loss_streak + 1, 4), 0.05, 0.95)
+        elif recovery_mode:
+            side_big_score = clip(side_big_score + 0.03, 0.05, 0.95)
 
         side = "BIG" if side_big_score >= 0.5 else "SMALL"
         valid_nums = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
 
-        # number distribution: strong evidence from sequence + tail + frequency
+        # Number selection with strong recent signal
         num_dist = [1.0] * 10
         if nums:
             for length in range(min(10, len(nums)), 1, -1):
@@ -707,6 +681,7 @@ class Engine:
                 recent = nums[-8:]
                 for x in recent:
                     num_dist[x] *= 1.22
+
             if side == "BIG":
                 for i in range(5, 10):
                     num_dist[i] *= 1.12
@@ -740,14 +715,13 @@ class Engine:
             "edge": edge,
             "confidence": confidence,
             "regime": current_regime,
-            "source": "🧠 Deep Beast Recovery" if recovery_mode else "📊 Statistical Ensemble",
+            "source": "🧠 Anti-Collapse Recovery" if recovery_mode else "📊 Statistical Ensemble",
             "patterns": [{"key": k, "p": p, "support": s} for _, p, s, _, k in patterns],
             "experts": experts,
             "features": features,
             "meta_feats": m_feats,
             "recovery_mode": recovery_mode,
             "recovery_gate": gate,
-            "recovery_confidence": consensus_conf,
         }
 
 # -----------------------------
@@ -1072,7 +1046,7 @@ async def main():
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
 
-            LOG.info("%s V23 Started (Deep Beast Engine enabled)", CFG.name)
+            LOG.info("%s V24 Started (Anti-collapse recovery enabled)", CFG.name)
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
 
