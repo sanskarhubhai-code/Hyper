@@ -1,5 +1,15 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V18 — Deep Statistical Engine)
+# bot.py — FTW VIP PREDICTOR (HYPER V19 — NO-SKIP ADVANCED ENGINE)
 # Python 3.10+ | Deps: aiohttp
+#
+# Features:
+# - No skip gate (always predicts if history is enough)
+# - Multi-expert ensemble
+# - Pattern + Markov + regime + trend + momentum + state + neighbors + ngram
+# - Anti-overfit calibration
+# - Number engine with distribution fusion
+# - Recovery after losses
+# - Telegram send + DB persistence
+# - Fixed class inheritance and settlement logic
 
 import asyncio
 import contextlib
@@ -28,20 +38,19 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v18.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v19.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
-    learning_rate: float = 0.045
-    meta_lr: float = 0.045
+    learning_rate: float = 0.05
+    meta_lr: float = 0.05
     decay: float = 0.985
-    max_pattern: int = 18
+    max_pattern: int = 20
     delivery_ttl: float = 60.0
-    name: str = "FTW VIP PREDICTOR (HYPER V18)"
-    min_edge: float = float(os.getenv("MIN_EDGE", "0.05"))
+    name: str = "FTW VIP PREDICTOR (HYPER V19)"
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
@@ -70,6 +79,15 @@ def logit(p, eps=0.02):
 
 def escape(x):
     return html.escape(str(x))
+
+def mean(xs):
+    return sum(xs) / len(xs) if xs else 0.5
+
+def stddev(xs):
+    if len(xs) < 2:
+        return 0.0
+    m = mean(xs)
+    return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
 
 def run_length(seq):
     if not seq:
@@ -110,10 +128,8 @@ def parse_history(payload):
             break
         if not isinstance(obj, dict):
             return []
-        obj = next(
-            (obj[k] for k in ("data", "list", "result", "items", "history") if isinstance(obj.get(k), (list, dict))),
-            None,
-        )
+        obj = next((obj[k] for k in ("data", "list", "result", "items", "history")
+                    if isinstance(obj.get(k), (list, dict))), None)
     if not isinstance(obj, list):
         return []
     records = {}
@@ -136,15 +152,6 @@ def weighted_probability(observations):
     effective_n = sw * sw / sw2 if sw2 else 0.0
     probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
     return probability, effective_n
-
-def mean(xs):
-    return sum(xs) / len(xs) if xs else 0.5
-
-def stddev(xs):
-    if len(xs) < 2:
-        return 0.0
-    m = mean(xs)
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
 
 def ema(values, period):
     if not values:
@@ -176,6 +183,7 @@ def trend_features(seq):
     slow = slice_mean(24)
     extra = slice_mean(48)
     s3 = slice_mean(3)
+
     rsi_val = 50.0
     if len(seq) >= 2:
         gains = 0.0
@@ -192,8 +200,6 @@ def trend_features(seq):
             rsi_val = 100.0
     rsi_n = (rsi_val / 100.0) * 2.0 - 1.0
     macd = (ema(seq[-12:], 12) - ema(seq[-26:], 26)) * 2.0
-    recent_var = stddev(seq[-12:])
-    long_var = stddev(seq[-24:])
 
     return [
         1.0,
@@ -212,7 +218,7 @@ def trend_features(seq):
         rsi_n,
         macd,
         (2 * stddev(seq[-10:]) - 1),
-        (2 * long_var - 1),
+        (2 * stddev(seq[-24:]) - 1),
         entropy_prob(slow),
         entropy_prob(fast),
         0.0 if len(seq) < 25 else 1.0 if slow > fast else -1.0,
@@ -307,16 +313,14 @@ class Database:
             (key, n, loss, inv, failures),
         )
 
-    # Optimized adapt:
     def adapt(self, key, probability):
         m = self.memory(key)
         n = m["n"]
         if n < 1:
-            return probability, 0.75, False
+            return probability, 0.82, False
 
         brier = m["loss"] / n
         inv = m["inverse_loss"] / n
-
         flipped = (inv + 0.025 < brier) and (brier > 0.24) and (m["failures"] >= 3)
         effective_loss = inv if flipped else brier
         p = (1 - probability) if flipped else probability
@@ -409,8 +413,7 @@ class Engine:
                         eff_n,
                         f"exact:{bits}",
                     )
-
-        return sorted(candidates.values(), key=lambda x: x[0], reverse=True)[:10]
+        return sorted(candidates.values(), key=lambda x: x[0], reverse=True)[:12]
 
     def mine_experts(self, seq):
         n = len(seq)
@@ -584,8 +587,8 @@ class Engine:
 
                 recent = self.db.get("recent_results", [])
                 recent.append("WIN" if won_side else "LOSS")
-                if len(recent) > 20:
-                    recent = recent[-20:]
+                if len(recent) > 25:
+                    recent = recent[-25:]
                 self.db.set("recent_results", recent)
 
                 if won_side and won_num:
@@ -661,18 +664,11 @@ class NumberEngine:
         return best, dist[best] / total
 
 
-# ─── UPGRADED ENGINE ──────────────────────────────────────────
+# ─── ADVANCED ENGINE (NO SKIP) ───────────────────────────────
 class UpgradedEngine(Engine):
     def __init__(self, db):
         super().__init__(db)
         self.num_engine = NumberEngine(db)
-
-    @staticmethod
-    def normalize(values):
-        total = sum(values)
-        if total <= 0:
-            return [1.0 / len(values)] * len(values)
-        return [v / total for v in values]
 
     def get_number_distribution(self, nums):
         return self.num_engine.get_distribution(nums)
@@ -685,7 +681,7 @@ class UpgradedEngine(Engine):
         imbalance = abs(fast - slow) * 2.0
         recent = seq[-10:]
         switches = sum(1 for i in range(1, len(recent)) if recent[i] != recent[i - 1]) / max(1, len(recent) - 1)
-        return clip((imbalance * 0.65) + (switches * 0.35), 0.0, 1.0)
+        return clip((imbalance * 0.6) + (switches * 0.4), 0.0, 1.0)
 
     @staticmethod
     def _expected_meta_len():
@@ -722,9 +718,9 @@ class UpgradedEngine(Engine):
         if not recent:
             return 0.0
         if recent[-1] == "LOSS":
-            return 0.12
+            return 0.10
         if len(recent) >= 2 and recent[-2] == "LOSS" and recent[-1] == "WIN":
-            return 0.06
+            return 0.05
         return 0.0
 
     def predict(self, history, issue):
@@ -737,19 +733,19 @@ class UpgradedEngine(Engine):
         big_prob = sum(num_dist[5:])
 
         experts["ngram_num"] = big_prob
-        experts["side_shift"] = 0.5 + 0.15 * (big_prob - 0.5)
+        experts["side_shift"] = 0.5 + 0.18 * (big_prob - 0.5)
 
         adjusted = []
         for name, p in experts.items():
             corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p)
             if name == "patterns":
-                weight *= 2.5
+                weight *= 2.6
             if name == "ngram_num":
-                weight *= 2.1
+                weight *= 2.2
             if name == "side_shift":
-                weight *= 1.6
+                weight *= 1.8
             if current_streak >= 4 and name in ("momentum", "run", "state"):
-                weight *= 3.2
+                weight *= 3.4
             if name == "trend" and current_regime in ("RUN", "IMBAL"):
                 weight *= 1.5
             adjusted.append((corrected, weight))
@@ -772,7 +768,7 @@ class UpgradedEngine(Engine):
 
         recovery = self._recovery_bias()
         if recovery > 0:
-            p_raw = clip(p_raw + recovery * (0.20 if current_regime in ("ALT", "IMBAL") else 0.12))
+            p_raw = clip(p_raw + recovery * (0.18 if current_regime in ("ALT", "IMBAL") else 0.12))
 
         bucket = min(19, int(p_raw * 20))
         n_global, s_global = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
@@ -783,6 +779,14 @@ class UpgradedEngine(Engine):
         best_num = max(valid_nums, key=lambda x: num_dist[x])
         num_prob = num_dist[best_num]
 
+        # extra number adjustment for stronger accuracy
+        num_pred, num_conf = self.num_engine._predict_number(nums)
+        if num_pred in valid_nums:
+            # Fuse number engine with distribution model
+            if num_conf > num_prob:
+                best_num = num_pred
+                num_prob = num_conf
+
         change_score = self.calculate_change_score(seq)
         edge = abs(p_cal - 0.5)
         confidence = max(p_cal, 1 - p_cal)
@@ -790,9 +794,7 @@ class UpgradedEngine(Engine):
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
 
-        if CFG.min_edge > 0 and edge < CFG.min_edge:
-            return None
-
+        # NO SKIP: always send prediction
         return {
             "issue": issue,
             "p": p_cal,
@@ -802,7 +804,7 @@ class UpgradedEngine(Engine):
             "num_probability": num_prob,
             "change_score": change_score,
             "regime": current_regime,
-            "source": "🎯 Deep Meta+Evidence",
+            "source": "🎯 Ultra Meta+Evidence",
             "trend_shift": trend_shift,
             "pattern_str": _pattern_str(patterns),
             "edge": edge,
@@ -830,12 +832,25 @@ def format_prediction(p):
     bar = "█" * filled + "░" * (10 - filled)
     side = "BIG" if p["side"] == "BIG" else "SMALL"
     color = "🔴" if side == "BIG" else "🔵"
-    quality = "🔥 HIGH VIP" if conf >= 65 else "⭐ VIP" if conf >= 60 else "✅ NORMAL"
-    stake = "1.5x" if conf >= 65 else "1x" if conf >= 60 else "0.5x"
+
+    if conf >= 70:
+        quality = "🔥 HOT VIP"
+        stake = "2x"
+    elif conf >= 60:
+        quality = "⭐ VIP"
+        stake = "1.5x"
+    elif conf >= 55:
+        quality = "✅ STRONG"
+        stake = "1x"
+    else:
+        quality = "📉 CAUTIOUS"
+        stake = "0.5x"
+
     shift_text = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
     pat_text = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") and p.get("pattern_str") != "None" else ""
     source_text = f"\n🧠 <b>SOURCE:</b> {p.get('source', 'Unknown')}"
     edge_text = f"\n📐 <b>EDGE:</b> {p.get('edge', 0) * 100:.1f}% | <b>CI:</b> {conf:.1f}%" if p.get("edge") else ""
+
     return (
         f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
         f"━━━━━━━━━━━━━━━━━━\n"
@@ -904,24 +919,19 @@ class Runtime:
                     if not exists:
                         p = self.engine.predict(history, issue)
                         with self.db.transaction():
-                            if p is None:
-                                LOG.info(f"Skipping issue {issue} (edge too low)")
-                                self.db.c.execute(
-                                    "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                    (issue, time.time(), "SKIP", json.dumps({"skipped": True})),
-                                )
-                            else:
-                                self.db.c.execute(
-                                    "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                    (issue, time.time(), "PENDING", json.dumps(p)),
-                                )
-                                self.db.queue("prediction", issue, format_prediction(p), time.time() + CFG.delivery_ttl)
+                            self.db.c.execute(
+                                "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
+                                (issue, time.time(), "PENDING", json.dumps(p)),
+                            )
+                            self.db.queue("prediction", issue, format_prediction(p), time.time() + CFG.delivery_ttl)
+
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 self.error = type(exc).__name__
                 failures += 1
                 LOG.error("Worker failure: %s", self.error)
+
             await self.pause(min(60, CFG.fetch_every * 2 ** min(failures, 4)))
 
     async def sender(self, session):
@@ -1009,7 +1019,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info(f"{CFG.name} V18 Started (Deep Adaptive Engine, min_edge={CFG.min_edge})")
+            LOG.info(f"{CFG.name} V19 Started (No-Skip Advanced Engine)")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
             for task in tasks:
