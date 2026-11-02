@@ -1,4 +1,4 @@
-# FTW PREDICTOR — ULTRA ADVANCED V25 (Fixed & Ready)
+# FTW PREDICTOR — MAX ELITE EDITION V26 (Fixed & Ready)
 # Python 3.10+
 # Deps: aiohttp
 
@@ -13,10 +13,9 @@ import signal
 import socket
 import sqlite3
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
 
 import aiohttp
 from aiohttp import web
@@ -33,18 +32,18 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_ultra_v34.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_max_elite_v35.db")
     port: int = int(os.getenv("PORT", "8080"))
-    fetch_every: float = float(os.getenv("FETCH_EVERY", "2"))
+    fetch_every: float = float(os.getenv("FETCH_EVERY", "2.0"))
     timeout: float = 18.0
-    max_history: int = 3000 # 🔥 5000 se 3000 kar diya taaki Render pe timeout na ho
-    min_history: int = int(os.getenv("MIN_HISTORY", "180"))
+    max_history: int = 3000 # 🔥 6000 se 3000 kar diya taaki Render crash na ho
+    min_history: int = int(os.getenv("MIN_HISTORY", "200"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "14"))
-    learning_rate: float = 0.045
-    meta_lr: float = 0.05
+    learning_rate: float = 0.05
+    meta_lr: float = 0.055
     decay: float = 0.985
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (ULTRA V25)"
+    name: str = "FTW PREDICTOR (MAX ELITE V26)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -57,11 +56,11 @@ class Config:
 
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOG = logging.getLogger("predictor_ultra")
+LOG = logging.getLogger("predictor_max_elite")
 
 
 # ============================================================
-# MATH / UTILS
+# MATH / HELPERS
 # ============================================================
 
 def clip(x, low=0.02, high=0.98):
@@ -96,12 +95,6 @@ def run_length(seq):
             break
         n += 1
     return n
-
-def majority(seq):
-    if not seq:
-        return 0
-    c = Counter(seq)
-    return c.most_common(1)[0][0]
 
 def weighted_probability(obs):
     if not obs:
@@ -156,6 +149,60 @@ def get_regime(seq):
         return "IMBAL"
     return "MIXED"
 
+def trend_features(seq):
+    if not seq:
+        return [0.0] * 20
+
+    def mean(k):
+        arr = seq[-k:]
+        return sum(arr) / len(arr) if arr else 0.5
+
+    def ema(k):
+        if not seq:
+            return 0.5
+        a = 2.0 / (k + 1)
+        v = float(seq[0])
+        for x in seq[1:]:
+            v = a * x + (1.0 - a) * v
+        return v
+
+    def std(k):
+        arr = seq[-k:]
+        if len(arr) < 2:
+            return 0.0
+        m = sum(arr) / len(arr)
+        return math.sqrt(sum((x - m) ** 2 for x in arr) / len(arr))
+
+    tail = seq[-24:]
+    alt = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
+    run_score = (2 * seq[-1] - 1) * min(run_length(seq), 12) / 12.0
+    macd = (ema(12) - ema(26)) * 2.0
+
+    return [
+        1.0,
+        2 * mean(3) - 1,
+        2 * mean(5) - 1,
+        2 * mean(10) - 1,
+        2 * mean(24) - 1,
+        2 * mean(48) - 1,
+        2 * mean(96) - 1,
+        mean(3) - mean(10),
+        mean(5) - mean(24),
+        mean(10) - mean(48),
+        run_score,
+        2 * seq[-1] - 1,
+        (2 * alt - 1) * (2 * seq[-1] - 1),
+        macd,
+        2 * std(10) - 1,
+        2 * std(24) - 1,
+        mean(3) - mean(12),
+        mean(8) - mean(24),
+        (mean(12) - mean(48)),
+        (mean(6) - mean(24))
+    ]
+
+def logistic(weights, features):
+    return sigmoid(sum(w * x for w, x in zip(weights, features)))
 
 # ============================================================
 # HISTORY PARSER
@@ -188,7 +235,7 @@ def parse_history(payload):
 
 
 # ============================================================
-# QUANTUM PATTERN MATCHER
+# QUANTUM PATTERN TRACKER
 # ============================================================
 
 class QuantumTracker:
@@ -201,6 +248,7 @@ class QuantumTracker:
         n = len(seq)
         if n < 20:
             return []
+
         results = []
         for length in range(self.max_len, self.min_len - 1, -1):
             suffix = seq[-length:]
@@ -302,8 +350,7 @@ class Database:
         rows = self.c.execute("""
             SELECT status FROM predictions
             WHERE status IN ('WIN','LOSS')
-            ORDER BY created DESC
-            LIMIT 12
+            ORDER BY created DESC LIMIT 12
         """).fetchall()
         streak = 0
         for r in rows:
@@ -343,7 +390,7 @@ class Database:
         p = (1.0 - probability) if flipped else probability
 
         reliability = clip((0.25 - eff_loss) / 0.12, 0.0, 1.0)
-        shrink = (1.0 - min(n / 50.0, 1.0)) * 0.7 + min(n / 50.0, 1.0) * reliability
+        shrink = (1.0 - min(n / 55.0, 1.0)) * 0.72 + min(n / 55.0, 1.0) * reliability
         p = 0.5 + (p - 0.5) * shrink
 
         weight = clip(math.exp(-7 * (eff_loss - 0.22)), 0.18, 2.0)
@@ -353,70 +400,12 @@ class Database:
 
     def queue(self, kind, issue, text, expires=None):
         self.c.execute(
-            "INSERT INTO outbox(kind, issue, text, created, expires) VALUES (?,?,?,?,?)",
+            "INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)",
             (kind, issue, text, time.time(), expires)
         )
 
     def close(self):
         self.c.close()
-
-
-# ============================================================
-# FEATURE FUNCTIONS
-# ============================================================
-
-def trend_features(seq):
-    if not seq:
-        return [0.0] * 18
-
-    def mean(k):
-        arr = seq[-k:]
-        return sum(arr) / len(arr) if arr else 0.5
-
-    def ema(k):
-        if not seq:
-            return 0.5
-        a = 2.0 / (k + 1)
-        v = float(seq[0])
-        for x in seq[1:]:
-            v = a * x + (1.0 - a) * v
-        return v
-
-    def std(k):
-        arr = seq[-k:]
-        if len(arr) < 2:
-            return 0.0
-        m = sum(arr) / len(arr)
-        return math.sqrt(sum((x - m) ** 2 for x in arr) / len(arr))
-
-    tail = seq[-24:]
-    alt = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
-    run_score = (2 * seq[-1] - 1) * min(run_length(seq), 12) / 12.0
-    macd = (ema(12) - ema(26)) * 2.0
-
-    return [
-        1.0,
-        2 * mean(3) - 1,
-        2 * mean(5) - 1,
-        2 * mean(10) - 1,
-        2 * mean(24) - 1,
-        2 * mean(48) - 1,
-        2 * mean(96) - 1,
-        mean(3) - mean(10),
-        mean(5) - mean(24),
-        mean(10) - mean(48),
-        run_score,
-        2 * seq[-1] - 1,
-        (2 * alt - 1) * (2 * seq[-1] - 1),
-        macd,
-        2 * std(10) - 1,
-        2 * std(24) - 1,
-        mean(3) - mean(12),
-        mean(8) - mean(24),
-    ]
-
-def logistic(weights, features):
-    return sigmoid(sum(w * x for w, x in zip(weights, features)))
 
 
 # ============================================================
@@ -624,7 +613,6 @@ class Engine:
         alpha = min(self.db.get("meta_n", 0) / 90.0, 1.0)
         p_raw = alpha * p_meta + (1.0 - alpha) * p_avg
 
-        # DEEP RECOVERY
         if loss_streak >= 1:
             p_raw, recovery_used = self.recovery.adjust(seq, p_raw, loss_streak)
         else:
@@ -637,12 +625,10 @@ class Engine:
             if short < 0.20 and p_raw < 0.34:
                 p_raw = 0.34
 
-        # CALIBRATION
         bucket = min(19, int(p_raw * 20))
         n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
         p_cal = clip((32 * p_raw + s_g) / (32 + n_g))
 
-        # SIDE DECISION
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
         valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
 
@@ -748,7 +734,6 @@ class Engine:
                 self.db.queue("sticker", row["issue"], sticker)
                 self.db.c.execute("UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent=0", (row["issue"],))
 
-
 def _pattern_str(patterns):
     if not patterns:
         return "None"
@@ -843,7 +828,7 @@ class Runtime:
                     if not self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone():
                         pred = self.engine.predict(history, issue)
                         
-                        # 🔥 NO-SKIP FIX: Yahan se confidence waali condition hata di hai
+                        # 🔥 NO-SKIP FIX: Confidence waali condition hata di hai
                         with self.db.transaction():
                             self.db.c.execute(
                                 "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
