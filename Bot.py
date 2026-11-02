@@ -1,5 +1,5 @@
 # bot.py
-# FULLY FIXED & BIAS-FREE VERSION
+# FULLY FIXED: Win/Loss bug resolved, Duplicate messages fixed, No artificial 50% clamping.
 
 import asyncio
 import contextlib
@@ -35,12 +35,10 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     name: str = "Fixed Predictor"
     
-    # Stickers
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
     
-    # FIX 1: Added decay variable (Resolves AttributeError)
     decay: float = 0.95 
 
     def validate(self):
@@ -310,15 +308,9 @@ class SignalPredictor:
 
     def predict(self, history, issue):
         if not history:
-            # FIX 2: Neutral fallback (Removed BIG default)
             return {
-                "issue": issue,
-                "p": 0.5,
-                "side": "SMALL",
-                "num": 2,
-                "regime": "COLD",
-                "source": "default",
-                "experts": {},
+                "issue": issue, "p": 0.5, "side": "SMALL", "num": 2,
+                "regime": "COLD", "source": "default", "experts": {}
             }
 
         seq = [r["size"] for r in history]
@@ -345,14 +337,12 @@ class SignalPredictor:
         elif reg == "ALT":
             p = clip(0.5 + (p - 0.5) * 0.7)
 
-        # FIX 3: Neutral Tie-breaker (No hardcoded BIG bias)
-        if abs(p - 0.5) < 0.05:
+        # 🔥 FIXED: Removed artificial clamping to 0.5
+        if p == 0.5:
+            # Exact tie: flip previous result
             last_size = seq[-1]
-            # If deadlock, flip the previous outcome (Mean Reversion)
             side = "SMALL" if last_size == 1 else "BIG"
-            p = 0.5
         else:
-            # Strict inequality for neutral handling
             side = "BIG" if p > 0.5 else "SMALL"
 
         valid_range = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
@@ -410,8 +400,11 @@ class SignalPredictor:
                 continue
 
             actual = lookup[issue]
-            y = actual["size"]
-            won_side = int(pred.get("p", 0.5) >= 0.5) == y
+            actual_side = "BIG" if actual["size"] == 1 else "SMALL"
+            
+            # 🔥 FIXED: Direct String comparison instead of p >= 0.5
+            pred_side = pred.get("side", "BIG")
+            won_side = (pred_side == actual_side)
 
             with self.db.transaction():
                 self.db.c.execute(
@@ -420,14 +413,14 @@ class SignalPredictor:
                 )
 
                 for name, val in pred.get("experts", {}).items():
-                    self.db.learn(f"expert:{name}:{pred.get('regime', 'N/A')}", val, y)
+                    self.db.learn(f"expert:{name}:{pred.get('regime', 'N/A')}", val, actual["size"])
 
                 msg = (
                     f"<b>{'✅ WIN' if won_side else '❌ LOSS'}</b>\n"
                     f"<b>Issue:</b> {issue}\n"
-                    f"<b>Actual:</b> {actual['num']} ({'BIG' if y else 'SMALL'})\n"
-                    f"<b>Prediction:</b> {pred.get('side', 'UNKNOWN')} -> {pred.get('num', '?')}\n"
-                    f"<b>Confidence:</b> {pred.get('p', 0.5) * 100:.1f}%"
+                    f"<b>Actual:</b> {actual['num']} ({actual_side})\n"
+                    f"<b>Prediction:</b> {pred_side} -> {pred.get('num', '?')}\n"
+                    f"<b>Confidence:</b> {max(pred.get('p', 0.5), 1-pred.get('p', 0.5)) * 100:.1f}%"
                 )
                 self.db.queue("result", issue, msg, time.time() + 60.0)
 
@@ -437,16 +430,16 @@ def format_prediction(p):
     conf = max(p["p"], 1 - p["p"]) * 100
     filled = int(conf // 10)
     bar = "█" * filled + "░" * (10 - filled)
-    side = "BIG" if p["side"] == "BIG" else "SMALL"
+    side = p["side"]
     color = "🔴" if side == "BIG" else "🔵"
 
-    if conf >= 70:
+    if conf >= 60:
         quality = "🔥 HOT"
         stake = "2x"
-    elif conf >= 60:
+    elif conf >= 55:
         quality = "⭐ STRONG"
         stake = "1.5x"
-    elif conf >= 55:
+    elif conf >= 52:
         quality = "✅ BALANCED"
         stake = "1x"
     else:
@@ -516,10 +509,17 @@ class Runtime:
                 latest = int(history[-1]["issue"])
                 if len(history) >= CFG.min_history:
                     issue = str(latest + 1)
+                    
                     exists = self.db.c.execute(
                         "SELECT 1 FROM predictions WHERE issue=?", (issue,)
                     ).fetchone()
-                    if not exists:
+                    
+                    # 🔥 FIXED: Check if message already queued to prevent duplicates
+                    already_queued = self.db.c.execute(
+                        "SELECT 1 FROM outbox WHERE issue=? AND kind='prediction'", (issue,)
+                    ).fetchone()
+
+                    if not exists and not already_queued:
                         pred = self.engine.predict(history, issue)
                         with self.db.transaction():
                             self.db.c.execute(
