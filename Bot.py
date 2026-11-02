@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V18 — No-Skip Edition)
+# bot.py — FTW VIP PREDICTOR (HYPER V20.1 — Fixed Pattern Engine)
 # Python 3.10+  |  Deps: aiohttp
 
 import asyncio
@@ -29,7 +29,7 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v25.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v20.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -42,9 +42,7 @@ class Config:
     max_pattern: int = 15
     delivery_ttl: float = 55.0
     name: str = "FTW VIP PREDICTOR (HYPER)"
-
-    # 🔒 NO SKIP — har issue pe prediction guaranteed
-    min_edge: float = 0.0
+    min_edge: float = float(os.getenv("MIN_EDGE", "0.0"))
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -153,6 +151,7 @@ def weighted_probability(observations):
 
 # ─── FAMILY PATTERN ENGINE ─────────────────────────────────────
 def family_run(seq):
+    """[1,1,0,0,1] -> [(1,2),(0,2),(1,1)]"""
     if not seq:
         return []
     out = []
@@ -170,10 +169,18 @@ def family_run(seq):
 
 
 def family_signature(seq):
+    """Hashable run-length signature. Same signature = same family pattern."""
     return tuple((int(v), cnt) for v, cnt in family_run(seq))
 
 
 def valid_family_window(seq, start, length, min_len=5):
+    """
+    A window is only valid if:
+      - length >= min_len
+      - left boundary is clean (start == 0 OR seq[start] != seq[start-1])
+      - right boundary is clean (end == len(seq) OR seq[end-1] != seq[end])
+    This guarantees we only match complete family structures, never partial cuts.
+    """
     if length < min_len:
         return False
     if start > 0 and seq[start] == seq[start - 1]:
@@ -182,6 +189,202 @@ def valid_family_window(seq, start, length, min_len=5):
     if end < len(seq) and seq[end - 1] == seq[end]:
         return False
     return True
+
+
+class AdvancedFamilyTracker:
+    """
+    Run-length aware pattern tracker.
+
+    IMPORTANT: every score method returns P(next = 1) — a real next-value
+    probability, NOT a raw structural measure. That means the ensemble can
+    compare them 1:1 against other experts (markov, run, trend, …).
+    """
+
+    def __init__(self, min_len=5, min_support=8):
+        self.min_len = min_len
+        self.min_support = min_support
+
+    # ── CORE: family pattern miner ─────────────────────────────
+    def repeated_patterns(self, seq):
+        """
+        Returns list of dicts:
+          {sig, p, support, eff_n, score}
+        sorted by |p - 0.5| * sqrt(eff_n) descending.
+        """
+        n = len(seq)
+        if n < self.min_len * 2:
+            return []
+
+        max_len = min(26, max(self.min_len, n // 2))
+        groups = {}  # sig -> list of window end positions
+
+        for length in range(self.min_len, max_len + 1):
+            for start in range(0, n - length + 1):
+                if not valid_family_window(seq, start, length, self.min_len):
+                    continue
+                sig = family_signature(seq[start:start + length])
+                groups.setdefault(sig, []).append(start + length)
+
+        results = []
+        for sig, ends in groups.items():
+            if len(ends) < self.min_support:
+                continue
+
+            obs = []
+            for end in ends:
+                if end < n:
+                    w = 0.5 ** ((n - 1 - end) / 420.0)
+                    obs.append((seq[end], w))
+
+            if len(obs) < 2:
+                continue
+
+            p, eff_n = weighted_probability(obs)
+            score = abs(p - 0.5) * math.sqrt(eff_n)
+            if score <= 0:
+                continue
+
+            results.append({
+                "sig": sig,
+                "p": p,
+                "support": len(obs),
+                "eff_n": eff_n,
+                "score": score,
+            })
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+        return results
+
+    # ── FEATURE PREDICTORS (all return P(next = 1)) ────────────
+    def transition_score(self, seq):
+        """
+        P(next = 1) based on the last TWO run-lengths.
+        e.g. if history shows "B2 → S3 → ?" always returned B,
+             and current tail ends with "B2 → S3", predict B.
+        """
+        n = len(seq)
+        if n < 10:
+            return 0.5
+        runs = family_run(seq)
+        if len(runs) < 2:
+            return 0.5
+
+        prev_val, prev_len = runs[-2]
+        last_val, last_len = runs[-1]
+
+        run_starts = [0]
+        for i in range(1, n):
+            if seq[i] != seq[i - 1]:
+                run_starts.append(i)
+
+        obs = []
+        for j in range(len(run_starts) - 2):
+            s1 = run_starts[j]
+            s2 = run_starts[j + 1]
+            s3 = run_starts[j + 2]
+            if s3 >= n:
+                break
+
+            if seq[s1] != prev_val or seq[s2] != last_val:
+                continue
+            if min(s2 - s1, 8) != min(prev_len, 8):
+                continue
+            if min(s3 - s2, 8) != min(last_len, 8):
+                continue
+
+            w = 0.5 ** ((n - 1 - s3) / 350.0)
+            obs.append((seq[s3], w))
+
+        if len(obs) >= self.min_support:
+            return weighted_probability(obs)[0]
+        return 0.5
+
+    def repeat_score(self, seq):
+        """Weighted average of top repeated-pattern probabilities."""
+        patterns = self.repeated_patterns(seq)
+        if not patterns:
+            return 0.5
+
+        num = 0.0
+        den = 0.0
+        for item in patterns[:5]:
+            w = item["score"]
+            num += item["p"] * w
+            den += w
+        if den <= 0:
+            return 0.5
+        return clip(num / den)
+
+    def mirror_score(self, seq):
+        """
+        P(next = 1) from mirror symmetry of the tail.
+        If the recent run-structure looks palindromic, expect the next value
+        to mirror the sequence's first value.
+        """
+        n = len(seq)
+        if n < 16:
+            return 0.5
+
+        tail = seq[-20:]
+        fwd = family_run(tail)
+        rev = family_run(list(reversed(tail)))
+        if len(fwd) < 3 or len(rev) < 3:
+            return 0.5
+
+        min_len = min(len(fwd), len(rev))
+        matches = sum(1 for i in range(min_len) if fwd[i][1] == rev[i][1])
+        similarity = matches / min_len
+
+        if similarity < 0.55:
+            return 0.5
+
+        mirror_next = 1 - tail[0]
+        strength = (similarity - 0.5) * 2.0  # 0..1
+        p = 0.5 + ((0.5 if mirror_next == 1 else -0.5) * strength * 0.5)
+        return clip(p)
+
+    def phase_score(self, seq):
+        """
+        P(next = 1) from run-length deviation.
+        Very long run  -> predict switch.
+        Very short run -> predict continuation.
+        """
+        n = len(seq)
+        if n < 12:
+            return 0.5
+
+        tail = seq[-24:]
+        runs = family_run(tail)
+        if len(runs) < 3:
+            return 0.5
+
+        lengths = [length for _, length in runs]
+        mean_len = sum(lengths) / len(lengths)
+        current_len = lengths[-1]
+        current_val = seq[-1]
+
+        if current_len >= mean_len * 1.6:
+            return clip(0.15 if current_val == 1 else 0.85)
+        if current_len <= mean_len * 0.5:
+            return clip(0.85 if current_val == 1 else 0.15)
+        return 0.5
+
+    def density_score(self, seq):
+        """P(next = 1) — majority-side pressure (weak signal)."""
+        n = len(seq)
+        if n < 10:
+            return 0.5
+        ratio = sum(seq) / n
+        return clip(0.5 + (ratio - 0.5) * 0.4)
+
+    def total_score(self, seq):
+        return {
+            "transition": self.transition_score(seq),
+            "repeat":     self.repeat_score(seq),
+            "mirror":     self.mirror_score(seq),
+            "phase":      self.phase_score(seq),
+            "density":    self.density_score(seq),
+        }
 
 
 def trend_features(seq):
@@ -272,9 +475,17 @@ def trend_features(seq):
 
 
 EXPERT_NAMES = [
-    "patterns", "markov1", "markov2", "markov3", "markov4",
-    "run", "regime", "base", "neighbors", "trend", "momentum", "cyclic"
+    "patterns",
+    "markov1", "markov2", "markov3", "markov4",
+    "run", "regime", "base", "neighbors", "trend", "momentum",
+    "family_transition", "family_repeat", "family_mirror",
+    "family_phase", "family_density",
 ]
+
+FAMILY_EXPERTS = {
+    "family_transition", "family_repeat", "family_mirror",
+    "family_phase", "family_density",
+}
 
 
 def logistic(weights, features):
@@ -350,7 +561,6 @@ class Database:
             (key, n, loss, inv, failures),
         )
 
-    # ✅ NEW STATISTICAL ADAPT — replaces the aggressive 2-fail flip
     def adapt(self, key, probability):
         m = self.memory(key)
         n = m["n"]
@@ -360,10 +570,6 @@ class Database:
         brier = m["loss"] / n
         inv = m["inverse_loss"] / n
 
-        # Flip only when:
-        # 1) inverse is meaningfully better (0.02 Brier margin)
-        # 2) model is actually worse than random (brier > 0.24)
-        # 3) at least 3 consecutive failures
         flipped = (inv + 0.02 < brier) and (brier > 0.24) and (m["failures"] >= 3)
         effective_loss = inv if flipped else brier
         p = (1 - probability) if flipped else probability
@@ -385,7 +591,7 @@ class Database:
         )
 
 
-# ─── BASE ENGINE ──────────────────────────────────────────────
+# ─── ENGINE ─────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
         self.db = db
@@ -406,42 +612,31 @@ class Engine:
         runs.append((current, length))
         return runs
 
-    # ✅ Family-aware pattern miner
     def mine_family_patterns(self, seq):
+        """Primary pattern miner — family-run structure."""
         if len(seq) < 12:
             return []
 
+        tracker = AdvancedFamilyTracker(min_len=5, min_support=CFG.min_support)
+        results = tracker.repeated_patterns(seq)
+
         patterns = []
-        max_len = min(26, max(5, len(seq) // 2))
+        for item in results[:8]:
+            sig = item["sig"]
+            label = "family:" + "-".join(
+                f"{'B' if v else 'S'}{c}" for v, c in sig
+            )
+            patterns.append((
+                item["score"],
+                item["p"],
+                item["support"],
+                item["eff_n"],
+                label,
+            ))
+        return patterns
 
-        for length in range(5, max_len + 1):
-            groups = {}
-
-            for i in range(0, len(seq) - length + 1):
-                if not valid_family_window(seq, i, length, 5):
-                    continue
-                sig = family_signature(seq[i:i + length])
-                groups.setdefault(sig, []).append(i)
-
-            for sig, idxs in groups.items():
-                if len(idxs) < CFG.min_support:
-                    continue
-
-                future = []
-                for idx in idxs:
-                    nxt = seq[idx + length] if idx + length < len(seq) else None
-                    if nxt is not None:
-                        future.append((nxt, 0.5 ** ((len(seq) - 1 - idx) / 350.0)))
-
-                if len(future) >= 2:
-                    p, eff_n = weighted_probability(future)
-                    sig_text = "-".join(f"{'B' if v else 'S'}{c}" for v, c in sig)
-                    patterns.append((abs(p - 0.5) * math.sqrt(eff_n), p, len(future), eff_n, f"family:{sig_text}"))
-
-        return sorted(patterns, key=lambda x: x[0], reverse=True)[:8]
-
-    # ✅ Fallback raw pattern mining
     def mine_patterns(self, seq):
+        """Family-first, exact-bit fallback."""
         fam = self.mine_family_patterns(seq)
         if fam:
             return fam
@@ -455,13 +650,16 @@ class Engine:
         for length in range(5, CFG.max_pattern + 1):
             if n < length * 2:
                 continue
+
             suffix = tuple(seq[-length:])
             obs = []
             last = -length - 1
+
             for i in range(length, n - length):
                 if tuple(seq[i - length:i]) == suffix and i - last >= length + 1:
                     obs.append((seq[i], weight(i)))
                     last = i
+
             if len(obs) >= CFG.min_support:
                 p, eff_n = weighted_probability(obs)
                 if eff_n >= CFG.min_support * 0.5:
@@ -483,6 +681,7 @@ class Engine:
         def weight(idx):
             return 0.5 ** ((n - 1 - idx) / 300.0)
 
+        # ── patterns expert ──
         patterns = self.mine_patterns(seq)
         if patterns:
             num = 0.0
@@ -494,6 +693,17 @@ class Engine:
             if den > 0:
                 experts["patterns"] = num / den
 
+        # ── family experts ──
+        family_stats = AdvancedFamilyTracker(
+            min_len=5, min_support=CFG.min_support
+        ).total_score(seq)
+        experts["family_transition"] = family_stats["transition"]
+        experts["family_repeat"]     = family_stats["repeat"]
+        experts["family_mirror"]     = family_stats["mirror"]
+        experts["family_phase"]      = family_stats["phase"]
+        experts["family_density"]    = family_stats["density"]
+
+        # ── markov ──
         for order in (1, 2, 3, 4):
             suffix = tuple(seq[-order:])
             obs = []
@@ -503,6 +713,7 @@ class Engine:
             if len(obs) >= CFG.min_support:
                 experts[f"markov{order}"] = weighted_probability(obs)[0]
 
+        # ── run continuation ──
         if n:
             run_at = [1] * n
             for i in range(1, n):
@@ -517,6 +728,7 @@ class Engine:
             if len(run_obs) >= CFG.min_support:
                 experts["run"] = weighted_probability(run_obs)[0]
 
+        # ── regime ──
         current_regime = get_regime(seq)
         regime_obs = [
             (seq[i], weight(i))
@@ -526,8 +738,12 @@ class Engine:
         if len(regime_obs) >= CFG.min_support:
             experts["regime"] = weighted_probability(regime_obs)[0]
 
-        experts["base"] = weighted_probability([(y, weight(i)) for i, y in enumerate(seq)])[0]
+        # ── base rate ──
+        experts["base"] = weighted_probability(
+            [(y, weight(i)) for i, y in enumerate(seq)]
+        )[0]
 
+        # ── nearest neighbors ──
         nearest = [
             (
                 seq[i],
@@ -539,16 +755,19 @@ class Engine:
         if len(nearest) >= 20:
             experts["neighbors"] = weighted_probability(nearest)[0]
 
+        # ── trend ──
         features = trend_features(seq)
         tw = self.db.get("trend_weights")
         if not isinstance(tw, list) or len(tw) != len(features):
             tw = [0.0] * len(features)
         experts["trend"] = logistic(tw, features)
+
+        # ── momentum ──
         momentum = sum(seq[-5:]) / 5.0 if seq else 0.5
         experts["momentum"] = 0.2 + (momentum * 0.6)
+
         return experts, patterns, features, current_regime
 
-    # ✅ Number predictor
     def _predict_number(self, seq_nums):
         ngram_db = self.db.get("num_ngrams", {})
         freq = self.db.get("num_freq", {})
@@ -589,6 +808,8 @@ class Engine:
             corrected, weight, _ = self.db.adapt(f"expert:{name}:{current_regime}", p)
             if name == "patterns":
                 weight *= 2.5
+            if name in FAMILY_EXPERTS:
+                weight *= 1.7
             if current_streak >= 4 and name in ("momentum", "run"):
                 weight *= 3.0
             if name == "trend" and current_regime in ("RUN", "IMBAL"):
@@ -604,6 +825,7 @@ class Engine:
         mw = self.db.get("meta_weights")
         if not isinstance(mw, list) or len(mw) != len(m_feats):
             mw = [1.0 / len(EXPERT_NAMES)] * len(EXPERT_NAMES) + [0.0]
+
         p_meta = sigmoid(sum(w * f for w, f in zip(mw, m_feats)))
         alpha = min(self.db.get("meta_n", 0) / 80.0, 1.0)
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
@@ -619,13 +841,13 @@ class Engine:
         valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
 
         num_pred, num_conf = self._predict_number(nums)
-
-        # ✅ FIXED: clean fallback to the correct side
         if num_pred not in valid_nums:
-            if pred_side == "BIG":
-                num_pred = max(5, min(9, num_pred))
-            else:
-                num_pred = max(0, min(4, num_pred))
+            candidate_nums = list(valid_nums)
+            if not candidate_nums:
+                candidate_nums = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+            num_pred = max(candidate_nums, key=lambda x: x if x in valid_nums else -1)
+            if num_pred not in valid_nums:
+                num_pred = candidate_nums[0]
 
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         current_regime = get_regime(seq)
@@ -634,7 +856,9 @@ class Engine:
         edge = abs(p_cal - 0.5)
         confidence = max(p_cal, 1 - p_cal)
 
-        # 🔒 NO SKIP — always return prediction
+        if CFG.min_edge > 0 and edge < CFG.min_edge:
+            return None
+
         return {
             "issue": issue,
             "p": p_cal,
@@ -705,23 +929,21 @@ class Engine:
                         [clip(w + CFG.learning_rate * (err * x - 0.01 * w), -4, 4) for w, x in zip(tw, payload["features"])]
                     )
 
-                target = len(EXPERT_NAMES) + 2
+                # ── meta-learner (fixed: target = experts + bias) ──
+                target = len(EXPERT_NAMES) + 1
                 if payload.get("meta_feats"):
-                    mw = self.db.get("meta_weights")
-                    if not isinstance(mw, list) or len(mw) != target:
-                        if isinstance(mw, list) and len(mw) == target - 1:
-                            mw = mw[:-1] + [0.0, mw[-1]]
-                        else:
-                            mw = [1.0 / len(EXPERT_NAMES)] * len(EXPERT_NAMES) + [0.0]
                     feats = payload["meta_feats"]
-                    if len(feats) == target - 1:
-                        feats = feats[:-1] + [0.0, feats[-1]]
                     if len(feats) == target:
+                        mw = self.db.get("meta_weights")
+                        if not isinstance(mw, list) or len(mw) != target:
+                            mw = [1.0 / len(EXPERT_NAMES)] * len(EXPERT_NAMES) + [0.0]
+
                         mp = sigmoid(sum(w * f for w, f in zip(mw, feats)))
                         grad = 2.0 * (y - mp) * mp * (1.0 - mp)
                         self.db.set(
                             "meta_weights",
-                            [clip(w * 0.999 + CFG.meta_lr * grad * f, -4, 4) for w, f in zip(mw, feats)]
+                            [clip(w * 0.999 + CFG.meta_lr * grad * f, -4, 4)
+                             for w, f in zip(mw, feats)]
                         )
                         self.db.set("meta_n", self.db.get("meta_n", 0) + 1)
 
@@ -754,6 +976,35 @@ def _pattern_str(patterns):
     return f"<code>{key}</code> {arrow}"
 
 
+# ─── FORMATTER ──────────────────────────────────────────────
+def format_prediction(p):
+    conf = max(p["p"], 1 - p["p"]) * 100
+    filled = int(conf // 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    side = "BIG" if p["side"] == "BIG" else "SMALL"
+    color = "🔴" if side == "BIG" else "🔵"
+
+    quality = "🔥 HIGH VIP" if conf >= 65 else "⭐ VIP" if conf >= 60 else "✅ NORMAL"
+    stake = "1.5x" if conf >= 65 else "1x" if conf >= 60 else "0.5x"
+
+    shift_text = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
+    pat_text = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") and p.get("pattern_str") != "None" else ""
+    source_text = f"\n🧠 <b>SOURCE:</b> {p.get('source', 'Unknown')}"
+    edge_text = f"\n📐 <b>EDGE:</b> {p.get('edge', 0) * 100:.1f}% | <b>CI:</b> {conf:.1f}%" if p.get("edge") else ""
+
+    return (
+        f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>TARGET:</b> {color} <b>{side}</b> → <code>{p['num']}</code>\n"
+        f"📅 <b>PERIOD:</b> <code>{escape(p['issue'])}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
+        f"🏆 <b>QUALITY:</b> {quality} (Stake: {stake}){edge_text}\n"
+        f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}{source_text}{shift_text}{pat_text}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+
+
 # ─── RUNTIME ─────────────────────────────────────────────────
 class Runtime:
     def __init__(self, db):
@@ -777,11 +1028,9 @@ class Runtime:
                     return parse_history(await r.json(content_type=None))
             except Exception:
                 return []
-
         sources = [x for x in await asyncio.gather(*(one(u) for u in CFG.urls)) if x]
         if not sources:
             raise RuntimeError("HistoryUnavailable")
-
         merged = {}
         for rows in sources:
             for row in rows:
@@ -811,19 +1060,25 @@ class Runtime:
                     ).fetchone()
 
                     if not exists:
-                        # 🔒 NO SKIP — always predict, always queue
                         p = self.engine.predict(history, issue)
                         with self.db.transaction():
-                            self.db.c.execute(
-                                "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                (issue, time.time(), "PENDING", json.dumps(p)),
-                            )
-                            self.db.queue(
-                                "prediction",
-                                issue,
-                                format_prediction(p),
-                                time.time() + CFG.delivery_ttl,
-                            )
+                            if p is None:
+                                LOG.info(f"Skipping issue {issue} (edge too low)")
+                                self.db.c.execute(
+                                    "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
+                                    (issue, time.time(), "SKIP", json.dumps({"skipped": True})),
+                                )
+                            else:
+                                self.db.c.execute(
+                                    "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
+                                    (issue, time.time(), "PENDING", json.dumps(p)),
+                                )
+                                self.db.queue(
+                                    "prediction",
+                                    issue,
+                                    format_prediction(p),
+                                    time.time() + CFG.delivery_ttl,
+                                )
 
             except asyncio.CancelledError:
                 raise
@@ -890,35 +1145,6 @@ class Runtime:
         })
 
 
-# ─── FORMATTER ──────────────────────────────────────────────
-def format_prediction(p):
-    conf = max(p["p"], 1 - p["p"]) * 100
-    filled = int(conf // 10)
-    bar = "█" * filled + "░" * (10 - filled)
-    side = "BIG" if p["side"] == "BIG" else "SMALL"
-    color = "🔴" if side == "BIG" else "🔵"
-
-    quality = "🔥 HIGH VIP" if conf >= 65 else "⭐ VIP" if conf >= 60 else "✅ NORMAL"
-    stake = "1.5x" if conf >= 65 else "1x" if conf >= 60 else "0.5x"
-
-    shift_text = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
-    pat_text = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") and p.get("pattern_str") != "None" else ""
-    source_text = f"\n🧠 <b>SOURCE:</b> {p.get('source', 'Unknown')}"
-    edge_text = f"\n📐 <b>EDGE:</b> {p.get('edge', 0) * 100:.1f}% | <b>CI:</b> {conf:.1f}%" if p.get("edge") else ""
-
-    return (
-        f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 <b>TARGET:</b> {color} <b>{side}</b> → <code>{p['num']}</code>\n"
-        f"📅 <b>PERIOD:</b> <code>{escape(p['issue'])}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
-        f"🏆 <b>QUALITY:</b> {quality} (Stake: {stake}){edge_text}\n"
-        f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}{source_text}{shift_text}{pat_text}\n"
-        f"━━━━━━━━━━━━━━━━━━"
-    )
-
-
 # ─── MAIN ──────────────────────────────────────────────────
 async def main():
     CFG.validate()
@@ -948,7 +1174,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info(f"{CFG.name} V18 Started (No-Skip Mode)")
+            LOG.info(f"{CFG.name} V20.1 Started (Fixed Pattern Engine, min_edge={CFG.min_edge})")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
 
