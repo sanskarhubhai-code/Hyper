@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V20.1 — Fixed Pattern Engine)
+# bot.py — FTW VIP PREDICTOR (HYPER V20.2 — NO-SKIP GUARANTEED)
 # Python 3.10+  |  Deps: aiohttp
 
 import asyncio
@@ -29,7 +29,7 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v20.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v28.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -40,9 +40,10 @@ class Config:
     meta_lr: float = 0.03
     decay: float = 0.985
     max_pattern: int = 15
-    delivery_ttl: float = 55.0
+    delivery_ttl: float = 120.0  # ✅ TTL badha diya taaki message expire na ho
     name: str = "FTW VIP PREDICTOR (HYPER)"
-    min_edge: float = float(os.getenv("MIN_EDGE", "0.0"))
+    
+    # ✅ NO SKIP - min_edge hata diya
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -151,7 +152,6 @@ def weighted_probability(observations):
 
 # ─── FAMILY PATTERN ENGINE ─────────────────────────────────────
 def family_run(seq):
-    """[1,1,0,0,1] -> [(1,2),(0,2),(1,1)]"""
     if not seq:
         return []
     out = []
@@ -169,18 +169,10 @@ def family_run(seq):
 
 
 def family_signature(seq):
-    """Hashable run-length signature. Same signature = same family pattern."""
     return tuple((int(v), cnt) for v, cnt in family_run(seq))
 
 
 def valid_family_window(seq, start, length, min_len=5):
-    """
-    A window is only valid if:
-      - length >= min_len
-      - left boundary is clean (start == 0 OR seq[start] != seq[start-1])
-      - right boundary is clean (end == len(seq) OR seq[end-1] != seq[end])
-    This guarantees we only match complete family structures, never partial cuts.
-    """
     if length < min_len:
         return False
     if start > 0 and seq[start] == seq[start - 1]:
@@ -192,31 +184,17 @@ def valid_family_window(seq, start, length, min_len=5):
 
 
 class AdvancedFamilyTracker:
-    """
-    Run-length aware pattern tracker.
-
-    IMPORTANT: every score method returns P(next = 1) — a real next-value
-    probability, NOT a raw structural measure. That means the ensemble can
-    compare them 1:1 against other experts (markov, run, trend, …).
-    """
-
     def __init__(self, min_len=5, min_support=8):
         self.min_len = min_len
         self.min_support = min_support
 
-    # ── CORE: family pattern miner ─────────────────────────────
     def repeated_patterns(self, seq):
-        """
-        Returns list of dicts:
-          {sig, p, support, eff_n, score}
-        sorted by |p - 0.5| * sqrt(eff_n) descending.
-        """
         n = len(seq)
         if n < self.min_len * 2:
             return []
 
         max_len = min(26, max(self.min_len, n // 2))
-        groups = {}  # sig -> list of window end positions
+        groups = {}
 
         for length in range(self.min_len, max_len + 1):
             for start in range(0, n - length + 1):
@@ -255,13 +233,7 @@ class AdvancedFamilyTracker:
         results.sort(key=lambda x: x["score"], reverse=True)
         return results
 
-    # ── FEATURE PREDICTORS (all return P(next = 1)) ────────────
     def transition_score(self, seq):
-        """
-        P(next = 1) based on the last TWO run-lengths.
-        e.g. if history shows "B2 → S3 → ?" always returned B,
-             and current tail ends with "B2 → S3", predict B.
-        """
         n = len(seq)
         if n < 10:
             return 0.5
@@ -300,7 +272,6 @@ class AdvancedFamilyTracker:
         return 0.5
 
     def repeat_score(self, seq):
-        """Weighted average of top repeated-pattern probabilities."""
         patterns = self.repeated_patterns(seq)
         if not patterns:
             return 0.5
@@ -316,11 +287,6 @@ class AdvancedFamilyTracker:
         return clip(num / den)
 
     def mirror_score(self, seq):
-        """
-        P(next = 1) from mirror symmetry of the tail.
-        If the recent run-structure looks palindromic, expect the next value
-        to mirror the sequence's first value.
-        """
         n = len(seq)
         if n < 16:
             return 0.5
@@ -339,16 +305,11 @@ class AdvancedFamilyTracker:
             return 0.5
 
         mirror_next = 1 - tail[0]
-        strength = (similarity - 0.5) * 2.0  # 0..1
+        strength = (similarity - 0.5) * 2.0
         p = 0.5 + ((0.5 if mirror_next == 1 else -0.5) * strength * 0.5)
         return clip(p)
 
     def phase_score(self, seq):
-        """
-        P(next = 1) from run-length deviation.
-        Very long run  -> predict switch.
-        Very short run -> predict continuation.
-        """
         n = len(seq)
         if n < 12:
             return 0.5
@@ -370,7 +331,6 @@ class AdvancedFamilyTracker:
         return 0.5
 
     def density_score(self, seq):
-        """P(next = 1) — majority-side pressure (weak signal)."""
         n = len(seq)
         if n < 10:
             return 0.5
@@ -613,7 +573,6 @@ class Engine:
         return runs
 
     def mine_family_patterns(self, seq):
-        """Primary pattern miner — family-run structure."""
         if len(seq) < 12:
             return []
 
@@ -636,7 +595,6 @@ class Engine:
         return patterns
 
     def mine_patterns(self, seq):
-        """Family-first, exact-bit fallback."""
         fam = self.mine_family_patterns(seq)
         if fam:
             return fam
@@ -681,7 +639,6 @@ class Engine:
         def weight(idx):
             return 0.5 ** ((n - 1 - idx) / 300.0)
 
-        # ── patterns expert ──
         patterns = self.mine_patterns(seq)
         if patterns:
             num = 0.0
@@ -693,7 +650,6 @@ class Engine:
             if den > 0:
                 experts["patterns"] = num / den
 
-        # ── family experts ──
         family_stats = AdvancedFamilyTracker(
             min_len=5, min_support=CFG.min_support
         ).total_score(seq)
@@ -703,7 +659,6 @@ class Engine:
         experts["family_phase"]      = family_stats["phase"]
         experts["family_density"]    = family_stats["density"]
 
-        # ── markov ──
         for order in (1, 2, 3, 4):
             suffix = tuple(seq[-order:])
             obs = []
@@ -713,7 +668,6 @@ class Engine:
             if len(obs) >= CFG.min_support:
                 experts[f"markov{order}"] = weighted_probability(obs)[0]
 
-        # ── run continuation ──
         if n:
             run_at = [1] * n
             for i in range(1, n):
@@ -728,7 +682,6 @@ class Engine:
             if len(run_obs) >= CFG.min_support:
                 experts["run"] = weighted_probability(run_obs)[0]
 
-        # ── regime ──
         current_regime = get_regime(seq)
         regime_obs = [
             (seq[i], weight(i))
@@ -738,12 +691,10 @@ class Engine:
         if len(regime_obs) >= CFG.min_support:
             experts["regime"] = weighted_probability(regime_obs)[0]
 
-        # ── base rate ──
         experts["base"] = weighted_probability(
             [(y, weight(i)) for i, y in enumerate(seq)]
         )[0]
 
-        # ── nearest neighbors ──
         nearest = [
             (
                 seq[i],
@@ -755,14 +706,12 @@ class Engine:
         if len(nearest) >= 20:
             experts["neighbors"] = weighted_probability(nearest)[0]
 
-        # ── trend ──
         features = trend_features(seq)
         tw = self.db.get("trend_weights")
         if not isinstance(tw, list) or len(tw) != len(features):
             tw = [0.0] * len(features)
         experts["trend"] = logistic(tw, features)
 
-        # ── momentum ──
         momentum = sum(seq[-5:]) / 5.0 if seq else 0.5
         experts["momentum"] = 0.2 + (momentum * 0.6)
 
@@ -856,9 +805,8 @@ class Engine:
         edge = abs(p_cal - 0.5)
         confidence = max(p_cal, 1 - p_cal)
 
-        if CFG.min_edge > 0 and edge < CFG.min_edge:
-            return None
-
+        # ✅ NO SKIP logic - Always return prediction
+        
         return {
             "issue": issue,
             "p": p_cal,
@@ -929,7 +877,6 @@ class Engine:
                         [clip(w + CFG.learning_rate * (err * x - 0.01 * w), -4, 4) for w, x in zip(tw, payload["features"])]
                     )
 
-                # ── meta-learner (fixed: target = experts + bias) ──
                 target = len(EXPERT_NAMES) + 1
                 if payload.get("meta_feats"):
                     feats = payload["meta_feats"]
@@ -1062,23 +1009,17 @@ class Runtime:
                     if not exists:
                         p = self.engine.predict(history, issue)
                         with self.db.transaction():
-                            if p is None:
-                                LOG.info(f"Skipping issue {issue} (edge too low)")
-                                self.db.c.execute(
-                                    "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                    (issue, time.time(), "SKIP", json.dumps({"skipped": True})),
-                                )
-                            else:
-                                self.db.c.execute(
-                                    "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                    (issue, time.time(), "PENDING", json.dumps(p)),
-                                )
-                                self.db.queue(
-                                    "prediction",
-                                    issue,
-                                    format_prediction(p),
-                                    time.time() + CFG.delivery_ttl,
-                                )
+                            # ✅ ALWAYS PREDICT - NO SKIP
+                            self.db.c.execute(
+                                "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
+                                (issue, time.time(), "PENDING", json.dumps(p)),
+                            )
+                            self.db.queue(
+                                "prediction",
+                                issue,
+                                format_prediction(p),
+                                time.time() + CFG.delivery_ttl,
+                            )
 
             except asyncio.CancelledError:
                 raise
@@ -1174,7 +1115,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info(f"{CFG.name} V20.1 Started (Fixed Pattern Engine, min_edge={CFG.min_edge})")
+            LOG.info(f"{CFG.name} V20.2 Started (NO-SKIP GUARANTEED)")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
 
