@@ -1,14 +1,5 @@
 # bot.py — FTW VIP PREDICTOR (HYPER V18 — Deep Statistical Engine)
-# Python 3.10+  |  Deps: aiohttp
-#
-# Upgrade features:
-# - regime-aware pattern mining
-# - multi-model ensemble (pattern + run + trend + regime + neighbors + state + ngram + continuity)
-# - online reliability calibration
-# - anti-drawdown recovery bias after losses
-# - strong skip logic on weak edge
-# - number distribution fusion with regime-aware priors
-# - Telegram sending + DB persistence
+# Python 3.10+ | Deps: aiohttp
 
 import asyncio
 import contextlib
@@ -21,7 +12,7 @@ import signal
 import socket
 import sqlite3
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -37,7 +28,7 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v23.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v18.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -51,7 +42,6 @@ class Config:
     delivery_ttl: float = 60.0
     name: str = "FTW VIP PREDICTOR (HYPER V18)"
     min_edge: float = float(os.getenv("MIN_EDGE", "0.05"))
-    # stickers
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
@@ -147,15 +137,6 @@ def weighted_probability(observations):
     probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
     return probability, effective_n
 
-def ema(values, period):
-    if not values:
-        return 0.5
-    alpha = 2.0 / (period + 1)
-    v = float(values[0])
-    for x in values[1:]:
-        v = alpha * x + (1 - alpha) * v
-    return v
-
 def mean(xs):
     return sum(xs) / len(xs) if xs else 0.5
 
@@ -164,6 +145,15 @@ def stddev(xs):
         return 0.0
     m = mean(xs)
     return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
+
+def ema(values, period):
+    if not values:
+        return 0.5
+    alpha = 2.0 / (period + 1)
+    v = float(values[0])
+    for x in values[1:]:
+        v = alpha * x + (1 - alpha) * v
+    return v
 
 def entropy_prob(p):
     if p <= 0 or p >= 1:
@@ -186,9 +176,6 @@ def trend_features(seq):
     slow = slice_mean(24)
     extra = slice_mean(48)
     s3 = slice_mean(3)
-    s6 = slice_mean(6)
-    s12 = slice_mean(12)
-    s24 = slice_mean(24)
     rsi_val = 50.0
     if len(seq) >= 2:
         gains = 0.0
@@ -208,7 +195,6 @@ def trend_features(seq):
     recent_var = stddev(seq[-12:])
     long_var = stddev(seq[-24:])
 
-    # 32 dims
     return [
         1.0,
         2 * s3 - 1,
@@ -231,14 +217,14 @@ def trend_features(seq):
         entropy_prob(fast),
         0.0 if len(seq) < 25 else 1.0 if slow > fast else -1.0,
         1.0 if mean(seq[-5:]) > mean(seq[-24:]) else -1.0,
-        (2 * seq[-1] - 1) * (2 * s24 - 1),
-        abs(s24 - 0.5) * 2,
+        (2 * seq[-1] - 1) * (2 * slow - 1),
+        abs(slow - 0.5) * 2,
         (2 * seq[-1] - 1) * (mean(seq[-10:]) - mean(seq[-48:])),
         (2 * fast - 1) / (stddev(seq[-10:]) + 0.1),
-        (2 * s24 - 1) / (stddev(seq[-24:]) + 0.1),
+        (2 * slow - 1) / (stddev(seq[-24:]) + 0.1),
         (mean(seq[-10:]) - 0.5),
         (mean(seq[-5:]) - 0.5),
-        (2 * fast - 1) * (2 * s24 - 1),
+        (2 * fast - 1) * (2 * slow - 1),
         math.tanh((mean(seq[-10:]) - 0.5) * 6),
         math.tanh((mean(seq[-48:]) - 0.5) * 6),
         (2 * s3 - 1) * (2 * slice_mean(96) - 1),
@@ -252,7 +238,7 @@ EXPERT_NAMES = [
 ]
 
 
-# ─── DATABASE (advanced and resilient) ─────────────────────
+# ─── DATABASE ─────────────────────────────────────────────────
 class Database:
     def __init__(self, path):
         self.c = sqlite3.connect(path, isolation_level=None, timeout=20)
@@ -321,6 +307,7 @@ class Database:
             (key, n, loss, inv, failures),
         )
 
+    # Optimized adapt:
     def adapt(self, key, probability):
         m = self.memory(key)
         n = m["n"]
@@ -351,7 +338,7 @@ class Database:
         )
 
 
-# ─── DEEP ENGINE ──────────────────────────────────────────────
+# ─── BASE ENGINE ──────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
         self.db = db
@@ -422,6 +409,7 @@ class Engine:
                         eff_n,
                         f"exact:{bits}",
                     )
+
         return sorted(candidates.values(), key=lambda x: x[0], reverse=True)[:10]
 
     def mine_experts(self, seq):
@@ -431,7 +419,6 @@ class Engine:
         def weight(idx):
             return 0.5 ** ((n - 1 - idx) / 350.0)
 
-        # exact patterns expert
         patterns = self.mine_patterns(seq)
         if patterns:
             total_num = total_d = 0.0
@@ -442,7 +429,6 @@ class Engine:
             if total_d > 0:
                 experts["patterns"] = total_num / total_d
 
-        # markov experts
         for order in (1, 2, 3, 4):
             suffix = tuple(seq[-order:])
             obs = [
@@ -453,7 +439,6 @@ class Engine:
             if len(obs) >= CFG.min_support:
                 experts[f"markov{order}"] = weighted_probability(obs)[0]
 
-        # run expert
         if n:
             run_at = [1] * n
             for i in range(1, n):
@@ -468,7 +453,6 @@ class Engine:
             if len(run_obs) >= CFG.min_support:
                 experts["run"] = weighted_probability(run_obs)[0]
 
-        # regime expert
         current_regime = get_regime(seq)
         regime_obs = [
             (seq[i], weight(i))
@@ -478,10 +462,8 @@ class Engine:
         if len(regime_obs) >= CFG.min_support:
             experts["regime"] = weighted_probability(regime_obs)[0]
 
-        # base expert
         experts["base"] = weighted_probability([(y, weight(i)) for i, y in enumerate(seq)])[0]
 
-        # nearest-neighbor expert
         nearest = [
             (seq[i], weight(i) * 0.4 ** sum(a != b for a, b in zip(seq[i - 10:i], seq[-10:])))
             for i in range(10, n - 10)
@@ -490,14 +472,12 @@ class Engine:
         if len(nearest) >= 20:
             experts["neighbors"] = weighted_probability(nearest)[0]
 
-        # trend expert
         features = trend_features(seq)
         tw = self.db.get("trend_weights")
         if not isinstance(tw, list) or len(tw) != len(features):
             tw = [0.0] * len(features)
         experts["trend"] = sigmoid(sum(w * x for w, x in zip(tw, features)))
 
-        # momentum + cyclic + jump + state + entropy
         momentum = mean(seq[-5:]) if seq else 0.5
         experts["momentum"] = 0.2 + (momentum * 0.6)
 
@@ -522,12 +502,104 @@ class Engine:
             experts["state"] = state_val
 
         if seq:
-            # entropy of recent bit distribution
             recent = seq[-20:]
             p = mean(recent)
             experts["entropy"] = 0.5 + 0.3 * (1 - abs(0.5 - p) * 2.0)
 
         return experts, patterns, features, current_regime
+
+    def settle(self, history):
+        lookup = {r["issue"]: r for r in history}
+        if history:
+            sig = f"{history[0]['issue']}-{history[-1]['issue']}-{len(history)}"
+            if self.db.get("ngram_sig") != sig:
+                num_ngrams, num_freq = {}, {}
+                for i in range(1, len(history)):
+                    curr = history[i]["num"]
+                    num_freq[str(curr)] = num_freq.get(str(curr), 0) + 1
+                    for length in range(2, 11):
+                        if i >= length:
+                            seq_key = ",".join(str(history[j]["num"]) for j in range(i - length, i))
+                            num_ngrams.setdefault(seq_key, {})
+                            num_ngrams[seq_key][str(curr)] = num_ngrams[seq_key].get(str(curr), 0) + 1
+                self.db.set("num_ngrams", num_ngrams)
+                self.db.set("num_freq", num_freq)
+                self.db.set("ngram_sig", sig)
+
+        pending = self.db.c.execute(
+            "SELECT issue,payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)"
+        ).fetchall()
+
+        for row in pending:
+            actual = lookup.get(row["issue"])
+            if actual is None:
+                continue
+
+            p = json.loads(row["payload"])
+            y = actual["size"]
+            won_side = int(p["p"] >= 0.5) == y
+            won_num = p.get("num") == actual["num"]
+
+            with self.db.transaction():
+                self.db.c.execute(
+                    "UPDATE predictions SET status=?,actual=? WHERE issue=?",
+                    ("WIN" if won_side else "LOSS", actual["num"], row["issue"]),
+                )
+
+                for name, val in p["experts"].items():
+                    self.db.learn(f"expert:{name}:{p['regime']}", val, y)
+
+                for pat in p["patterns"]:
+                    self.db.learn(pat["key"], pat["p"], y)
+
+                if p.get("features") and p["experts"].get("trend"):
+                    err = y - p["experts"]["trend"]
+                    tw = self.db.get("trend_weights") or [0.0] * len(p["features"])
+                    self.db.set("trend_weights",
+                                [clip(w + CFG.learning_rate * (err * x - 0.01 * w), -4, 4)
+                                 for w, x in zip(tw, p["features"])])
+
+                target = len(EXPERT_NAMES) + 2
+                if p.get("meta_feats"):
+                    mw = self.db.get("meta_weights")
+                    if not isinstance(mw, list) or len(mw) != target:
+                        if isinstance(mw, list) and len(mw) == target - 1:
+                            mw = mw[:-1] + [0.0, mw[-1]]
+                        else:
+                            mw = [1.0 / len(EXPERT_NAMES)] * len(EXPERT_NAMES) + [0.0]
+                    feats = p["meta_feats"]
+                    if len(feats) == target - 1:
+                        feats = feats[:-1] + [0.0, feats[-1]]
+                    if len(feats) == target:
+                        mp = sigmoid(sum(w * f for w, f in zip(mw, feats)))
+                        grad = 2.0 * (y - mp) * mp * (1.0 - mp)
+                        self.db.set("meta_weights",
+                                    [clip(w * 0.999 + CFG.meta_lr * grad * f, -4, 4)
+                                     for w, f in zip(mw, feats)])
+                        self.db.set("meta_n", self.db.get("meta_n", 0) + 1)
+
+                bucket = min(19, int(p.get("p_raw", p["p"]) * 20))
+                n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
+                self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + y])
+
+                recent = self.db.get("recent_results", [])
+                recent.append("WIN" if won_side else "LOSS")
+                if len(recent) > 20:
+                    recent = recent[-20:]
+                self.db.set("recent_results", recent)
+
+                if won_side and won_num:
+                    sticker = CFG.jack_sticker
+                elif won_side:
+                    sticker = CFG.win_sticker
+                else:
+                    sticker = CFG.loss_sticker
+                self.db.queue("sticker", row["issue"], sticker)
+
+                self.db.c.execute(
+                    "UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent=0",
+                    (row["issue"],)
+                )
 
 
 # ─── NUMBER ENGINE ────────────────────────────────────────────
@@ -544,14 +616,12 @@ class NumberEngine:
     def get_distribution(self, nums):
         ngram_db = self.db.get("num_ngrams", {})
         dist = [1.0] * 10
-        # global base from recent seq frequencies
         if nums:
             freq = Counter(nums)
             total = sum(freq.values())
             if total > 0:
                 for i in range(10):
                     dist[i] += 3.0 * (freq.get(i, 0) / total)
-        # suffix transitions
         for length in range(min(10, len(nums)), 1, -1):
             seq_key = ",".join(str(x) for x in nums[-length:])
             if seq_key in ngram_db:
@@ -591,7 +661,7 @@ class NumberEngine:
         return best, dist[best] / total
 
 
-# ─── MAIN UPGRADED ENGINE ─────────────────────────────────────
+# ─── UPGRADED ENGINE ──────────────────────────────────────────
 class UpgradedEngine(Engine):
     def __init__(self, db):
         super().__init__(db)
@@ -651,7 +721,6 @@ class UpgradedEngine(Engine):
         recent = self.db.get("recent_results", [])
         if not recent:
             return 0.0
-        # after any loss, push more toward reversal pattern
         if recent[-1] == "LOSS":
             return 0.12
         if len(recent) >= 2 and recent[-2] == "LOSS" and recent[-1] == "WIN":
@@ -667,7 +736,6 @@ class UpgradedEngine(Engine):
         num_dist = self.get_number_distribution(nums)
         big_prob = sum(num_dist[5:])
 
-        # Add strong evidence experts
         experts["ngram_num"] = big_prob
         experts["side_shift"] = 0.5 + 0.15 * (big_prob - 0.5)
 
@@ -698,7 +766,6 @@ class UpgradedEngine(Engine):
         alpha = min(self.db.get("meta_n", 0) / 80.0, 1.0)
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
 
-        # Streak + recovery logic
         if current_streak >= 4:
             p_streak = self._streak_probability(seq)
             p_raw = 0.6 * p_streak + 0.4 * p_raw
@@ -711,7 +778,6 @@ class UpgradedEngine(Engine):
         n_global, s_global = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
         p_cal = clip((30 * p_raw + s_global) / (30 + n_global))
 
-        # Strong side from number distribution
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
         valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
         best_num = max(valid_nums, key=lambda x: num_dist[x])
@@ -724,7 +790,6 @@ class UpgradedEngine(Engine):
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
 
-        # Strong skip policy
         if CFG.min_edge > 0 and edge < CFG.min_edge:
             return None
 
@@ -758,7 +823,6 @@ def _pattern_str(patterns):
     bits = top[4].split(":")[-1]
     arrow = "⬆️" if top[1] >= 0.5 else "⬇️"
     return f"👨‍👩‍👧‍👦 <code>{bits}</code> {arrow}" if p_type == "family" else f"<code>{bits}</code> {arrow}"
-
 
 def format_prediction(p):
     conf = max(p["p"], 1 - p["p"]) * 100
@@ -916,116 +980,6 @@ class Runtime:
         })
 
 
-# ─── ENGINE SETTLEMENT LOGIC ─────────────────────────────────
-class Engine(Engine):
-    pass
-
-
-# Patch original Engine with settlement support
-def _settle_impl(self, history):
-    lookup = {r["issue"]: r for r in history}
-    if history:
-        sig = f"{history[0]['issue']}-{history[-1]['issue']}-{len(history)}"
-        if self.db.get("ngram_sig") != sig:
-            num_ngrams, num_freq = {}, {}
-            for i in range(1, len(history)):
-                curr = history[i]["num"]
-                num_freq[str(curr)] = num_freq.get(str(curr), 0) + 1
-                for length in range(2, 11):
-                    if i >= length:
-                        seq_key = ",".join(str(history[j]["num"]) for j in range(i - length, i))
-                        num_ngrams.setdefault(seq_key, {})
-                        num_ngrams[seq_key][str(curr)] = num_ngrams[seq_key].get(str(curr), 0) + 1
-            self.db.set("num_ngrams", num_ngrams)
-            self.db.set("num_freq", num_freq)
-            self.db.set("ngram_sig", sig)
-
-    pending = self.db.c.execute(
-        "SELECT issue,payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)"
-    ).fetchall()
-
-    for row in pending:
-        actual = lookup.get(row["issue"])
-        if actual is None:
-            continue
-
-        p = json.loads(row["payload"])
-        y = actual["size"]
-        won_side = int(p["p"] >= 0.5) == y
-        won_num = p.get("num") == actual["num"]
-
-        with self.db.transaction():
-            self.db.c.execute(
-                "UPDATE predictions SET status=?,actual=? WHERE issue=?",
-                ("WIN" if won_side else "LOSS", actual["num"], row["issue"]),
-            )
-
-            # learn experts
-            for name, val in p["experts"].items():
-                self.db.learn(f"expert:{name}:{p['regime']}", val, y)
-
-            for pat in p["patterns"]:
-                self.db.learn(pat["key"], pat["p"], y)
-
-            if p.get("features") and p["experts"].get("trend"):
-                err = y - p["experts"]["trend"]
-                tw = self.db.get("trend_weights") or [0.0] * len(p["features"])
-                self.db.set("trend_weights", [
-                    clip(w + CFG.learning_rate * (err * x - 0.01 * w), -4, 4)
-                    for w, x in zip(tw, p["features"])
-                ])
-
-            target = len(EXPERT_NAMES) + 2
-            if p.get("meta_feats"):
-                mw = self.db.get("meta_weights")
-                if not isinstance(mw, list) or len(mw) != target:
-                    if isinstance(mw, list) and len(mw) == target - 1:
-                        mw = mw[:-1] + [0.0, mw[-1]]
-                    else:
-                        mw = [1.0 / len(EXPERT_NAMES)] * len(EXPERT_NAMES) + [0.0]
-                feats = p["meta_feats"]
-                if len(feats) == target - 1:
-                    feats = feats[:-1] + [0.0, feats[-1]]
-                if len(feats) == target:
-                    mp = sigmoid(sum(w * f for w, f in zip(mw, feats)))
-                    grad = 2.0 * (y - mp) * mp * (1.0 - mp)
-                    self.db.set("meta_weights", [
-                        clip(w * 0.999 + CFG.meta_lr * grad * f, -4, 4)
-                        for w, f in zip(mw, feats)
-                    ])
-                    self.db.set("meta_n", self.db.get("meta_n", 0) + 1)
-
-            bucket = min(19, int(p.get("p_raw", p["p"]) * 20))
-            n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
-            self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + y])
-
-            # recent results memory for recovery logic
-            recent = self.db.get("recent_results", [])
-            recent.append("WIN" if won_side else "LOSS")
-            if len(recent) > 20:
-                recent = recent[-20:]
-            self.db.set("recent_results", recent)
-
-            # stickers
-            if won_side and won_num:
-                sticker = CFG.jack_sticker
-            elif won_side:
-                sticker = CFG.win_sticker
-            else:
-                sticker = CFG.loss_sticker
-            self.db.queue("sticker", row["issue"], sticker)
-
-            # prevent duplicate queueing
-            self.db.c.execute(
-                "UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent=0",
-                (row["issue"],),
-            )
-
-
-# attach method to Engine in runtime
-Engine.settle = _settle_impl
-
-
 # ─── MAIN ──────────────────────────────────────────────────
 async def main():
     CFG.validate()
@@ -1042,6 +996,7 @@ async def main():
     runner = web.AppRunner(app)
     tasks = []
     stop_task = None
+
     try:
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", CFG.port).start()
