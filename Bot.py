@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (REAL PATTERN TRACKER + FIXED)
+# bot.py — FTW VIP PREDICTOR (SUPER ADVANCED PATTERN TRACKER)
 # Python 3.10+ | aiohttp
 
 import asyncio
@@ -32,19 +32,17 @@ class Config:
     ) or (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_pattern_tracker.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_super_advanced.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
-    max_history: int = 5000
+    max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
+    min_edge: float = float(os.getenv("MIN_EDGE", "0.06"))
     max_pattern_len: int = int(os.getenv("MAX_PATTERN_LEN", "12"))
-    learning_rate: float = 0.06
-    meta_lr: float = 0.05
-    decay: float = 0.988
-    delivery_ttl: float = 55.0
-    name: str = "FTW VIP PREDICTOR (PATTERN TRACKER)"
+    delivery_ttl: float = 45.0
+    name: str = "FTW VIP PREDICTOR (SUPER ADVANCED)"
     win_sticker: str = os.getenv("WIN_STICKER", "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E")
     loss_sticker: str = os.getenv("LOSS_STICKER", "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E")
     jack_sticker: str = os.getenv("JACK_STICKER", "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E")
@@ -64,7 +62,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 LOG = logging.getLogger("predictor")
 
 # -----------------------------
-# COMMON HELPERS
+# HELPERS
 # -----------------------------
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
@@ -85,8 +83,8 @@ def numeric(value):
 def run_length(seq):
     if not seq:
         return 0
-    n = 0
     last = seq[-1]
+    n = 0
     for x in reversed(seq):
         if x != last:
             break
@@ -125,77 +123,6 @@ def ema(seq, k):
         val = alpha * x + (1.0 - alpha) * val
     return val
 
-def trend_features(seq):
-    if not seq:
-        return [0.0] * 16
-
-    def mean(k):
-        arr = seq[-k:]
-        return sum(arr) / len(arr) if arr else 0.5
-
-    def std(k):
-        arr = seq[-k:]
-        if len(arr) < 2:
-            return 0.0
-        m = sum(arr) / len(arr)
-        return math.sqrt(sum((x - m) ** 2 for x in arr) / len(arr))
-
-    tail = seq[-12:]
-    recent_avg = sum(seq[-6:]) / len(seq[-6:])
-    recent_short = sum(seq[-3:]) / len(seq[-3:])
-    alternation = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
-    e12 = ema(seq, 12)
-    e6 = ema(seq, 6)
-
-    return [
-        1.0,
-        2 * mean(3) - 1,
-        2 * mean(5) - 1,
-        2 * mean(8) - 1,
-        2 * mean(12) - 1,
-        2 * recent_avg - 1,
-        2 * recent_short - 1,
-        2 * seq[-1] - 1,
-        2 * alternation - 1,
-        2 * e12 - 1,
-        2 * e6 - 1,
-        2 * std(5) - 1,
-        2 * std(10) - 1,
-        (sum(seq[-10:]) / 10.0) - 0.5,
-        (sum(seq[-5:]) / 5.0) - 0.5,
-        (e12 - e6) * 2,
-    ]
-
-def logistic(weights, features):
-    return sigmoid(sum(w * x for w, x in zip(weights, features)))
-
-def run_length_score(seq):
-    if not seq:
-        return 0.0
-    return (min(run_length(seq), 10) / 10.0) * (2 * seq[-1] - 1)
-
-def regime_counts(history):
-    seq = [x["size"] for x in history]
-    out = {
-        "RUN": {"big": 0, "small": 0, "total": 0},
-        "ALT": {"big": 0, "small": 0, "total": 0},
-        "IMBAL": {"big": 0, "small": 0, "total": 0},
-        "MIXED": {"big": 0, "small": 0, "total": 0},
-        "COLD": {"big": 0, "small": 0, "total": 0},
-    }
-    if not seq:
-        return out
-
-    for i in range(1, len(seq)):
-        reg = get_regime(seq[max(0, i-24):i])
-        out.setdefault(reg, {"big": 0, "small": 0, "total": 0})
-        out[reg]["total"] += 1
-        if seq[i] == 1:
-            out[reg]["big"] += 1
-        else:
-            out[reg]["small"] += 1
-    return out
-
 def recent_suffix_scores(history, max_len=8):
     seq = [x["size"] for x in history]
     if not seq:
@@ -221,7 +148,6 @@ def recent_suffix_scores(history, max_len=8):
                 "big": cnt_big / total,
                 "small": cnt_small / total,
                 "total": total,
-                "bias": (cnt_big - cnt_small) / total
             }
     return scores
 
@@ -284,8 +210,7 @@ class Database:
         self.c.executescript("""
             CREATE TABLE IF NOT EXISTS history(issue TEXT PRIMARY KEY, num INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS predictions(issue TEXT PRIMARY KEY, created REAL NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, actual INTEGER);
-            CREATE TABLE IF NOT EXISTS models(key TEXT PRIMARY KEY, n REAL NOT NULL, loss REAL NOT NULL, inverse_loss REAL NOT NULL, failures INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind TEXT NOT NULL,
@@ -295,13 +220,14 @@ class Database:
                 expires REAL,
                 sent INTEGER NOT NULL DEFAULT 0
             );
-        """)
-
-        self.c.execute("""
-            CREATE TABLE IF NOT EXISTS state(
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            )
+            CREATE TABLE IF NOT EXISTS pattern_stats(
+                pattern_key TEXT PRIMARY KEY,
+                big_count INTEGER NOT NULL DEFAULT 0,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                big_rate REAL NOT NULL DEFAULT 0.5,
+                last_seen REAL NOT NULL DEFAULT 0,
+                regime TEXT NOT NULL DEFAULT 'MIXED'
+            );
         """)
 
         self.set_value("meta_n", "0")
@@ -334,15 +260,44 @@ class Database:
             return default
         return json.loads(row["value"])
 
-    def set_meta(self, key, value):
-        self.c.execute(
-            "INSERT INTO meta VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, json.dumps(value))
-        )
+    def pattern_get(self, key):
+        row = self.c.execute(
+            "SELECT big_count, total_count, big_rate, last_seen, regime FROM pattern_stats WHERE pattern_key=?",
+            (key,)
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "big_count": row["big_count"],
+            "total_count": row["total_count"],
+            "big_rate": row["big_rate"],
+            "last_seen": row["last_seen"],
+            "regime": row["regime"],
+        }
 
-    def get_meta(self, key, default=None):
-        row = self.c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-        return json.loads(row["value"]) if row else default
+    def pattern_upsert(self, key, next_big, regime):
+        now = time.time()
+        existing = self.pattern_get(key)
+        if existing:
+            total = existing["total_count"] + 1
+            big_total = existing["big_count"] + (1 if next_big else 0)
+            new_rate = big_total / total
+            self.c.execute(
+                """
+                UPDATE pattern_stats
+                SET big_count = ?, total_count = ?, big_rate = ?, last_seen = ?, regime = ?
+                WHERE pattern_key = ?
+                """,
+                (big_total, total, new_rate, now, regime, key),
+            )
+        else:
+            self.c.execute(
+                """
+                INSERT INTO pattern_stats(pattern_key, big_count, total_count, big_rate, last_seen, regime)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (key, 1 if next_big else 0, 1, 1.0 if next_big else 0.0, now, regime),
+            )
 
     def ingest(self, records):
         with self.transaction():
@@ -360,44 +315,6 @@ class Database:
     def history(self):
         rows = self.c.execute("SELECT issue, num FROM history ORDER BY CAST(issue AS INTEGER)").fetchall()
         return [{"issue": r["issue"], "num": r["num"], "size": int(r["num"] >= 5)} for r in rows]
-
-    def memory(self, key):
-        row = self.c.execute("SELECT * FROM models WHERE key=?", (key,)).fetchone()
-        return dict(row) if row else {"n": 0.0, "loss": 0.0, "inverse_loss": 0.0, "failures": 0}
-
-    def learn(self, key, probability, actual):
-        m = self.memory(key)
-        n = CFG.decay * m["n"] + 1
-        loss = CFG.decay * m["loss"] + (probability - actual) ** 2
-        inv = CFG.decay * m["inverse_loss"] + (1 - probability - actual) ** 2
-        wrong = int(probability >= 0.5) != actual
-        failures = m["failures"] + 1 if wrong else 0
-        self.c.execute(
-            "INSERT INTO models VALUES (?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
-            "n=excluded.n, loss=excluded.loss, inverse_loss=excluded.inverse_loss, failures=excluded.failures",
-            (key, n, loss, inv, failures)
-        )
-
-    def adapt(self, key, probability):
-        m = self.memory(key)
-        n = m["n"]
-        if n < 1:
-            return probability, 0.75, False
-        brier = m["loss"] / n
-        reliability = clip((0.26 - brier) / 0.12, 0.0, 1.0)
-        maturity = min(n / 50.0, 1.0)
-        shrink = (1 - maturity) * 0.65 + maturity * reliability
-        adjusted = 0.5 + (probability - 0.5) * shrink
-        weight = clip(math.exp(-6 * (brier - 0.22)), 0.18, 2.8)
-        if m["failures"] >= 4:
-            weight *= 0.7
-        return clip(adjusted), weight, False
-
-    def queue(self, kind, issue, text, expires=None):
-        self.c.execute(
-            "INSERT INTO outbox(kind, issue, text, created, expires) VALUES (?, ?, ?, ?, ?)",
-            (kind, issue, text, time.time(), expires)
-        )
 
     def update_recovery_state(self, settled_result):
         consecutive_losses = int(self.get_value("consecutive_losses", 0))
@@ -418,35 +335,60 @@ class Database:
             "recovery_mode": int(self.get_value("recovery_mode", 0)),
         }
 
+    def queue(self, kind, issue, text, expires=None):
+        self.c.execute(
+            "INSERT INTO outbox(kind, issue, text, created, expires) VALUES (?, ?, ?, ?, ?)",
+            (kind, issue, text, time.time(), expires)
+        )
+
 # -----------------------------
-# PATTERN TRACKER ENGINE
+# ENGINE
 # -----------------------------
 class Engine:
     def __init__(self, db):
         self.db = db
 
-    def exact_long_patterns(self, seq):
-        results = []
-        max_len = min(CFG.max_pattern_len, len(seq) // 2)
-        for L in range(5, max_len + 1):
-            if len(seq) < L + 1:
-                continue
-            suffix = tuple(seq[-L:])
-            count = 0
-            big_after = 0
-            for i in range(len(seq) - L):
-                cand = tuple(seq[i:i+L])
-                if cand == suffix:
-                    count += 1
-                    if seq[i+L] == 1:
-                        big_after += 1
-            if count >= CFG.min_support:
-                p = big_after / count
-                results.append((L, suffix, count, p))
-        results.sort(key=lambda x: (abs(x[3] - 0.5), x[2]), reverse=True)
-        return results[:8]
+    def build_pattern_tracker(self, history):
+        if not history:
+            return
+        seq = [x["size"] for x in history]
+        if len(seq) < 6:
+            return
 
-    def markov_model(self, seq):
+        for i in range(5, len(seq) - 1):
+            pattern = tuple(seq[i-5:i])
+            regime = get_regime(seq[max(0, i-24):i])
+            key = f"{regime}:{len(pattern)}:{pattern}"
+            next_big = 1 if seq[i] == 1 else 0
+            self.db.pattern_upsert(key, next_big, regime)
+
+    def exact_pattern_score(self, history):
+        seq = [x["size"] for x in history]
+        if len(seq) < 6:
+            return 0.5, []
+
+        matches = []
+        for L in range(5, min(CFG.max_pattern_len, len(seq) - 1) + 1):
+            suffix = tuple(seq[-L:])
+            regime = get_regime(seq[max(0, len(seq)-24):len(seq)])
+            key = f"{regime}:{L}:{suffix}"
+            stat = self.db.pattern_get(key)
+            if stat:
+                matches.append((L, stat["big_rate"], stat["total_count"], key))
+
+        if not matches:
+            return 0.5, []
+
+        total_w = 0.0
+        total_p = 0.0
+        for L, p, count, key in matches:
+            w = min(1.0, count / 25.0) * (1.0 + (L * 0.12))
+            total_w += w
+            total_p += p * w
+
+        return (total_p / total_w) if total_w else 0.5, matches
+
+    def markov_score(self, seq):
         model = []
         for L in range(1, 5):
             if len(seq) <= L:
@@ -454,13 +396,39 @@ class Engine:
             total = 0
             big_after = 0
             for i in range(len(seq) - L):
-                nxt = seq[i+L]
+                nxt = seq[i + L]
                 total += 1
                 if nxt == 1:
                     big_after += 1
             if total:
                 model.append((L, big_after / total, total))
-        return model
+        if not model:
+            return 0.5
+        total_w = sum(w for _, _, w in model)
+        return sum(p * w for _, p, w in model) / total_w if total_w else 0.5
+
+    def regime_probability(self, history):
+        seq = [x["size"] for x in history]
+        reg_map = {
+            "RUN": {"big": 0, "small": 0, "total": 0},
+            "ALT": {"big": 0, "small": 0, "total": 0},
+            "IMBAL": {"big": 0, "small": 0, "total": 0},
+            "MIXED": {"big": 0, "small": 0, "total": 0},
+            "COLD": {"big": 0, "small": 0, "total": 0},
+        }
+
+        for i in range(1, len(seq)):
+            reg = get_regime(seq[max(0, i-24):i])
+            reg_map.setdefault(reg, {"big": 0, "small": 0, "total": 0})
+            reg_map[reg]["total"] += 1
+            if seq[i] == 1:
+                reg_map[reg]["big"] += 1
+            else:
+                reg_map[reg]["small"] += 1
+
+        reg = get_regime(seq)
+        reg_counts = reg_map.get(reg, {"big": 1, "small": 1, "total": 2})
+        return (reg_counts["big"] / reg_counts["total"]) if reg_counts["total"] else 0.5
 
     def predict(self, history, issue):
         seq = [x["size"] for x in history]
@@ -476,39 +444,18 @@ class Engine:
                 "confidence": 0.5,
                 "regime": "MIXED",
                 "source": "📊 Baseline",
-                "patterns": [],
+                "pattern_matches": [],
                 "recovery_mode": False,
                 "strong_reversal": False,
             }
 
         reg = get_regime(seq)
-        reg_map = regime_counts(history)
-        reg_counts = reg_map.get(reg, {"big": 1, "small": 1, "total": 2})
-        reg_prob = (reg_counts["big"] / reg_counts["total"]) if reg_counts["total"] else 0.5
+        reg_prob = self.regime_probability(history)
 
-        # exact long pattern probability
-        exact_patterns = self.exact_long_patterns(seq)
-        exact_prob = 0.5
-        pattern_list = []
-        if exact_patterns:
-            weights = []
-            vals = []
-            for L, suffix, count, p in exact_patterns:
-                w = min(1.0, count / 30.0) * (1.0 + (L * 0.18))
-                weights.append(w)
-                vals.append(p * w)
-            exact_prob = sum(vals) / sum(weights) if sum(weights) else 0.5
-            for L, suffix, count, p in exact_patterns[:5]:
-                pattern_list.append({"key": f"suffix:{L}:{suffix}", "p": p, "support": count})
+        pattern_prob, pattern_matches = self.exact_pattern_score(history)
+        if not pattern_matches:
+            pattern_prob = 0.5
 
-        # Markov probability
-        markov = self.markov_model(seq)
-        markov_prob = 0.5
-        if markov:
-            total_w = sum(w for _, _, w in markov)
-            markov_prob = sum(p * w for _, p, w in markov) / total_w if total_w else 0.5
-
-        # recent exact suffix probability
         suffix_scores = recent_suffix_scores(history, max_len=8)
         recent_suffix_prob = 0.5
         if suffix_scores:
@@ -518,15 +465,15 @@ class Engine:
 
         tail = seq[-8:]
         tail_prob = sum(tail) / len(tail)
-        run_score = run_length_score(seq)
+
+        markov_prob = self.markov_score(seq)
 
         p_big = (
-            0.42 * exact_prob +
+            0.42 * pattern_prob +
             0.22 * reg_prob +
             0.18 * markov_prob +
             0.10 * recent_suffix_prob +
-            0.06 * tail_prob +
-            0.02 * (0.5 + run_score * 0.5)
+            0.08 * tail_prob
         )
         p_big = clip(p_big, 0.02, 0.98)
 
@@ -543,7 +490,7 @@ class Engine:
 
         side = "BIG" if p_big >= 0.5 else "SMALL"
 
-        # number prediction based on exact suffix matches only
+        # number prediction using exact recent suffix patterns
         num_dist = [1.0] * 10
         if nums:
             for L in range(5, min(12, len(nums)) + 1):
@@ -575,6 +522,9 @@ class Engine:
             confidence = min(0.99, confidence + 0.06)
             edge = max(edge, 0.12)
 
+        if CFG.min_edge > 0 and edge < CFG.min_edge:
+            return None
+
         return {
             "issue": issue,
             "p": p_big,
@@ -585,7 +535,7 @@ class Engine:
             "confidence": confidence,
             "regime": reg,
             "source": "📊 Exact Pattern Tracker",
-            "patterns": pattern_list,
+            "pattern_matches": pattern_matches,
             "recovery_mode": recovery_mode,
             "strong_reversal": strong_reversal,
         }
@@ -602,14 +552,10 @@ def format_prediction(p):
     quality = "🔥 HIGH VIP" if conf >= 65 else "⭐ VIP" if conf >= 60 else "✅ NORMAL"
     stake = "2x" if conf >= 70 else "1.5x" if conf >= 65 else "1x" if conf >= 60 else "0.5x"
 
-    shift = ""
-    if p.get("regime"):
-        shift = f"\n🌊 <b>REGIME:</b> {escape(p['regime'])}"
-
     pattern_text = ""
-    if p.get("patterns"):
-        first = p["patterns"][0]
-        pattern_text = f"\n🧩 <b>PATTERN:</b> <code>{escape(first['key'])}</code>"
+    if p.get("pattern_matches"):
+        first = p["pattern_matches"][0]
+        pattern_text = f"\n🧩 <b>PATTERN:</b> <code>{escape(first[3])}</code>"
 
     rec_txt = ""
     if p.get("recovery_mode"):
@@ -626,7 +572,8 @@ def format_prediction(p):
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
         f"🏆 <b>QUALITY:</b> {quality} (Stake: {stake})\n"
-        f"📐 <b>EDGE:</b> {p.get('edge', 0) * 100:.1f}%{rec_txt}{shift}{pattern_text}\n"
+        f"📐 <b>EDGE:</b> {p.get('edge', 0) * 100:.1f}%{rec_txt}\n"
+        f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}{pattern_text}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
 
@@ -634,12 +581,17 @@ def format_prediction(p):
 # SETTLEMENT
 # -----------------------------
 def settle_history(db, history):
+    if not history:
+        return
+
+    engine = Engine(db)
+    engine.build_pattern_tracker(history)
+
     pending = db.c.execute(
         "SELECT issue, payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)"
     ).fetchall()
 
     lookup = {r["issue"]: r for r in history}
-
     for row in pending:
         issue = row["issue"]
         actual = lookup.get(issue)
@@ -660,6 +612,7 @@ def settle_history(db, history):
                 "UPDATE predictions SET status=?, actual=? WHERE issue=?",
                 (final_status, actual_num, issue)
             )
+
             if won_side and won_num:
                 db.update_recovery_state("WIN")
                 sticker = CFG.jack_sticker
@@ -682,7 +635,6 @@ class Runtime:
         self.engine = Engine(db)
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
-        self.error = None
 
     async def pause(self, seconds):
         try:
@@ -722,36 +674,36 @@ class Runtime:
                 self.db.ingest(records)
                 history = self.db.history()
                 self.last_fetch = time.time()
-                self.error = None
                 failures = 0
 
                 settle_history(self.db, history)
 
                 if history:
                     latest = int(history[-1]["issue"])
-                    self.db.set_meta("latest_seen", latest)
-
                     if len(history) >= CFG.min_history:
                         issue = str(latest + 1)
                         exists = self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
                         if not exists:
-                            p = self.engine.predict(history, issue)
-                            payload = json.dumps(p)
-
-                            self.db.c.execute(
-                                "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                (issue, time.time(), "PENDING", payload)
-                            )
-                            self.db.queue("prediction", issue, format_prediction(p), time.time() + CFG.delivery_ttl)
-
-                            self.db.set_value("last_issue", json.dumps(issue))
-                            self.db.set_value("last_side", json.dumps(p["side"]))
-                            self.db.set_value("last_num", str(p["num"]))
+                            pred = self.engine.predict(history, issue)
+                            if pred is not None:
+                                payload = json.dumps(pred)
+                                self.db.c.execute(
+                                    "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
+                                    (issue, time.time(), "PENDING", payload)
+                                )
+                                self.db.queue("prediction", issue, format_prediction(pred), time.time() + CFG.delivery_ttl)
+                                self.db.set_value("last_issue", json.dumps(issue))
+                                self.db.set_value("last_side", json.dumps(pred["side"]))
+                                self.db.set_value("last_num", str(pred["num"]))
+                            else:
+                                self.db.c.execute(
+                                    "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
+                                    (issue, time.time(), "SKIP", json.dumps({"skipped": True}))
+                                )
 
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                self.error = type(exc).__name__
                 failures += 1
                 LOG.error("Worker failure: %s", exc)
 
@@ -835,7 +787,6 @@ async def main():
     runner = web.AppRunner(app)
     tasks = []
     stop_task = None
-
     try:
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", CFG.port).start()
