@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V17 — Statistics-First Engine)
+# bot.py — FTW VIP PREDICTOR (HYPER V18 — No-Skip Edition)
 # Python 3.10+  |  Deps: aiohttp
 
 import asyncio
@@ -43,8 +43,8 @@ class Config:
     delivery_ttl: float = 55.0
     name: str = "FTW VIP PREDICTOR (HYPER)"
 
-    # min_edge should stay as a single-line value, not multiple lines
-    min_edge: float = float(os.getenv("MIN_EDGE", "0.0"))
+    # 🔒 NO SKIP — har issue pe prediction guaranteed
+    min_edge: float = 0.0
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -153,12 +153,6 @@ def weighted_probability(observations):
 
 # ─── FAMILY PATTERN ENGINE ─────────────────────────────────────
 def family_run(seq):
-    """
-    Convert sequence into family run tokens.
-    Example:
-      [1,1,0,0,1,1,1,0,1]
-      -> [(1,2), (0,2), (1,3), (0,1), (1,1)]
-    """
     if not seq:
         return []
     out = []
@@ -176,24 +170,10 @@ def family_run(seq):
 
 
 def family_signature(seq):
-    """
-    PRIMARY PATTERN TRACKER.
-    This is the correct tracker for your screenshot logic.
-    Same connected same-size family stays together.
-    Example:
-      BBSSBBSSSB -> ((1,2),(0,2),(1,2),(0,3),(1,1))
-      BBSBBBB   -> ((1,2),(0,1),(1,5))
-      BSBBBB    -> ((1,1),(0,1),(1,5))
-    These are different -> no false match.
-    """
     return tuple((int(v), cnt) for v, cnt in family_run(seq))
 
 
 def valid_family_window(seq, start, length, min_len=5):
-    """
-    Reject windows that cut through a same-family run.
-    Minimum pattern length must be 5.
-    """
     if length < min_len:
         return False
     if start > 0 and seq[start] == seq[start - 1]:
@@ -405,7 +385,7 @@ class Database:
         )
 
 
-# ─── BASE ENGINE (pattern logic fixed below) ──────────────────
+# ─── BASE ENGINE ──────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
         self.db = db
@@ -428,12 +408,6 @@ class Engine:
 
     # ✅ Family-aware pattern miner
     def mine_family_patterns(self, seq):
-        """
-        Correct logic:
-        - minimum pattern length = 5
-        - same connected family is kept together
-        - BBSBBBB and BSBBBB are different
-        """
         if len(seq) < 12:
             return []
 
@@ -466,7 +440,7 @@ class Engine:
 
         return sorted(patterns, key=lambda x: x[0], reverse=True)[:8]
 
-    # ✅ Fallback raw pattern mining, but family detection is primary
+    # ✅ Fallback raw pattern mining
     def mine_patterns(self, seq):
         fam = self.mine_family_patterns(seq)
         if fam:
@@ -574,7 +548,7 @@ class Engine:
         experts["momentum"] = 0.2 + (momentum * 0.6)
         return experts, patterns, features, current_regime
 
-    # ✅ Fixed number predictor
+    # ✅ Number predictor
     def _predict_number(self, seq_nums):
         ngram_db = self.db.get("num_ngrams", {})
         freq = self.db.get("num_freq", {})
@@ -635,7 +609,6 @@ class Engine:
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
 
         if current_streak >= 4:
-            # streak continuation boost
             p_raw = 0.9 * float(seq[-1]) + 0.1 * p_raw
 
         bucket = min(19, int(p_raw * 20))
@@ -646,15 +619,13 @@ class Engine:
         valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
 
         num_pred, num_conf = self._predict_number(nums)
+
+        # ✅ FIXED: clean fallback to the correct side
         if num_pred not in valid_nums:
-            # keep same side validity
-            best_num = max(valid_nums, key=lambda x: (x >= 5) == (pred_side == "BIG"))
-            if best_num == max(valid_nums):
-                num_pred = max(valid_nums)
+            if pred_side == "BIG":
+                num_pred = max(5, min(9, num_pred))
             else:
-                num_pred = min(valid_nums)
-        else:
-            num_pred = num_pred
+                num_pred = max(0, min(4, num_pred))
 
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         current_regime = get_regime(seq)
@@ -663,10 +634,7 @@ class Engine:
         edge = abs(p_cal - 0.5)
         confidence = max(p_cal, 1 - p_cal)
 
-        # optional skip
-        if CFG.min_edge > 0 and edge < CFG.min_edge:
-            return None
-
+        # 🔒 NO SKIP — always return prediction
         return {
             "issue": issue,
             "p": p_cal,
@@ -843,25 +811,19 @@ class Runtime:
                     ).fetchone()
 
                     if not exists:
+                        # 🔒 NO SKIP — always predict, always queue
                         p = self.engine.predict(history, issue)
                         with self.db.transaction():
-                            if p is None:
-                                LOG.info(f"Skipping issue {issue} (edge too low)")
-                                self.db.c.execute(
-                                    "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                    (issue, time.time(), "SKIP", json.dumps({"skipped": True})),
-                                )
-                            else:
-                                self.db.c.execute(
-                                    "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                    (issue, time.time(), "PENDING", json.dumps(p)),
-                                )
-                                self.db.queue(
-                                    "prediction",
-                                    issue,
-                                    format_prediction(p),
-                                    time.time() + CFG.delivery_ttl,
-                                )
+                            self.db.c.execute(
+                                "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
+                                (issue, time.time(), "PENDING", json.dumps(p)),
+                            )
+                            self.db.queue(
+                                "prediction",
+                                issue,
+                                format_prediction(p),
+                                time.time() + CFG.delivery_ttl,
+                            )
 
             except asyncio.CancelledError:
                 raise
@@ -986,7 +948,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info(f"{CFG.name} V17 Started (Statistics-First Engine, min_edge={CFG.min_edge})")
+            LOG.info(f"{CFG.name} V18 Started (No-Skip Mode)")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
 
