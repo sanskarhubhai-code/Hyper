@@ -129,6 +129,53 @@ def get_regime(seq):
     return "MIXED"
 
 
+# ─── FAMILY PATTERN HELPERS ─────────────────────────────────────
+def run_tokens(seq):
+    """Convert sequence into contiguous run tokens: [(value, count), ...]."""
+    if not seq:
+        return []
+    out = []
+    current = seq[0]
+    count = 1
+    for x in seq[1:]:
+        if x == current:
+            count += 1
+        else:
+            out.append((current, count))
+            current = x
+            count = 1
+    out.append((current, count))
+    return out
+
+
+def family_signature(seq):
+    """
+    Run-aware pattern representation.
+    Example:
+      [1,1,0,0,1,1,1,1,0,1]
+      -> ((1,2),(0,2),(1,4),(0,1),(1,1))
+    This prevents false matches like:
+      BBSBBBB != BSBBBB
+    because their family signatures differ.
+    """
+    return tuple((side, length) for side, length in run_tokens(seq))
+
+
+def family_window_valid(seq, start, length):
+    """
+    Reject windows that cut through a contiguous same-side family.
+    Minimum pattern length = 5.
+    """
+    if length < 5:
+        return False
+    if start > 0 and seq[start] == seq[start - 1]:
+        return False
+    end = start + length
+    if end < len(seq) and seq[end - 1] == seq[end]:
+        return False
+    return True
+
+
 def parse_history(payload):
     obj = payload
     for _ in range(6):
@@ -281,36 +328,100 @@ class SignalPredictor:
 
     # ---------- Core signals ----------
     def exact_pattern(self, seq):
-        if len(seq) < 8:
+        if len(seq) < 10:
             return 0.5
+
         hits = []
-        for length in range(3, min(12, len(seq) // 2) + 1):
-            suffix = tuple(seq[-length:])
-            obs = []
-            for i in range(length, len(seq) - length):
-                if tuple(seq[i - length:i]) == suffix:
-                    obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 320.0)))
-            if len(obs) >= 3:
-                p, _ = weighted_probability(obs)
-                hits.append(p)
+        max_len = min(26, max(5, len(seq) // 2))
+
+        for length in range(5, max_len + 1):
+            groups = {}
+
+            for i in range(0, len(seq) - length + 1):
+                if not family_window_valid(seq, i, length):
+                    continue
+                fam = family_signature(seq[i:i + length])
+                groups.setdefault(fam, []).append(i)
+
+            for idxs in groups.values():
+                if len(idxs) < 2:
+                    continue
+
+                obs = []
+                for idx in idxs:
+                    nxt = seq[idx + length] if idx + length < len(seq) else None
+                    if nxt is None:
+                        continue
+                    decay = 0.5 ** ((len(seq) - 1 - idx) / 420.0)
+                    obs.append((nxt, decay))
+
+                if len(obs) >= 2:
+                    p, _ = weighted_probability(obs)
+                    hits.append(p)
+
         return mean(hits) if hits else 0.5
 
     def markov_pattern(self, seq):
-        if len(seq) < 8:
+        if len(seq) < 10:
             return 0.5
+
         vals = []
-        for order in (1, 2, 3, 4, 5):
+        for order in (5, 6, 7, 8, 9, 10, 12):
             if len(seq) <= order:
                 continue
-            suffix = tuple(seq[-order:])
+
+            suffix = family_signature(seq[-order:])
             obs = []
+
             for i in range(order, len(seq) - order):
-                if tuple(seq[i - order:i]) == suffix:
-                    obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 360.0)))
+                if not family_window_valid(seq, i, order):
+                    continue
+                history_part = seq[i - order:i]
+                if family_signature(history_part) == suffix:
+                    nxt = seq[i]
+                    obs.append((nxt, 0.5 ** ((len(seq) - 1 - i) / 460.0)))
+
             if len(obs) >= 2:
                 p, _ = weighted_probability(obs)
                 vals.append(p)
+
         return mean(vals) if vals else 0.5
+
+    def family_pattern_miner(self, seq):
+        """
+        Strong advanced family miner:
+        Track repeated family signatures only across valid run boundaries.
+        """
+        if len(seq) < 12:
+            return 0.5
+
+        hits = []
+        max_len = min(26, max(5, len(seq) // 2))
+
+        for length in range(5, max_len + 1):
+            groups = {}
+
+            for i in range(0, len(seq) - length + 1):
+                if not family_window_valid(seq, i, length):
+                    continue
+                fam = family_signature(seq[i:i + length])
+                groups.setdefault(fam, []).append(i)
+
+            for idxs in groups.values():
+                if len(idxs) < 2:
+                    continue
+
+                future = []
+                for idx in idxs:
+                    end = idx + length
+                    if end < len(seq):
+                        future.append((seq[end], 0.5 ** ((len(seq) - end) / 200.0)))
+
+                if len(future) >= 2:
+                    p, _ = weighted_probability(future)
+                    hits.append(p)
+
+        return mean(hits) if hits else 0.5
 
     def regime_signal(self, seq):
         reg = get_regime(seq)
@@ -387,7 +498,6 @@ class SignalPredictor:
             return 0.5
         tail = seq[-20:]
         sigma = stddev(tail)
-        # More volatility usually means less certain, so closer to 0.5
         if sigma < 0.12:
             return 0.65
         if sigma > 0.38:
@@ -412,7 +522,6 @@ class SignalPredictor:
         if len(seq) < 10:
             return 0.5
         tail = seq[-20:]
-        # local pulse detection
         period_hints = []
         for k in range(2, min(8, len(tail) // 2) + 1):
             aa = tail[::k]
@@ -424,11 +533,34 @@ class SignalPredictor:
         pulse = mean(period_hints)
         return clip(0.5 + (pulse - 0.5) * 1.2)
 
+    def family_regime_score(self, seq):
+        """
+        Like regime score but uses family run patterns.
+        """
+        if len(seq) < 12:
+            return 0.5
+        fam = family_signature(seq[-18:])
+        if not fam:
+            return 0.5
+        obs = []
+        for i in range(12, len(seq)):
+            candidate = seq[max(0, i - 18):i]
+            if not candidate:
+                continue
+            if family_signature(candidate) == fam:
+                obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 500.0)))
+        if len(obs) >= 2:
+            p, _ = weighted_probability(obs)
+            return p
+        return 0.5
+
     # ---------- adaptive fusion ----------
     def adapt_probability(self, signal_map):
         base = {
-            "exact": 1.30,
-            "markov": 1.20,
+            "exact": 1.35,
+            "markov": 1.25,
+            "family_miner": 1.60,
+            "family_regime": 1.28,
             "regime": 1.12,
             "trend": 1.18,
             "momentum": 1.06,
@@ -556,6 +688,8 @@ class SignalPredictor:
                 "experts": {
                     "exact": 0.5,
                     "markov": 0.5,
+                    "family_miner": 0.5,
+                    "family_regime": 0.5,
                     "regime": 0.5,
                     "trend": 0.5,
                     "momentum": 0.5,
@@ -577,6 +711,8 @@ class SignalPredictor:
         signal_map = {
             "exact": self.exact_pattern(seq),
             "markov": self.markov_pattern(seq),
+            "family_miner": self.family_pattern_miner(seq),
+            "family_regime": self.family_regime_score(seq),
             "regime": self.regime_signal(seq),
             "trend": self.trend_signal(seq),
             "momentum": self.momentum_signal(seq),
@@ -601,7 +737,6 @@ class SignalPredictor:
         elif regime == "COLD":
             p = clip(0.5 + (p - 0.5) * 0.9)
 
-        # unbiased 50/50 tie breaker
         if abs(p - 0.5) <= CFG.tie_band:
             side = random.choice(["BIG", "SMALL"])
             p = 0.5
@@ -616,10 +751,12 @@ class SignalPredictor:
             "side": side,
             "num": num,
             "regime": regime,
-            "source": "ultra-deep-ensemble",
+            "source": "ultra-deep-family-ensemble-v2",
             "experts": {
                 "exact": signal_map["exact"],
                 "markov": signal_map["markov"],
+                "family_miner": signal_map["family_miner"],
+                "family_regime": signal_map["family_regime"],
                 "regime": signal_map["regime"],
                 "trend": signal_map["trend"],
                 "momentum": signal_map["momentum"],
