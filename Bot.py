@@ -1,9 +1,6 @@
-# -*- coding: utf-8 -*-
-"""
-FTW VIP PREDICTOR — Ultra Advanced v24 (Fixed & Ready)
-Python 3.10+
-Deps: aiohttp
-"""
+# FTW PREDICTOR — ULTRA ADVANCED V25 (Fixed & Ready)
+# Python 3.10+
+# Deps: aiohttp
 
 import asyncio
 import contextlib
@@ -18,38 +15,36 @@ import sqlite3
 import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, List, Tuple
 
 import aiohttp
 from aiohttp import web
 
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
 # CONFIG
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
 
 @dataclass(frozen=True)
 class Config:
-    # 🔥 Yahan tera original token aur chat id set kar diya hai
+    # 🔥 Tera original Token aur Chat ID set kar diya hai
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_ultra_v33.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_ultra_v25.db")
     port: int = int(os.getenv("PORT", "8080"))
-    fetch_every: float = float(os.getenv("FETCH_EVERY", "2.5"))
-    timeout: float = 20.0
-    max_history: int = 3000 # 🔥 5000 se 3000 kar diya (Timeout fix)
-    min_history: int = int(os.getenv("MIN_HISTORY", "160"))
-    min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "12"))
-    learning_rate: float = 0.04
-    meta_lr: float = 0.045
+    fetch_every: float = float(os.getenv("FETCH_EVERY", "2"))
+    timeout: float = 18.0
+    max_history: int = 3000 # 🔥 5000 se 3000 kar diya taaki Render pe timeout na ho
+    min_history: int = int(os.getenv("MIN_HISTORY", "180"))
+    min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "14"))
+    learning_rate: float = 0.045
+    meta_lr: float = 0.05
     decay: float = 0.985
-    max_pattern: int = 8
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (ULTRA V24)"
+    name: str = "FTW PREDICTOR (ULTRA V25)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -65,20 +60,20 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 LOG = logging.getLogger("predictor_ultra")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CORE MATH / UTIL
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
+# MATH / UTILS
+# ============================================================
 
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
 
+def sigmoid(z):
+    z = max(-25.0, min(25.0, float(z)))
+    return 1.0 / (1.0 + math.exp(-z))
+
 def logit(p, eps=0.02):
     p = max(eps, min(1.0 - eps, float(p)))
     return math.log(p / (1.0 - p))
-
-def sigmoid(z):
-    z = max(-20.0, min(20.0, float(z)))
-    return 1.0 / (1.0 + math.exp(-z))
 
 def escape(x):
     return html.escape(str(x))
@@ -87,7 +82,7 @@ def numeric(value):
     if isinstance(value, bool):
         return None
     s = str(value).strip()
-    if s.isdigit() and s.isascii():
+    if s.isascii() and s.isdigit():
         return int(s)
     return None
 
@@ -108,29 +103,29 @@ def majority(seq):
     c = Counter(seq)
     return c.most_common(1)[0][0]
 
-def weighted_probability(observations):
-    if not observations:
+def weighted_probability(obs):
+    if not obs:
         return 0.5, 0.0
-    sw = sum(w for _, w in observations)
-    sw2 = sum(w * w for _, w in observations)
-    effective_n = (sw * sw / sw2) if sw2 else 0.0
-    prob = (4.0 + sum(y * w for y, w in observations)) / (8.0 + sw)
-    return clip(prob), effective_n
+    sw = sum(w for _, w in obs)
+    sw2 = sum(w * w for _, w in obs)
+    eff = (sw * sw / sw2) if sw2 else 0.0
+    p = (4.0 + sum(y * w for y, w in obs)) / (8.0 + sw)
+    return clip(p), eff
 
 def family_run(seq):
     if not seq:
         return []
     out = []
-    current = seq[0]
+    cur = seq[0]
     count = 1
     for x in seq[1:]:
-        if x == current:
+        if x == cur:
             count += 1
         else:
-            out.append((current, count))
-            current = x
+            out.append((cur, count))
+            cur = x
             count = 1
-    out.append((current, count))
+    out.append((cur, count))
     return out
 
 def family_signature(seq):
@@ -140,12 +135,12 @@ def entropy_bits(seq):
     if not seq:
         return 0.0
     c = Counter(seq)
-    n = len(seq)
-    entr = 0.0
+    total = len(seq)
+    e = 0.0
     for freq in c.values():
-        p = freq / n
-        entr -= p * math.log2(p)
-    return entr
+        p = freq / total
+        e -= p * math.log2(p)
+    return e
 
 def get_regime(seq):
     tail = seq[-24:]
@@ -155,16 +150,16 @@ def get_regime(seq):
     rate = flips / max(1, len(tail) - 1)
     if run_length(tail) >= 5:
         return "RUN"
-    if rate >= 0.70:
+    if rate >= 0.72:
         return "ALT"
     if abs(sum(tail) / len(tail) - 0.5) > 0.20:
         return "IMBAL"
     return "MIXED"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
 # HISTORY PARSER
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
 
 def parse_history(payload):
     obj = payload
@@ -192,9 +187,9 @@ def parse_history(payload):
     return sorted(records.values(), key=lambda x: int(x["issue"]))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# QUANTUM PATTERN ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
+# QUANTUM PATTERN MATCHER
+# ============================================================
 
 class QuantumTracker:
     def __init__(self, min_len=3, max_len=8, min_support=12):
@@ -204,24 +199,22 @@ class QuantumTracker:
 
     def match_tail_patterns(self, seq):
         n = len(seq)
-        if n < 18:
+        if n < 20:
             return []
         results = []
-
         for length in range(self.max_len, self.min_len - 1, -1):
             suffix = seq[-length:]
             sig = family_signature(suffix)
             obs = []
             for i in range(n - length):
                 if family_signature(seq[i:i + length]) == sig:
-                    w = 0.5 ** ((n - 1 - (i + length)) / 350.0)
+                    w = 0.5 ** ((n - 1 - (i + length)) / 420.0)
                     obs.append((seq[i + length], w))
             if len(obs) < self.min_support:
                 continue
-
             p, eff_n = weighted_probability(obs)
             score = abs(p - 0.5) * math.sqrt(max(1.0, eff_n))
-            if score > 0.0:
+            if score > 0:
                 results.append({
                     "sig": sig,
                     "p": p,
@@ -230,13 +223,12 @@ class QuantumTracker:
                     "score": score,
                 })
             break
-
         return results
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
 # DATABASE
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
 
 class Database:
     def __init__(self, path):
@@ -250,6 +242,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS predictions(issue TEXT PRIMARY KEY, created REAL NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, actual INTEGER);
             CREATE TABLE IF NOT EXISTS models(key TEXT PRIMARY KEY, n REAL NOT NULL, loss REAL NOT NULL, inverse_loss REAL NOT NULL, failures INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS stats(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 kind TEXT NOT NULL,
@@ -258,10 +251,6 @@ class Database:
                 created REAL NOT NULL,
                 expires REAL,
                 sent INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS stats(
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
             );
         """)
 
@@ -314,7 +303,7 @@ class Database:
             SELECT status FROM predictions
             WHERE status IN ('WIN','LOSS')
             ORDER BY created DESC
-            LIMIT 8
+            LIMIT 12
         """).fetchall()
         streak = 0
         for r in rows:
@@ -332,7 +321,7 @@ class Database:
         m = self.memory(key)
         n = CFG.decay * m["n"] + 1
         loss = CFG.decay * m["loss"] + (probability - actual) ** 2
-        inv = CFG.decay * m["inverse_loss"] + (1 - probability - actual) ** 2
+        inv = CFG.decay * m["inverse_loss"] + (1.0 - probability - actual) ** 2
         wrong = int(probability >= 0.5) != actual
         failures = m["failures"] + 1 if wrong else 0
         self.c.execute(
@@ -345,14 +334,18 @@ class Database:
         m = self.memory(key)
         n = m["n"]
         if n < 1:
-            return probability, 0.65
-        brier, inv = m["loss"] / n, m["inverse_loss"] / n
-        flipped = (inv + 0.03 < brier) and (brier > 0.27) and (m["failures"] >= 3)
+            return probability, 0.7
+
+        brier = m["loss"] / n
+        inv = m["inverse_loss"] / n
+        flipped = (inv + 0.02 < brier) and (brier > 0.25) and (m["failures"] >= 3)
         eff_loss = inv if flipped else brier
-        p = (1 - probability) if flipped else probability
+        p = (1.0 - probability) if flipped else probability
+
         reliability = clip((0.25 - eff_loss) / 0.12, 0.0, 1.0)
-        shrink = (1 - min(n / 50.0, 1.0)) * 0.75 + min(n / 50.0, 1.0) * reliability
+        shrink = (1.0 - min(n / 50.0, 1.0)) * 0.7 + min(n / 50.0, 1.0) * reliability
         p = 0.5 + (p - 0.5) * shrink
+
         weight = clip(math.exp(-7 * (eff_loss - 0.22)), 0.18, 2.0)
         if m["failures"] >= 4 and not flipped:
             weight *= 0.55
@@ -368,9 +361,9 @@ class Database:
         self.c.close()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# FEATURE EXTRACTION
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
+# FEATURE FUNCTIONS
+# ============================================================
 
 def trend_features(seq):
     if not seq:
@@ -383,11 +376,11 @@ def trend_features(seq):
     def ema(k):
         if not seq:
             return 0.5
-        alpha = 2.0 / (k + 1)
-        val = float(seq[0])
+        a = 2.0 / (k + 1)
+        v = float(seq[0])
         for x in seq[1:]:
-            val = alpha * x + (1.0 - alpha) * val
-        return val
+            v = a * x + (1.0 - a) * v
+        return v
 
     def std(k):
         arr = seq[-k:]
@@ -400,11 +393,7 @@ def trend_features(seq):
     alt = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
     run_score = (2 * seq[-1] - 1) * min(run_length(seq), 12) / 12.0
     macd = (ema(12) - ema(26)) * 2.0
-    short = mean(3)
-    mid = mean(10)
-    long = mean(24)
-    slope = (mean(3) - mean(12))
-    slope2 = (mean(8) - mean(24))
+
     return [
         1.0,
         2 * mean(3) - 1,
@@ -422,18 +411,53 @@ def trend_features(seq):
         macd,
         2 * std(10) - 1,
         2 * std(24) - 1,
-        slope,
-        slope2,
+        mean(3) - mean(12),
+        mean(8) - mean(24),
     ]
-
 
 def logistic(weights, features):
     return sigmoid(sum(w * x for w, x in zip(weights, features)))
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
+# RECOVERY CONTROLLER
+# ============================================================
+
+class RecoveryController:
+    def __init__(self):
+        self.mode = 0
+        self.last_loss = 0.0
+
+    def update(self, loss_streak):
+        if loss_streak >= 1:
+            self.mode = max(self.mode, 1)
+            self.last_loss = time.time()
+        else:
+            self.mode = 0
+
+    def adjust(self, seq, base_p, loss_streak):
+        if loss_streak <= 0:
+            return base_p, False
+
+        recent = sum(seq[-5:]) / max(1, len(seq[-5:])) if seq else 0.5
+
+        if loss_streak == 1:
+            if recent > 0.70:
+                return 0.28, True
+            if recent < 0.30:
+                return 0.72, True
+            return 0.5 + (base_p - 0.5) * 0.7, True
+
+        if recent > 0.72:
+            return 0.22, True
+        if recent < 0.28:
+            return 0.78, True
+        return 0.5 + (base_p - 0.5) * 0.55, True
+
+
+# ============================================================
 # ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
 
 EXPERT_NAMES = [
     "patterns", "markov1", "markov2", "markov3",
@@ -441,53 +465,18 @@ EXPERT_NAMES = [
     "reversal", "volatility", "entropy"
 ]
 
-class RecoveryController:
-    def __init__(self):
-        self.last_loss_epoch = 0.0
-        self.recovery_mode = 0
-
-    def update(self, loss_streak):
-        if loss_streak >= 1:
-            self.recovery_mode = max(self.recovery_mode, 1)
-            self.last_loss_epoch = time.time()
-        else:
-            self.recovery_mode = 0
-
-    def intensify(self, seq, base_p, experts, loss_streak):
-        if loss_streak <= 0:
-            return base_p, False
-
-        recent_big = sum(seq[-5:]) / max(1, len(seq[-5:]))
-        recent_small = 1.0 - recent_big
-
-        if loss_streak == 1:
-            if recent_big > 0.72:
-                return 0.28, True
-            if recent_small > 0.72:
-                return 0.72, True
-            return 0.5 + (base_p - 0.5) * 0.7, True
-
-        if recent_big > 0.70:
-            return 0.25, True
-        if recent_small > 0.70:
-            return 0.75, True
-
-        return 0.5 + (base_p - 0.5) * 0.55, True
-
 class Engine:
     def __init__(self, db):
         self.db = db
         self.recovery = RecoveryController()
 
     def mine_patterns(self, seq):
-        if len(seq) < 18:
+        if len(seq) < 20:
             return []
         tracker = QuantumTracker(min_len=3, max_len=8, min_support=CFG.min_support)
-        results = tracker.match_tail_patterns(seq)
-        if not results:
-            return []
+        pat = tracker.match_tail_patterns(seq)
         out = []
-        for item in results[:CFG.max_pattern]:
+        for item in pat[:6]:
             out.append((
                 item["score"],
                 item["p"],
@@ -497,22 +486,22 @@ class Engine:
             ))
         return out
 
-    def mine_experts(self, seq, is_recovery):
+    def mine_experts(self, seq):
         n = len(seq)
         experts = {}
 
         def weight(idx):
-            return 0.5 ** ((n - 1 - idx) / 320.0)
+            return 0.5 ** ((n - 1 - idx) / 340.0)
 
         patterns = self.mine_patterns(seq)
         if patterns:
-            weighted = []
+            candidates = []
             for _, p, _, eff_n, key in patterns:
                 adjusted_p, w = self.db.adapt(key, p)
-                weighted.append((adjusted_p, w * math.sqrt(max(1.0, eff_n))))
-            if weighted:
-                num = sum(p * w for p, w in weighted)
-                den = sum(w for _, w in weighted)
+                candidates.append((adjusted_p, w * math.sqrt(max(1.0, eff_n))))
+            if candidates:
+                num = sum(p * w for p, w in candidates)
+                den = sum(w for _, w in candidates)
                 if den > 0:
                     experts["patterns"] = clip(num / den)
 
@@ -528,21 +517,20 @@ class Engine:
         if n:
             run_at = [1] * n
             for i in range(1, n):
-                run_at[i] = run_at[i-1] + 1 if seq[i] == seq[i-1] else 1
-
-            cr = min(run_at[-1], 8)
-            lv = seq[-1]
+                run_at[i] = run_at[i - 1] + 1 if seq[i] == seq[i - 1] else 1
+            cur_run = min(run_at[-1], 8)
+            last_val = seq[-1]
             run_obs = []
             for i in range(24, n):
-                if seq[i - 1] == lv and min(run_at[i - 1], 8) == cr:
+                if seq[i-1] == last_val and min(run_at[i-1], 8) == cur_run:
                     run_obs.append((seq[i], weight(i)))
             if len(run_obs) >= CFG.min_support:
                 experts["run"] = weighted_probability(run_obs)[0]
 
-        current_regime = get_regime(seq)
+        regime = get_regime(seq)
         regime_obs = []
         for i in range(24, n):
-            if get_regime(seq[max(0, i - 96):i]) == current_regime:
+            if get_regime(seq[max(0, i - 96):i]) == regime:
                 regime_obs.append((seq[i], weight(i)))
         if len(regime_obs) >= CFG.min_support:
             experts["regime"] = weighted_probability(regime_obs)[0]
@@ -557,30 +545,34 @@ class Engine:
 
         tail = seq[-16:]
         if len(tail) > 1:
-            mean_t = sum(tail) / len(tail)
-            vol = sum((x - mean_t) ** 2 for x in tail) / len(tail)
-            experts["volatility"] = clip(0.5 + (0.5 - abs(0.5 - mean_t)) * 0.9 + vol * 0.1)
+            avg = sum(tail) / len(tail)
+            vol = sum((x - avg) ** 2 for x in tail) / len(tail)
+            experts["volatility"] = clip(0.5 + (0.5 - abs(0.5 - avg)) * 0.85 + vol * 0.1)
         else:
             experts["volatility"] = 0.5
 
-        e = entropy_bits(seq[-12:]) / 3.32
-        experts["entropy"] = clip(0.5 + (e - 0.5) * 0.6)
+        experts["entropy"] = clip(0.5 + (entropy_bits(seq[-12:]) / 3.32 - 0.5) * 0.6)
 
         momentum = sum(seq[-4:]) / 4.0 if seq else 0.5
         experts["momentum"] = 0.2 + (momentum * 0.6)
         experts["reversal"] = 1.0 - experts["momentum"]
 
-        for k, p in list(experts.items()):
-            experts[k] = clip(p, 0.05, 0.95)
+        for k, val in list(experts.items()):
+            experts[k] = clip(val, 0.05, 0.95)
 
-        return experts, patterns, features, current_regime
+        return experts, patterns, features, regime
 
     def _predict_number(self, seq_nums):
         ngram_db = self.db.get("num_ngrams", {})
         freq = self.db.get("num_freq", {})
-        prior = [4.0 + 20.0 * freq.get(str(i), 0) / max(1, sum(freq.values())) for i in range(10)] if freq else [1.0] * 10
-        dist = list(prior)
 
+        if freq:
+            total = sum(freq.values())
+            prior = [4.0 + 20.0 * freq.get(str(i), 0) / max(1, total) for i in range(10)]
+        else:
+            prior = [1.0] * 10
+
+        dist = list(prior)
         for length in range(2, min(10, len(seq_nums)) + 1):
             key = ",".join(str(x) for x in seq_nums[-length:])
             trans = ngram_db.get(key, {})
@@ -595,30 +587,29 @@ class Engine:
             return 4, 0.10
 
         best = max(range(10), key=lambda i: dist[i])
-        return best, dist[best] / sum(dist)
+        p = dist[best] / sum(dist)
+        return best, p
 
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
 
         loss_streak = self.db.get_loss_streak()
-        is_recovery = loss_streak > 0
         self.recovery.update(loss_streak)
 
-        experts, patterns, features, current_regime = self.mine_experts(seq, is_recovery)
+        experts, patterns, features, regime = self.mine_experts(seq)
 
         adjusted = []
         for name, p in experts.items():
-            corrected, weight = self.db.adapt(f"expert:{name}:{current_regime}", p)
+            corrected, weight = self.db.adapt(f"expert:{name}:{regime}", p)
             if name == "patterns":
                 weight *= 3.2
-            if name in ("momentum", "run", "trend"):
-                if loss_streak >= 2:
-                    weight *= 0.32
+            if name in ("momentum", "run", "trend") and loss_streak >= 2:
+                weight *= 0.28
             if name == "reversal" and loss_streak >= 1:
-                weight *= 2.7
+                weight *= 2.8
             if loss_streak == 1 and name in ("momentum", "run"):
-                weight *= 1.6
+                weight *= 1.5
             adjusted.append((corrected, weight))
 
         total_w = sum(w for _, w in adjusted)
@@ -630,47 +621,37 @@ class Engine:
             mw = [1.0 / len(EXPERT_NAMES)] * len(EXPERT_NAMES) + [0.0]
         p_meta = sigmoid(sum(w * f for w, f in zip(mw, m_feats)))
 
-        alpha = min(self.db.get("meta_n", 0) / 100.0, 1.0)
+        alpha = min(self.db.get("meta_n", 0) / 90.0, 1.0)
         p_raw = alpha * p_meta + (1.0 - alpha) * p_avg
 
+        # DEEP RECOVERY
         if loss_streak >= 1:
-            if loss_streak == 1:
-                recent_bias = sum(seq[-3:]) / 3.0 if len(seq) >= 3 else 0.5
-                if recent_bias > 0.68:
-                    p_raw = 0.28
-                elif recent_bias < 0.32:
-                    p_raw = 0.72
-                else:
-                    p_raw = 0.5 + (p_raw - 0.5) * 0.7
-            elif loss_streak >= 2:
-                recent_bias = sum(seq[-4:]) / 4.0 if len(seq) >= 4 else 0.5
-                if recent_bias > 0.7:
-                    p_raw = 0.22
-                elif recent_bias < 0.3:
-                    p_raw = 0.78
-                else:
-                    p_raw = 0.5 + (p_raw - 0.5) * 0.5
+            p_raw, recovery_used = self.recovery.adjust(seq, p_raw, loss_streak)
+        else:
+            recovery_used = False
 
         if len(seq) >= 8:
             short = sum(seq[-6:]) / 6.0
-            if short > 0.80 and p_raw > 0.65:
-                p_raw = 0.65
-            if short < 0.20 and p_raw < 0.35:
-                p_raw = 0.35
+            if short > 0.80 and p_raw > 0.66:
+                p_raw = 0.66
+            if short < 0.20 and p_raw < 0.34:
+                p_raw = 0.34
 
+        # CALIBRATION
         bucket = min(19, int(p_raw * 20))
         n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
-        p_cal = clip((30 * p_raw + s_g) / (30 + n_g))
+        p_cal = clip((32 * p_raw + s_g) / (32 + n_g))
 
+        # SIDE DECISION
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
         valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
 
         num_pred, num_conf = self._predict_number(nums)
         if num_pred not in valid_nums:
-            num_pred = max(valid_nums, key=lambda x: (x if x in valid_nums else -1))
+            num_pred = max(valid_nums, key=lambda x: x if x in valid_nums else -1)
 
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
-        trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
+        trend_shift = f"{prev_regime} ➡️ {regime}" if prev_regime != regime else None
 
         payload = {
             "issue": issue,
@@ -679,7 +660,7 @@ class Engine:
             "side": pred_side,
             "num": num_pred,
             "num_probability": num_conf,
-            "regime": current_regime,
+            "regime": regime,
             "source": "🎯 Ultra Quantum Engine",
             "trend_shift": trend_shift,
             "pattern_str": _pattern_str(patterns),
@@ -688,11 +669,10 @@ class Engine:
             "experts": experts,
             "features": features,
             "meta_feats": m_feats,
-            "is_recovery": is_recovery,
+            "is_recovery": recovery_used or (loss_streak > 0),
             "loss_streak": loss_streak,
             "patterns": [{"key": k, "p": p, "support": s} for _, p, s, _, k in patterns],
         }
-
         return payload
 
     def settle(self, history):
@@ -776,7 +756,6 @@ def _pattern_str(patterns):
     key = top[4].split(":")[-1] if ":" in top[4] else top[4]
     return f"<code>{key}</code> {'⬆️' if top[1] >= 0.5 else '⬇️'}"
 
-
 def format_prediction(p):
     conf = max(p["p"], 1.0 - p["p"]) * 100
     filled = int(conf // 10)
@@ -788,9 +767,9 @@ def format_prediction(p):
     rec_tag = ""
     if p.get("is_recovery"):
         if p.get("loss_streak") == 1:
-            rec_tag = "⚠️ <b>RECOVERY LVL 1</b> ⚠️\n"
+            rec_tag = "⚠️ <b>RECOVERY LEVEL 1</b> ⚠️\n"
         else:
-            rec_tag = "🚨 <b>ULTRA RECOVERY LVL 2</b> 🚨\n"
+            rec_tag = "🚨 <b>ULTRA RECOVERY LEVEL 2</b> 🚨\n"
 
     shift = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
     pat = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") and p.get("pattern_str") != "None" else ""
@@ -809,14 +788,13 @@ def format_prediction(p):
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
 # RUNTIME
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
 
 class Runtime:
     def __init__(self, db):
-        self.db = db
-        self.engine = Engine(db)
+        self.db, self.engine = db, Engine(db)
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
         self.error = None
@@ -839,6 +817,7 @@ class Runtime:
         sources = [x for x in await asyncio.gather(*(one(u) for u in CFG.urls)) if x]
         if not sources:
             raise RuntimeError("HistoryUnavailable")
+
         merged = {}
         for rows in sources:
             for row in rows:
@@ -862,14 +841,16 @@ class Runtime:
                 if len(history) >= CFG.min_history:
                     issue = str(latest + 1)
                     if not self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone():
-                        p = self.engine.predict(history, issue)
+                        pred = self.engine.predict(history, issue)
+                        
+                        # 🔥 NO-SKIP FIX: Yahan se confidence waali condition hata di hai
                         with self.db.transaction():
                             self.db.c.execute(
                                 "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                (issue, time.time(), "PENDING", json.dumps(p))
+                                (issue, time.time(), "PENDING", json.dumps(pred))
                             )
-                            self.db.queue("prediction", issue, format_prediction(p), time.time() + CFG.delivery_ttl)
-
+                            self.db.queue("prediction", issue, format_prediction(pred), time.time() + CFG.delivery_ttl)
+                            
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -889,7 +870,6 @@ class Runtime:
             if not row:
                 await self.pause(0.5)
                 continue
-
             delay = backoff
             try:
                 url = endpoint_sticker if row["kind"] == "sticker" else endpoint_msg
@@ -932,9 +912,9 @@ class Runtime:
         })
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
 # MAIN
-# ─────────────────────────────────────────────────────────────────────────────
+# ============================================================
 
 async def main():
     CFG.validate()
@@ -949,7 +929,8 @@ async def main():
     app = web.Application()
     app.router.add_get("/", runtime.health)
     runner = web.AppRunner(app)
-    tasks, stop_task = [], None
+    tasks = []
+    stop_task = None
 
     try:
         await runner.setup()
