@@ -1,5 +1,4 @@
-
-# FTW PREDICTOR — FIXED FINAL VERSION
+# FTW PREDICTOR — FIXED FINAL VERSION (V30 Fixed)
 # Python 3.10+
 # Deps: aiohttp
 
@@ -32,11 +31,11 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_fixed_final.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_fixed_final_v30.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "2.0"))
     timeout: float = 18.0
-    max_history: int = 12000
+    max_history: int = 3500 # 🔥 12000 se 3500 kar diya taaki Render crash na ho
     min_history: int = int(os.getenv("MIN_HISTORY", "180"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "12"))
     learning_rate: float = 0.058
@@ -757,6 +756,9 @@ class Engine:
         total_w = sum(w for _, w in adjusted)
         p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
 
+        # 🔥 FIX: m_feats calculate karna bhool gaya tha
+        m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES] + [1.0]
+
         # direct exact distribution from walk-forward-scored models
         wf_weights, wf_info = _score_models_from_walkforward(
             nums,
@@ -865,7 +867,7 @@ class Engine:
             "confidence": max(p_cal, 1.0 - p_cal),
             "experts": experts,
             "features": features,
-            "meta_feats": m_feats,
+            "meta_feats": m_feats, # 🔥 Ab ye crash nahi karega
             "is_recovery": recovery_used or (loss_streak > 0),
             "loss_streak": loss_streak,
             "patterns": [{"key": k, "p": p, "support": s} for _, p, s, _, k in patterns],
