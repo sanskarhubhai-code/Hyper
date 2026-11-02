@@ -1,4 +1,4 @@
-# FTW PREDICTOR — PATTERN + TREND + SEQUENCE FINAL VERSION
+# FTW PREDICTOR — FULL FIXED VERSION WITH PATTERN + TREND + SEQUENCE
 # Python 3.10+
 # Deps: aiohttp
 
@@ -31,14 +31,14 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_pattern_trend_final.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_fixed_pattern_final.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "2.0"))
     timeout: float = 18.0
     max_history: int = 12000
     min_history: int = int(os.getenv("MIN_HISTORY", "180"))
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (PATTERN + TREND + SEQUENCE)"
+    name: str = "FTW PREDICTOR (FIXED PATTERN FINAL)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -50,7 +50,7 @@ class Config:
 
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOG = logging.getLogger("ftw_pattern_trend_final")
+LOG = logging.getLogger("ftw_fixed_pattern_final")
 
 
 # ============================================================
@@ -60,9 +60,11 @@ LOG = logging.getLogger("ftw_pattern_trend_final")
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
 
-def sigmoid(z):
-    z = max(-25.0, min(25.0, float(z)))
-    return 1.0 / (1.0 + math.exp(-z))
+def normalize(values):
+    total = sum(values)
+    if total <= 0:
+        return [0.1] * 10
+    return [v / total for v in values]
 
 def escape(x):
     return html.escape(str(x))
@@ -100,23 +102,6 @@ def parse_history(payload):
         records[key] = {"issue": key, "num": number, "size": int(number >= 5)}
     return sorted(records.values(), key=lambda x: int(x["issue"]))
 
-def normalize(values):
-    total = sum(values)
-    if total <= 0:
-        return [0.1] * 10
-    return [v / total for v in values]
-
-def run_length(seq):
-    if not seq:
-        return 0
-    last = seq[-1]
-    n = 0
-    for x in reversed(seq):
-        if x != last:
-            break
-        n += 1
-    return n
-
 def recent_frequency(nums, window=200):
     if not nums:
         return [0.1] * 10
@@ -141,59 +126,59 @@ def markov_predict(nums, order=2):
         return recent_frequency(nums)
     return normalize([counts[k] + 1.0 for k in range(10)])
 
-def size_seq_pattern(history):
-    if len(history) < 8:
-        return {"big_prob": 0.5, "seq_score": 0.0, "reason": "short history"}
+def run_pattern(bits):
+    if not bits:
+        return "—"
+    parts = []
+    current = bits[0]
+    count = 1
+    for value in bits[1:]:
+        if value == current:
+            count += 1
+        else:
+            parts.append(f"{'B' if current else 'S'}{count}")
+            current = value
+            count = 1
+    parts.append(f"{'B' if current else 'S'}{count}")
+    return "-".join(parts)
+
+def size_patterns(history, max_len=12):
+    if len(history) < 4:
+        return []
 
     seq = [int(r["size"]) for r in history]
-    recent = seq[-20:]
-    short = seq[-8:]
+    found = []
 
-    big_ratio = sum(recent) / len(recent)
-    run = run_length(short)
-    bias = 0.5 + (big_ratio - 0.5) * 0.6
+    for length in range(min(max_len, len(seq) - 1), 2, -1):
+        context = seq[-length:]
+        matches = 0
+        big_count = 0
+        for i in range(len(seq) - length):
+            if seq[i:i + length] == context:
+                matches += 1
+                big_count += int(seq[i + length] >= 5) if i + length < len(seq) else 0
 
-    # strong sequence signals
-    if run >= 5:
-        seq_score = 0.7
-        reason = "run"
-    elif sum(1 for a, b in zip(short, short[1:]) if a != b) >= len(short) - 1:
-        seq_score = 0.7
-        reason = "alternation"
-    else:
-        seq_score = 0.5
-        reason = "neutral"
+        if matches < 2:
+            continue
 
-    return {
-        "big_prob": clip(bias, 0.02, 0.98),
-        "seq_score": seq_score,
-        "reason": reason,
-    }
+        p_big = (2.0 + big_count) / (4.0 + matches)
+        found.append({
+            "key": run_pattern(context),
+            "length": length,
+            "support": matches,
+            "p_big": p_big,
+            "predicted_side": "BIG" if p_big >= 0.5 else "SMALL",
+            "lift": p_big - 0.5,
+        })
 
-def exact_number_distribution(history):
-    nums = [int(r["num"]) for r in history]
-    if not nums:
-        return [0.1] * 10
-
-    f1 = recent_frequency(nums, 80)
-    f2 = recent_frequency(nums, 200)
-    m1 = markov_predict(nums, 1)
-    m2 = markov_predict(nums, 2)
-    m3 = markov_predict(nums, 3)
-
-    final = [0.0] * 10
-    for i in range(10):
-        final[i] = 0.30 * f1[i] + 0.25 * f2[i] + 0.20 * m1[i] + 0.15 * m2[i] + 0.10 * m3[i]
-
-    return normalize(final)
+    return found
 
 def trend_side(history):
     if len(history) < 10:
         return 0.5, "neutral"
 
-    nums = [int(r["num"]) for r in history]
-    recent = nums[-20:]
-    ratio = sum(1 for x in recent if x >= 5) / len(recent)
+    recent = [int(r["size"]) for r in history][-20:]
+    ratio = sum(recent) / len(recent)
 
     if ratio > 0.65:
         return 0.7, "big_uptrend"
@@ -201,65 +186,22 @@ def trend_side(history):
         return 0.3, "small_uptrend"
     return 0.5, "neutral"
 
-# ============================================================
-# PATTERN MEMORY
-# ============================================================
+def exact_number_distribution(history):
+    nums = [int(r["num"]) for r in history]
+    if not nums:
+        return [0.1] * 10
 
-class PatternMemory:
-    def __init__(self, db):
-        self.db = db
+    d1 = recent_frequency(nums, 80)
+    d2 = recent_frequency(nums, 200)
+    d3 = markov_predict(nums, 1)
+    d4 = markov_predict(nums, 2)
+    d5 = markov_predict(nums, 3)
 
-    def _key(self, seq):
-        return "|".join(str(x) for x in seq)
+    final = [0.0] * 10
+    for i in range(10):
+        final[i] = 0.30 * d1[i] + 0.25 * d2[i] + 0.20 * d3[i] + 0.15 * d4[i] + 0.10 * d5[i]
 
-    def record(self, seq, side, actual_side, actual_num):
-        if not seq:
-            return
-        key = self._key(seq)
-        rec = self.db.get(f"pattern:{key}", {"hits": 0, "misses": 0, "score": 0.5, "last_seen": 0})
-        rec["last_seen"] = time.time()
-        if side == actual_side:
-            rec["hits"] = int(rec.get("hits", 0)) + 1
-            rec["score"] = 0.8 * float(rec.get("score", 0.5)) + 0.2 * 1.0
-        else:
-            rec["misses"] = int(rec.get("misses", 0)) + 1
-            rec["score"] = 0.8 * float(rec.get("score", 0.5)) + 0.2 * 0.0
-
-        self.db.set(f"pattern:{key}", rec)
-
-    def extract(self, seq):
-        if not seq:
-            return []
-        key = self._key(seq)
-        rec = self.db.get(f"pattern:{key}", None)
-        if rec is None:
-            return []
-        return [{
-            "key": key,
-            "score": float(rec.get("score", 0.5)),
-            "hits": int(rec.get("hits", 0)),
-            "misses": int(rec.get("misses", 0)),
-            "reason": "pattern_memory",
-        }]
-
-    def pattern_list(self, history):
-        # only a small bounded list of recent patterns: suffix lengths 3..8
-        out = []
-        nums = [int(r["num"]) for r in history]
-        if len(nums) < 4:
-            return out
-        for length in range(3, min(9, len(nums))):
-            seq = nums[-length:]
-            out.extend(self.extract(seq))
-        # dedupe
-        seen = set()
-        final = []
-        for item in out:
-            if item["key"] in seen:
-                continue
-            seen.add(item["key"])
-            final.append(item)
-        return final[:12]
+    return normalize(final)
 
 
 # ============================================================
@@ -366,7 +308,6 @@ class RecoveryController:
         if loss_streak <= 0:
             return side_prob, False
 
-        # gentle correction only
         if loss_streak == 1:
             return 0.5 + (side_prob - 0.5) * 0.55, True
 
@@ -380,19 +321,16 @@ class RecoveryController:
 class Engine:
     def __init__(self, db):
         self.db = db
-        self.pattern_memory = PatternMemory(db)
         self.recovery = RecoveryController()
 
     def predict(self, history, issue):
         nums = [int(r["num"]) for r in history]
         if not nums:
             final_dist = [0.1] * 10
-            side = "BIG"
-            num = 7
             return {
                 "issue": issue,
-                "side": side,
-                "num": num,
+                "side": "BIG",
+                "num": 7,
                 "p": 0.5,
                 "num_probability": 0.1,
                 "exact_distribution": final_dist,
@@ -400,19 +338,41 @@ class Engine:
                 "loss_streak": 0,
                 "source": "SAFE",
                 "pattern_trace": [],
+                "pattern_display": "—",
+                "trend_reason": "neutral",
             }
 
         exact = exact_number_distribution(history)
-        size_pattern = size_seq_pattern(history)
-        trend_prob, trend_reason = trend_side(history)
+        pattern_candidates = size_patterns(history, max_len=12)
 
-        # side probability from exact number + size pattern + trend
+        # build pattern display from strongest supported pattern
+        pattern_display = "—"
+        pattern_trace = []
+        if pattern_candidates:
+            for p in pattern_candidates[:6]:
+                pattern_trace.append({
+                    "key": p["key"],
+                    "length": p["length"],
+                    "support": p["support"],
+                    "p_big": p["p_big"],
+                    "predicted_side": p["predicted_side"],
+                })
+            pattern_display = pattern_candidates[0]["key"]
+
+        # side probability from exact number + pattern + trend
         p_big = sum(exact[5:10])
         p_small = sum(exact[:5])
 
+        pattern_bias = 0.5
+        if pattern_candidates:
+            strongest = max(pattern_candidates, key=lambda x: abs(x["p_big"] - 0.5))
+            pattern_bias = strongest["p_big"]
+
+        trend_prob, trend_reason = trend_side(history)
+
         side_prob = 0.5
-        side_prob = 0.50 * side_prob + 0.50 * (p_big if p_big >= p_small else p_small)
-        side_prob = 0.70 * side_prob + 0.30 * size_pattern["big_prob"]
+        side_prob = 0.55 * side_prob + 0.45 * (p_big if p_big >= p_small else p_small)
+        side_prob = 0.70 * side_prob + 0.30 * pattern_bias
         side_prob = 0.80 * side_prob + 0.20 * trend_prob
 
         loss_streak = self.db.get_loss_streak()
@@ -422,55 +382,32 @@ class Engine:
         else:
             recovery_used = False
 
-        # keep neutral when weak evidence
+        # neutralise weak side evidence
         if len(nums) >= 20:
             recent_ratio = sum(1 for x in nums[-20:] if x >= 5) / 20.0
             if abs(recent_ratio - 0.5) < 0.08:
                 side_prob = 0.5 + (side_prob - 0.5) * 0.45
 
-        if side_prob >= 0.5:
-            final_side = "BIG"
-            allowed = range(5, 10)
-        else:
-            final_side = "SMALL"
-            allowed = range(0, 5)
+        final_side = "BIG" if side_prob >= 0.5 else "SMALL"
+        allowed = range(5, 10) if final_side == "BIG" else range(0, 5)
 
-        pattern_candidates = self.pattern_memory.pattern_list(history)
-        pattern_trace = []
-        weighted_pattern_prob = 0.5
-
-        for item in pattern_candidates:
-            score = item.get("score", 0.5)
-            if score >= 0.7:
-                weighted_pattern_prob += 0.04
-            elif score <= 0.3:
-                weighted_pattern_prob -= 0.04
-            pattern_trace.append(item)
-
-        if weighted_pattern_prob > 0.8:
-            final_side = "BIG"
-            allowed = range(5, 10)
-        elif weighted_pattern_prob < 0.2:
-            final_side = "SMALL"
-            allowed = range(0, 5)
-
-        # exact number same final distribution
+        # exact-number final distribution must match side
         final_dist = [0.0] * 10
         for k in range(10):
             final_dist[k] = exact[k]
 
-        # apply final side filter gently
         for k in range(10):
             if k in allowed:
-                final_dist[k] *= 1.7
+                final_dist[k] *= 1.6
             else:
                 final_dist[k] *= 0.35
 
         final_dist = normalize(final_dist)
 
-        p_big_final = sum(final_dist[5:10])
-        p_small_final = sum(final_dist[:5])
-        if p_big_final >= p_small_final:
+        # recalc side from same final distribution -> consistency
+        final_p_big = sum(final_dist[5:10])
+        final_p_small = sum(final_dist[:5])
+        if final_p_big >= final_p_small:
             final_side = "BIG"
             allowed = range(5, 10)
         else:
@@ -492,28 +429,24 @@ class Engine:
 
         num = max(allowed, key=lambda k: side_adjusted[k])
 
-        # this is the final, consistent output
         payload = {
             "issue": issue,
             "side": final_side,
             "num": num,
-            "p": side_prob,
+            "p": max(side_prob, 1.0 - side_prob),
             "num_probability": side_adjusted[num],
             "exact_distribution": side_adjusted,
             "is_recovery": recovery_used or (loss_streak > 0),
             "loss_streak": loss_streak,
             "source": "PATTERN + TREND + SEQUENCE",
             "pattern_trace": pattern_trace,
-            "pattern_reason": size_pattern["reason"],
+            "pattern_display": pattern_display,
             "trend_reason": trend_reason,
         }
         return payload
 
     def settle(self, history):
         lookup = {r["issue"]: r for r in history}
-        pattern_memory = self.pattern_memory
-
-        # record pattern memory after actual result known
         pending = self.db.c.execute(
             "SELECT issue,payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)"
         ).fetchall()
@@ -525,43 +458,46 @@ class Engine:
 
             payload = json.loads(row["payload"])
             actual_side = "BIG" if actual["num"] >= 5 else "SMALL"
-            pred_side = payload.get("side", "BIG" if payload["p"] >= 0.5 else "SMALL")
+            predicted_side = payload.get("side", "BIG" if payload.get("p", 0.5) >= 0.5 else "SMALL")
 
-            # record recent sequence patterns
-            nums = [int(r["num"]) for r in history]
-            if len(nums) >= 3:
-                for length in range(3, min(9, len(nums))):
-                    seq = nums[-length:]
-                    pattern_memory.record(seq, pred_side, actual_side, actual["num"])
+            # record every pattern snapshot against result
+            for item in payload.get("pattern_trace", []):
+                key = "pattern:" + item["key"]
+                memory = self.db.get(key, {"hits": 0, "misses": 0, "score": 0.5})
+                hit = predicted_side == actual_side
+                memory["hits"] = int(memory.get("hits", 0)) + int(hit)
+                memory["misses"] = int(memory.get("misses", 0)) + int(not hit)
+                if hit:
+                    memory["score"] = 0.8 * float(memory.get("score", 0.5)) + 0.2 * 1.0
+                else:
+                    memory["score"] = 0.8 * float(memory.get("score", 0.5)) + 0.2 * 0.0
+                self.db.set(key, memory)
+
+            won_side = predicted_side == actual_side
+            won_num = payload.get("num") == actual["num"]
 
             with self.db.transaction():
                 self.db.c.execute(
                     "UPDATE predictions SET status=?, actual=? WHERE issue=?",
-                    ("WIN" if pred_side == actual_side else "LOSS", actual["num"], row["issue"])
+                    ("WIN" if won_side else "LOSS", actual["num"], row["issue"])
                 )
 
-                sticker = CFG.jack_sticker if (pred_side == actual_side and payload.get("num") == actual["num"]) else CFG.win_sticker if pred_side == actual_side else CFG.loss_sticker
+                sticker = CFG.jack_sticker if (won_side and won_num) else CFG.win_sticker if won_side else CFG.loss_sticker
                 self.db.queue("sticker", row["issue"], sticker)
                 self.db.c.execute("UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent=0", (row["issue"],))
 
-
-# ============================================================
-# FORMATTING
-# ============================================================
 
 def format_prediction(p):
     conf = max(p["p"], 1.0 - p["p"]) * 100
     filled = int(conf // 10)
     bar = "█" * filled + "░" * (10 - filled)
     side = "BIG" if p["side"] == "BIG" else "SMALL"
-
     rec_tag = ""
-    if p.get("is_recovery"):
+    if p.get("is_recovery") and p.get("loss_streak", 0) >= 1:
         rec_tag = "⚠️ <b>RECOVERY</b> ⚠️\n"
 
-    pattern_reason = p.get("pattern_reason", "neutral")
-    trend_reason = p.get("trend_reason", "neutral")
-    pattern_count = len(p.get("pattern_trace", []))
+    pattern_display = escape(p.get("pattern_display", "—"))
+    trend_reason = escape(p.get("trend_reason", "neutral"))
 
     return (
         f"{rec_tag}⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
@@ -570,9 +506,8 @@ def format_prediction(p):
         f"📅 <b>PERIOD:</b> <code>{escape(p['issue'])}</code>\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
-        f"🧠 <b>SEQUENCE:</b> {pattern_reason}\n"
+        f"🧩 <b>PATTERN:</b> <code>{pattern_display}</code>\n"
         f"📈 <b>TREND:</b> {trend_reason}\n"
-        f"🧩 <b>PATTERN TRACKS:</b> {pattern_count}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
 
