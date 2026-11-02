@@ -1,4 +1,5 @@
-# FTW PREDICTOR — FULL UPDATED FINAL VERSION
+
+# FTW PREDICTOR — FIXED FINAL VERSION
 # Python 3.10+
 # Deps: aiohttp
 
@@ -31,7 +32,7 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_full_updated_final.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_fixed_final.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "2.0"))
     timeout: float = 18.0
@@ -42,7 +43,7 @@ class Config:
     meta_lr: float = 0.07
     decay: float = 0.985
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (FULL UPDATED FINAL)"
+    name: str = "FTW PREDICTOR (FIXED FINAL)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -54,7 +55,7 @@ class Config:
 
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOG = logging.getLogger("ftw_full_updated_final")
+LOG = logging.getLogger("ftw_fixed_final")
 
 
 # ============================================================
@@ -228,206 +229,16 @@ def parse_history(payload):
         key = str(issue)
         if key in records and records[key]["num"] != number:
             raise ValueError(f"Conflicting duplicate issue: {key}")
-        records[key] = {"issue": key, "num": number, "size": int(number >= 5)}
+        records[key] = {
+            "issue": key,
+            "num": number,
+            "size": int(number >= 5),
+        }
     return sorted(records.values(), key=lambda x: int(x["issue"]))
 
 
 # ============================================================
-# MULTI-ENGINE / WALK-FORWARD
-# ============================================================
-
-MODEL_NAMES = ("global", "recent60", "recent120", "recent300", "markov1", "markov2", "markov3")
-
-def _normalize(values):
-    total = sum(values)
-    if total <= 0:
-        return [0.1] * 10
-    return [float(v) / total for v in values]
-
-def _prior(nums, smoothing=1.5):
-    if not nums:
-        return [0.1] * 10
-    counts = Counter(nums)
-    return _normalize([counts.get(k, 0) + smoothing for k in range(10)])
-
-def _forecast_one(nums, model):
-    if not nums:
-        return [0.1] * 10
-
-    if model == "global":
-        return _prior(nums[-1000:])
-
-    window_map = {
-        "recent60": 60,
-        "recent120": 120,
-        "recent300": 300,
-    }
-    if model in window_map:
-        return _prior(nums[-window_map[model]:])
-
-    order = {"markov1": 1, "markov2": 2, "markov3": 3}.get(model)
-    if order is None:
-        raise ValueError(f"Unknown model: {model}")
-
-    prior = _prior(nums[-300:])
-
-    if len(nums) <= order:
-        return prior
-
-    context = tuple(nums[-order:])
-    counts = [0.0] * 10
-    support = 0
-
-    for target_idx in range(order, len(nums)):
-        if tuple(nums[target_idx - order:target_idx]) != context:
-            continue
-        age = len(nums) - 1 - target_idx
-        recency_weight = 0.5 ** (age / 250.0)
-        counts[nums[target_idx]] += recency_weight
-        support += recency_weight
-
-    if support <= 0:
-        return prior
-
-    prior_strength = 12.0
-    return _normalize([
-        counts[k] + prior_strength * prior[k]
-        for k in range(10)
-    ])
-
-def _brier10(probabilities, actual):
-    return sum(
-        (probabilities[k] - (1.0 if k == actual else 0.0)) ** 2
-        for k in range(10)
-    ) / 2.0
-
-def _score_models_from_walkforward(nums, steps=900, min_train=100, loss_streak=0):
-    if len(nums) <= min_train:
-        e = 1.0 / len(MODEL_NAMES)
-        return (
-            {name: e for name in MODEL_NAMES},
-            {"steps": 0, "scores": None, "recovery": loss_streak >= 1},
-        )
-
-    start = max(min_train, len(nums) - steps)
-    model_losses = {name: [] for name in MODEL_NAMES}
-
-    for target_idx in range(start, len(nums)):
-        past = nums[:target_idx]
-        actual = nums[target_idx]
-        for name in MODEL_NAMES:
-            forecast = _forecast_one(past, name)
-            model_losses[name].append(_brier10(forecast, actual))
-
-    decay = 0.94 if loss_streak >= 1 else 0.985
-    scores = {}
-
-    for name, losses in model_losses.items():
-        weights = [decay ** (len(losses) - 1 - i) for i in range(len(losses))]
-        scores[name] = (
-            sum(w * loss for w, loss in zip(weights, losses)) / sum(weights)
-        )
-
-    best_score = min(scores.values())
-    raw = {
-        name: math.exp(-8.0 * max(0.0, score - best_score))
-        for name, score in scores.items()
-    }
-    raw_total = sum(raw.values())
-    learned = {name: raw[name] / raw_total for name in MODEL_NAMES}
-    uniform = 1.0 / len(MODEL_NAMES)
-    learned_share = 0.60
-    final = {
-        name: learned_share * learned[name] + (1.0 - learned_share) * uniform
-        for name in MODEL_NAMES
-    }
-
-    return final, {
-        "steps": len(next(iter(model_losses.values()))),
-        "scores": scores,
-        "recovery": loss_streak >= 1,
-    }
-
-def exact_number_model(history, side_bias):
-    if not history:
-        return [1.0] * 10, "cold"
-
-    nums = [x["num"] for x in history]
-    sizes = [x["size"] for x in history]
-    regime = get_regime([x["size"] for x in history])
-    base = [1.0] * 10
-
-    freq = Counter(nums)
-    for k in range(10):
-        base[k] *= 1.0 + 2.8 * freq.get(k, 0)
-
-    recent = nums[-12:]
-    recent_counter = Counter(recent)
-    for k in range(10):
-        base[k] *= 1.0 + 1.6 * recent_counter.get(k, 0)
-
-    trans = {}
-    for i in range(1, len(nums)):
-        prev = nums[i - 1]
-        cur = nums[i]
-        trans[(prev, cur)] = trans.get((prev, cur), 0) + 1
-
-    last_num = nums[-1] if nums else 0
-    for k in range(10):
-        base[k] *= 1.0 + 0.9 * trans.get((last_num, k), 0)
-        base[k] *= 1.0 + 0.45 * trans.get((k, last_num), 0)
-
-    if side_bias >= 0.5:
-        for k in range(0, 5):
-            base[k] *= 0.35
-        for k in range(5, 10):
-            base[k] *= 1.5
-    else:
-        for k in range(5, 10):
-            base[k] *= 0.35
-        for k in range(0, 5):
-            base[k] *= 1.5
-
-    if regime == "RUN":
-        if len(nums) >= 3:
-            if nums[-1] >= 5:
-                for k in range(5, 10):
-                    base[k] *= 1.2
-            else:
-                for k in range(0, 5):
-                    base[k] *= 1.2
-    elif regime == "ALT":
-        if len(nums) >= 4:
-            a, b = nums[-2], nums[-1]
-            for k in range(10):
-                if k in (a, b):
-                    base[k] *= 1.1
-    elif regime == "IMBAL":
-        avg = sum(recent) / len(recent)
-        if avg >= 5:
-            for k in range(5, 10):
-                base[k] *= 1.2
-        else:
-            for k in range(0, 5):
-                base[k] *= 1.2
-
-    if len(sizes) >= 4:
-        recent_size = sum(sizes[-6:]) / len(sizes[-6:])
-        if recent_size > 0.7:
-            for k in range(5, 10):
-                base[k] *= 1.15
-        elif recent_size < 0.3:
-            for k in range(0, 5):
-                base[k] *= 1.15
-
-    total = sum(base)
-    if total <= 0:
-        return [1.0] * 10, regime
-    return [x / total for x in base], regime
-
-
-# ============================================================
-# QUANTUM PATTERN MATCHER (same as before)
+# QUANTUM PATTERN TRACKER
 # ============================================================
 
 class QuantumTracker:
@@ -600,6 +411,193 @@ class Database:
 
 
 # ============================================================
+# FLEXIBLE MODEL ENGINE — 900 WALK-FORWARD + EXACT NUMBER DIST
+# ============================================================
+
+MODEL_NAMES = ("global", "recent60", "recent120", "recent300", "markov1", "markov2", "markov3")
+
+def _normalize(values):
+    total = sum(values)
+    if total <= 0:
+        return [0.1] * 10
+    return [float(v) / total for v in values]
+
+def _prior(nums, smoothing=1.5):
+    if not nums:
+        return [0.1] * 10
+    counts = Counter(nums)
+    return _normalize([counts.get(k, 0) + smoothing for k in range(10)])
+
+def _forecast_one(nums, model):
+    if not nums:
+        return [0.1] * 10
+
+    if model == "global":
+        return _prior(nums[-1000:])
+
+    window_map = {"recent60": 60, "recent120": 120, "recent300": 300}
+    if model in window_map:
+        return _prior(nums[-window_map[model]:])
+
+    order = {"markov1": 1, "markov2": 2, "markov3": 3}.get(model)
+    if order is None:
+        raise ValueError(f"Unknown model: {model}")
+
+    prior = _prior(nums[-300:])
+    if len(nums) <= order:
+        return prior
+
+    context = tuple(nums[-order:])
+    counts = [0.0] * 10
+    support = 0.0
+
+    for target_idx in range(order, len(nums)):
+        if tuple(nums[target_idx - order:target_idx]) != context:
+            continue
+        age = len(nums) - 1 - target_idx
+        recency = 0.5 ** (age / 250.0)
+        counts[nums[target_idx]] += recency
+        support += recency
+
+    if support <= 0:
+        return prior
+
+    prior_strength = 12.0
+    return _normalize([
+        counts[k] + prior_strength * prior[k]
+        for k in range(10)
+    ])
+
+def _brier10(probabilities, actual):
+    return sum(
+        (probabilities[k] - (1.0 if k == actual else 0.0)) ** 2
+        for k in range(10)
+    ) / 2.0
+
+def _score_models_from_walkforward(nums, steps=900, min_train=100, loss_streak=0):
+    if len(nums) <= min_train:
+        e = 1.0 / len(MODEL_NAMES)
+        return (
+            {name: e for name in MODEL_NAMES},
+            {"steps": 0, "scores": None, "recovery": loss_streak >= 1},
+        )
+
+    start = max(min_train, len(nums) - steps)
+    model_losses = {name: [] for name in MODEL_NAMES}
+
+    for target_idx in range(start, len(nums)):
+        past = nums[:target_idx]
+        actual = nums[target_idx]
+
+        for name in MODEL_NAMES:
+            forecast = _forecast_one(past, name)
+            model_losses[name].append(_brier10(forecast, actual))
+
+    decay = 0.94 if loss_streak >= 1 else 0.985
+    scores = {}
+    for name, losses in model_losses.items():
+        weights = [decay ** (len(losses) - 1 - i) for i in range(len(losses))]
+        scores[name] = sum(w * v for w, v in zip(weights, losses)) / sum(weights)
+
+    best_score = min(scores.values())
+    raw = {
+        name: math.exp(-8.0 * max(0.0, score - best_score))
+        for name, score in scores.items()
+    }
+    raw_total = sum(raw.values())
+    learned = {name: raw[name] / raw_total for name in MODEL_NAMES}
+    uniform = 1.0 / len(MODEL_NAMES)
+    learned_share = 0.60
+    final = {
+        name: learned_share * learned[name] + (1.0 - learned_share) * uniform
+        for name in MODEL_NAMES
+    }
+    return final, {
+        "steps": len(next(iter(model_losses.values()))),
+        "scores": scores,
+        "recovery": loss_streak >= 1,
+    }
+
+def exact_number_model(history, side_bias):
+    if not history:
+        return [1.0] * 10, "cold"
+
+    nums = [x["num"] for x in history]
+    sizes = [x["size"] for x in history]
+    regime = get_regime([x["size"] for x in history])
+    base = [1.0] * 10
+
+    freq = Counter(nums)
+    for k in range(10):
+        base[k] *= 1.0 + 2.8 * freq.get(k, 0)
+
+    recent = nums[-12:]
+    recent_counter = Counter(recent)
+    for k in range(10):
+        base[k] *= 1.0 + 1.6 * recent_counter.get(k, 0)
+
+    trans = {}
+    for i in range(1, len(nums)):
+        prev = nums[i - 1]
+        cur = nums[i]
+        trans[(prev, cur)] = trans.get((prev, cur), 0) + 1
+
+    last_num = nums[-1] if nums else 0
+    for k in range(10):
+        base[k] *= 1.0 + 0.9 * trans.get((last_num, k), 0)
+        base[k] *= 1.0 + 0.45 * trans.get((k, last_num), 0)
+
+    # side bias is only soft; do not force BIG
+    if side_bias >= 0.5:
+        for k in range(0, 5):
+            base[k] *= 0.75
+        for k in range(5, 10):
+            base[k] *= 1.25
+    else:
+        for k in range(5, 10):
+            base[k] *= 0.75
+        for k in range(0, 5):
+            base[k] *= 1.25
+
+    if regime == "RUN":
+        if len(nums) >= 3:
+            if nums[-1] >= 5:
+                for k in range(5, 10):
+                    base[k] *= 1.1
+            else:
+                for k in range(0, 5):
+                    base[k] *= 1.1
+    elif regime == "ALT":
+        if len(nums) >= 4:
+            a, b = nums[-2], nums[-1]
+            for k in range(10):
+                if k in (a, b):
+                    base[k] *= 1.08
+    elif regime == "IMBAL":
+        avg = sum(recent) / len(recent)
+        if avg >= 5:
+            for k in range(5, 10):
+                base[k] *= 1.08
+        else:
+            for k in range(0, 5):
+                base[k] *= 1.08
+
+    if len(sizes) >= 4:
+        recent_size = sum(sizes[-6:]) / len(sizes[-6:])
+        if recent_size > 0.7:
+            for k in range(5, 10):
+                base[k] *= 1.08
+        elif recent_size < 0.3:
+            for k in range(0, 5):
+                base[k] *= 1.08
+
+    total = sum(base)
+    if total <= 0:
+        return [1.0] * 10, regime
+    return [x / total for x in base], regime
+
+
+# ============================================================
 # RECOVERY CONTROLLER
 # ============================================================
 
@@ -631,7 +629,7 @@ class RecoveryController:
 
 
 # ============================================================
-# FINAL ENGINE
+# ENGINE
 # ============================================================
 
 EXPERT_NAMES = [
@@ -759,72 +757,95 @@ class Engine:
         total_w = sum(w for _, w in adjusted)
         p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
 
-        m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES] + [1.0]
-        mw = self.db.get("meta_weights")
-        if not isinstance(mw, list) or len(mw) != len(m_feats):
-            mw = [1.0 / len(EXPERT_NAMES)] * len(EXPERT_NAMES) + [0.0]
-        p_meta = sigmoid(sum(w * f for w, f in zip(mw, m_feats)))
+        # direct exact distribution from walk-forward-scored models
+        wf_weights, wf_info = _score_models_from_walkforward(
+            nums,
+            steps=900,
+            min_train=100,
+            loss_streak=loss_streak,
+        )
 
-        alpha = min(self.db.get("meta_n", 0) / 100.0, 1.0)
-        p_raw = alpha * p_meta + (1.0 - alpha) * p_avg
-
-        # walk-forward weight and exact prediction
-        wf_weights, wf_info = _score_models_from_walkforward(nums, steps=900, min_train=100, loss_streak=loss_streak)
-
-        exact_dist, _ = exact_number_model(history, p_raw)
-        weighted_exact = [0.0] * 10
+        model_dist = [0.0] * 10
         for name in MODEL_NAMES:
             forecast = _forecast_one(nums, name)
             for k in range(10):
-                weighted_exact[k] += wf_weights[name] * forecast[k]
+                model_dist[k] += wf_weights[name] * forecast[k]
 
-        combined = [0.0] * 10
+        model_dist = _normalize(model_dist)
+
+        # exact-number model (soft)
+        exact_dist, _ = exact_number_model(history, p_avg)
+        final_dist = [0.0] * 10
         for k in range(10):
-            combined[k] = 0.55 * exact_dist[k] + 0.45 * weighted_exact[k]
+            final_dist[k] = 0.55 * exact_dist[k] + 0.45 * model_dist[k]
+        final_dist = _normalize(final_dist)
 
-        # normalize combined dist
-        total = sum(combined)
-        if total <= 0:
-            combined = [0.1] * 10
-            total = 10.0
-        combined = [x / total for x in combined]
+        # side from same final distribution
+        p_big = sum(final_dist[5:10])
+        p_small = sum(final_dist[:5])
 
-        p_big = sum(combined[5:10])
-        p_small = sum(combined[:5])
-        pred_side = "BIG" if p_big >= p_small else "SMALL"
+        if p_big >= p_small:
+            pred_side = "BIG"
+            allowed = range(5, 10)
+        else:
+            pred_side = "SMALL"
+            allowed = range(0, 5)
 
+        # ensure final distribution is consistent with side
+        side_adjusted = [0.0] * 10
+        for k in range(10):
+            if k in allowed:
+                side_adjusted[k] = final_dist[k] * 1.8
+            else:
+                side_adjusted[k] = final_dist[k] * 0.2
+
+        side_total = sum(side_adjusted)
+        if side_total <= 0:
+            side_adjusted = [0.1] * 10
+            side_total = 10.0
+        side_adjusted = [x / side_total for x in side_adjusted]
+
+        # side probability used for output
+        if pred_side == "BIG":
+            p_out = p_big
+        else:
+            p_out = p_small
+
+        # recovery: controlled, not blind flip
         if loss_streak >= 1:
-            p_raw, recovery_used = self.recovery.adjust(seq, p_raw, loss_streak)
+            p_out, recovery_used = self.recovery.adjust(seq, p_out, loss_streak)
         else:
             recovery_used = False
 
+        # anti-stubborn but not random reverse
         if len(seq) >= 8:
             short = sum(seq[-6:]) / 6.0
-            if short > 0.80 and p_raw > 0.66:
-                p_raw = 0.66
-            if short < 0.20 and p_raw < 0.34:
-                p_raw = 0.34
+            if short > 0.80 and p_out > 0.66:
+                p_out = 0.66
+            if short < 0.20 and p_out < 0.34:
+                p_out = 0.34
 
-        bucket = min(19, int(p_raw * 20))
+        # final side decision must be from the same final distribution
+        big_prob = sum(side_adjusted[5:10])
+        small_prob = sum(side_adjusted[:5])
+
+        if big_prob >= small_prob:
+            final_side = "BIG"
+            final_allowed = range(5, 10)
+        else:
+            final_side = "SMALL"
+            final_allowed = range(0, 5)
+
+        num_pred = max(final_allowed, key=lambda k: side_adjusted[k])
+        num_conf = side_adjusted[num_pred]
+
+        # Replace the old p calculation with the same final distribution
+        p_final = big_prob if final_side == "BIG" else small_prob
+
+        # calibrate with global bucket
+        bucket = min(19, int(p_final * 20))
         n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
-        p_cal = clip((32 * p_raw + s_g) / (32 + n_g))
-
-        valid_numbers = range(5, 10) if pred_side == "BIG" else range(0, 5)
-        side_dist = [0.0] * 10
-        for k in range(10):
-            if k in valid_numbers:
-                side_dist[k] = combined[k] * 1.6
-            else:
-                side_dist[k] = combined[k] * 0.35
-
-        total_side = sum(side_dist)
-        if total_side <= 0:
-            side_dist = [0.1] * 10
-            total_side = 10.0
-        side_dist = [x / total_side for x in side_dist]
-
-        num_pred = max(valid_numbers, key=lambda k: side_dist[k])
-        num_conf = side_dist[num_pred]
+        p_cal = clip((32 * p_final + s_g) / (32 + n_g))
 
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         trend_shift = f"{prev_regime} ➡️ {regime}" if prev_regime != regime else None
@@ -832,12 +853,12 @@ class Engine:
         payload = {
             "issue": issue,
             "p": p_cal,
-            "p_raw": p_raw,
-            "side": pred_side,
+            "p_raw": p_final,
+            "side": final_side,
             "num": num_pred,
             "num_probability": num_conf,
             "regime": regime,
-            "source": "🎯 Full Updated Final",
+            "source": "🎯 Fixed Final Engine",
             "trend_shift": trend_shift,
             "pattern_str": _pattern_str(patterns),
             "edge": abs(p_cal - 0.5),
@@ -848,7 +869,7 @@ class Engine:
             "is_recovery": recovery_used or (loss_streak > 0),
             "loss_streak": loss_streak,
             "patterns": [{"key": k, "p": p, "support": s} for _, p, s, _, k in patterns],
-            "exact_distribution": side_dist,
+            "exact_distribution": side_adjusted,
             "model_weights": wf_weights,
             "walk_forward": wf_info,
         }
@@ -883,8 +904,9 @@ class Engine:
                 continue
 
             payload = json.loads(row["payload"])
-            y = actual["size"]
-            won_side = int(payload["p"] >= 0.5) == y
+            actual_side = "BIG" if actual["num"] >= 5 else "SMALL"
+            predicted_side = payload.get("side", "BIG" if payload["p"] >= 0.5 else "SMALL")
+            won_side = predicted_side == actual_side
             won_num = payload.get("num") == actual["num"]
 
             with self.db.transaction():
@@ -894,13 +916,13 @@ class Engine:
                 )
 
                 for name, val in payload["experts"].items():
-                    self.db.learn(f"expert:{name}:{payload['regime']}", val, y)
+                    self.db.learn(f"expert:{name}:{payload['regime']}", val, actual["size"])
 
                 for pat in payload["patterns"]:
-                    self.db.learn(pat["key"], pat["p"], y)
+                    self.db.learn(pat["key"], pat["p"], actual["size"])
 
                 if payload.get("features") and payload["experts"].get("trend"):
-                    err = y - payload["experts"]["trend"]
+                    err = actual["size"] - payload["experts"]["trend"]
                     tw = self.db.get("trend_weights") or [0.0] * len(payload["features"])
                     self.db.set("trend_weights", [
                         clip(w + CFG.learning_rate * (err * x - 0.015 * w), -4, 4)
@@ -913,7 +935,7 @@ class Engine:
                     if len(feats) == target:
                         mw = self.db.get("meta_weights") or [1.0 / len(EXPERT_NAMES)] * len(EXPERT_NAMES) + [0.0]
                         mp = sigmoid(sum(w * f for w, f in zip(mw, feats)))
-                        grad = 2.0 * (y - mp) * mp * (1.0 - mp)
+                        grad = 2.0 * (actual["size"] - mp) * mp * (1.0 - mp)
                         self.db.set("meta_weights", [
                             clip(w * 0.999 + CFG.meta_lr * grad * f, -4, 4)
                             for w, f in zip(mw, feats)
@@ -922,7 +944,7 @@ class Engine:
 
                 bucket = min(19, int(payload.get("p_raw", payload["p"]) * 20))
                 n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
-                self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + y])
+                self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + actual["size"]])
 
                 sticker = CFG.jack_sticker if (won_side and won_num) else CFG.win_sticker if won_side else CFG.loss_sticker
                 self.db.queue("sticker", row["issue"], sticker)
