@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (V22 ULTRA — Deep Recovery Engine)
+# bot.py — FTW VIP PREDICTOR (V22 ULTRA — Tail-Matching Pattern Engine)
 # Python 3.10+  |  Deps: aiohttp
 
 import asyncio
@@ -28,7 +28,7 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v31.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v32.db") # <--- NEW DB PATH
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -38,13 +38,9 @@ class Config:
     learning_rate: float = 0.035
     meta_lr: float = 0.03
     decay: float = 0.985
-    max_pattern: int = 20 # N-Gram badha kar 20 kar diya
-    delivery_ttl: float = 600.0  
+    max_pattern: int = 20
+    delivery_ttl: float = 300.0  
     name: str = "FTW VIP PREDICTOR (ULTRA V22)"
-
-    # High Recovery Settings
-    recovery_confidence_threshold: float = 0.58 # Recovery me minimum 58% confidence chahiye
-    normal_confidence_threshold: float = 0.51
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -88,7 +84,6 @@ def get_regime(seq):
     return "MIXED"
 
 def calculate_entropy(seq):
-    """Calculates randomness. High entropy = random (unpredictable)."""
     if len(seq) < 10: return 0.0
     counts = Counter(seq)
     probs = [c / len(seq) for c in counts.values()]
@@ -125,7 +120,7 @@ def weighted_probability(observations):
     probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
     return clip(probability), effective_n
 
-# ─── ULTRA PATTERN ENGINE ───────────────────────────────────
+# ─── ULTRA PATTERN ENGINE (TAIL-MATCHING) ───────────────────
 def family_run(seq):
     if not seq: return []
     out, current, count = [], seq[0], 1
@@ -139,60 +134,42 @@ def family_run(seq):
 
 def family_signature(seq): return tuple((int(v), cnt) for v, cnt in family_run(seq))
 
-def valid_family_window(seq, start, length, min_len=5):
-    if length < min_len: return False
-    if start > 0 and seq[start] == seq[start - 1]: return False
-    end = start + length
-    if end < len(seq) and seq[end - 1] == seq[end]: return False
-    return True
-
-class UltraFamilyTracker:
+class UltraTailTracker:
     def __init__(self, min_len=5, min_support=8):
         self.min_len, self.min_support = min_len, min_support
 
-    def repeated_patterns(self, seq):
+    def match_tail_patterns(self, seq):
+        """Only finds patterns that match the CURRENT end of the sequence."""
         n = len(seq)
         if n < self.min_len * 2: return []
-        max_len = min(30, max(self.min_len, n // 2)) # Deep length up to 30
-        groups = {}
-        for length in range(self.min_len, max_len + 1):
-            for start in range(0, n - length + 1):
-                if not valid_family_window(seq, start, length, self.min_len): continue
-                sig = family_signature(seq[start:start + length])
-                groups.setdefault(sig, []).append(start + length)
+        
         results = []
-        for sig, ends in groups.items():
-            if len(ends) < self.min_support: continue
-            obs = [(seq[end], 0.5 ** ((n - 1 - end) / 420.0)) for end in ends if end < n]
-            if len(obs) < 2: continue
-            p, eff_n = weighted_probability(obs)
-            score = abs(p - 0.5) * math.sqrt(eff_n)
-            if score > 0:
-                results.append({"sig": sig, "p": p, "support": len(obs), "eff_n": eff_n, "score": score})
-        results.sort(key=lambda x: x["score"], reverse=True)
+        # Look for longest possible match from current tail, down to min_len
+        for length in range(min(30, n - 1), self.min_len - 1, -1):
+            suffix = seq[-length:]
+            sig = family_signature(suffix)
+            
+            obs = []
+            # Find historical matches of this exact signature
+            for i in range(n - length):
+                if family_signature(seq[i:i+length]) == sig:
+                    w = 0.5 ** ((n - 1 - (i+length)) / 420.0)
+                    obs.append((seq[i+length], w))
+            
+            if len(obs) >= self.min_support:
+                p, eff_n = weighted_probability(obs)
+                score = abs(p - 0.5) * math.sqrt(eff_n)
+                if score > 0:
+                    results.append({
+                        "sig": sig, "p": p, "support": len(obs), "eff_n": eff_n, "score": score
+                    })
+            # Take top 3 longest matching patterns
+            if len(results) >= 3:
+                break
         return results
 
-    def transition_score(self, seq):
-        n = len(seq)
-        if n < 10: return 0.5
-        runs = family_run(seq)
-        if len(runs) < 2: return 0.5
-        prev_val, prev_len, last_val, last_len = runs[-2][0], runs[-2][1], runs[-1][0], runs[-1][1]
-        run_starts = [i for i in range(1, n) if seq[i] != seq[i - 1]]
-        obs = []
-        for j in range(len(run_starts) - 2):
-            s1, s2, s3 = run_starts[j], run_starts[j+1], run_starts[j+2]
-            if s3 >= n: break
-            if seq[s1] != prev_val or seq[s2] != last_val: continue
-            if min(s2 - s1, 8) != min(prev_len, 8) or min(s3 - s2, 8) != min(last_len, 8): continue
-            obs.append((seq[s3], 0.5 ** ((n - 1 - s3) / 350.0)))
-        return weighted_probability(obs)[0] if len(obs) >= self.min_support else 0.5
-
-    def total_score(self, seq):
-        return {"transition": self.transition_score(seq)}
-
 def trend_features(seq):
-    if not seq: return [0.0] * 32
+    if not seq: return [0.0] * 16
     def mean(k):
         arr = seq[-k:]
         return sum(arr) / len(arr) if arr else 0.5
@@ -216,7 +193,6 @@ def trend_features(seq):
             2*mean(96)-1, mean(3)-mean(10), mean(5)-mean(24), mean(10)-mean(48), 
             s_run, 2*seq[-1]-1, (2*alt-1)*(2*seq[-1]-1), macd, (2*std(10)-1), (2*std(24)-1)]
 
-# ─── EXPERTS LIST ───────────────────────────────────────────
 EXPERT_NAMES = [
     "patterns", "markov1", "markov2", "markov3", "markov4",
     "run", "regime", "base", "trend", "momentum", "contrarian", "entropy"
@@ -309,9 +285,9 @@ class Engine:
 
     def mine_patterns(self, seq):
         if len(seq) < 12: return []
-        tracker = UltraFamilyTracker(min_len=5, min_support=CFG.min_support)
-        results = tracker.repeated_patterns(seq)
-        return [(item["score"], item["p"], item["support"], item["eff_n"], "family:" + "-".join(f"{'B' if v else 'S'}{c}" for v, c in item["sig"])) for item in results[:8]]
+        tracker = UltraTailTracker(min_len=5, min_support=CFG.min_support)
+        results = tracker.match_tail_patterns(seq)
+        return [(item["score"], item["p"], item["support"], item["eff_n"], "tail:" + "-".join(f"{'B' if v else 'S'}{c}" for v, c in item["sig"])) for item in results]
 
     def mine_experts(self, seq, is_recovery):
         n = len(seq)
@@ -350,11 +326,8 @@ class Engine:
         momentum = sum(seq[-5:]) / 5.0 if seq else 0.5
         experts["momentum"] = 0.2 + (momentum * 0.6)
         
-        # 🔥 ULTRA RECOVERY EXPERTS
-        # Contrarian: Predicts against the obvious trend
+        # ULTRA RECOVERY EXPERTS
         experts["contrarian"] = 1.0 - experts.get("momentum", 0.5) 
-        
-        # Entropy: If sequence is too random, rely on base rate
         entropy = calculate_entropy(seq[-20:])
         experts["entropy"] = 0.5 + (0.1 if entropy > 0.8 else -0.1) 
 
@@ -381,7 +354,7 @@ class Engine:
         nums = [r["num"] for r in history]
         
         loss_streak = self.db.get_loss_streak()
-        is_recovery = loss_streak > 0 # 🚨 Trigger Recovery Mode
+        is_recovery = loss_streak > 0
 
         experts, patterns, features, current_regime = self.mine_experts(seq, is_recovery)
         current_streak = run_length(seq)
@@ -390,14 +363,13 @@ class Engine:
         for name, p in experts.items():
             corrected, weight = self.db.adapt(f"expert:{name}:{current_regime}", p)
             
-            # Weight Balancing
-            if name == "patterns": weight *= 2.5
-            if current_streak >= 4 and name in ("momentum", "run"): weight *= 3.0
+            if name == "patterns": weight *= 3.0 # Pattern priority
+            if current_streak >= 4 and name in ("momentum", "run"): weight *= 2.0
             
-            # 🔥 RECOVERY OVERRIDE
+            # 🔥 RECOVERY OVERRIDE (Smarter)
             if is_recovery:
-                if name in ("momentum", "run", "trend"): weight *= 0.3 # Kill failing trend experts
-                if name in ("contrarian", "entropy"): weight *= 4.0 # Boost trap catchers
+                if name in ("momentum", "run", "trend"): weight *= 0.5 # Kill blindly following trend
+                if name in ("contrarian", "entropy"): weight *= 3.0 # Boost trap catchers
             
             adjusted.append((corrected, weight))
 
@@ -411,6 +383,10 @@ class Engine:
         p_meta = sigmoid(sum(w * f for w, f in zip(mw, m_feats)))
         alpha = min(self.db.get("meta_n", 0) / 80.0, 1.0)
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
+
+        # If pattern is very strong, respect it even in recovery
+        if patterns and abs(patterns[0][1] - 0.5) > 0.15 and patterns[0][2] > 10:
+            p_raw = (p_raw + patterns[0][1]) / 2.0
 
         if current_streak >= 4 and not is_recovery: p_raw = 0.9 * float(seq[-1]) + 0.1 * p_raw
 
@@ -519,7 +495,7 @@ def format_prediction(p):
         f"━━━━━━━━━━━━━━━━━━"
     )
 
-# ─── RUNTIME ─────────────────────────────────────────────────
+# ─── RUNTIME & MAIN ─────────────────────────────────────────────────
 class Runtime:
     def __init__(self, db):
         self.db, self.engine = db, Engine(db)
@@ -618,7 +594,7 @@ async def main():
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             tasks = [asyncio.create_task(runtime.worker(session), name="worker"), asyncio.create_task(runtime.sender(session), name="sender")]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info(f"{CFG.name} ULTRA V22 Started (Deep Recovery Engine ON)")
+            LOG.info(f"{CFG.name} ULTRA V22 Tail-Matching Started")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
             for task in tasks:
