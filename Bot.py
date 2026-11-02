@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (ADVANCED MIN5 + FIXED)
+# bot.py — FTW VIP PREDICTOR (REAL PATTERN TRACKER + FIXED)
 # Python 3.10+ | aiohttp
 
 import asyncio
@@ -32,7 +32,7 @@ class Config:
     ) or (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_advanced_min5.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_pattern_tracker.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -40,11 +40,11 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     max_pattern_len: int = int(os.getenv("MAX_PATTERN_LEN", "12"))
-    learning_rate: float = 0.05
-    meta_lr: float = 0.045
+    learning_rate: float = 0.06
+    meta_lr: float = 0.05
     decay: float = 0.988
     delivery_ttl: float = 55.0
-    name: str = "FTW VIP PREDICTOR (ADVANCED MIN5)"
+    name: str = "FTW VIP PREDICTOR (PATTERN TRACKER)"
     win_sticker: str = os.getenv("WIN_STICKER", "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E")
     loss_sticker: str = os.getenv("LOSS_STICKER", "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E")
     jack_sticker: str = os.getenv("JACK_STICKER", "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E")
@@ -64,7 +64,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 LOG = logging.getLogger("predictor")
 
 # -----------------------------
-# UTILS
+# COMMON HELPERS
 # -----------------------------
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
@@ -107,29 +107,6 @@ def get_regime(seq):
         return "IMBAL"
     return "MIXED"
 
-def regime_counts(history):
-    seq = [x["size"] for x in history]
-    out = {
-        "RUN": {"big": 0, "small": 0, "total": 0},
-        "ALT": {"big": 0, "small": 0, "total": 0},
-        "IMBAL": {"big": 0, "small": 0, "total": 0},
-        "MIXED": {"big": 0, "small": 0, "total": 0},
-        "COLD": {"big": 0, "small": 0, "total": 0},
-    }
-    if not seq:
-        return out
-
-    for i in range(1, len(seq)):
-        reg = get_regime(seq[max(0, i-24):i])
-        out.setdefault(reg, {"big": 0, "small": 0, "total": 0})
-        out[reg]["total"] += 1
-        if seq[i] == 1:
-            out[reg]["big"] += 1
-        else:
-            out[reg]["small"] += 1
-
-    return out
-
 def weighted_probability(observations):
     sw = sum(w for _, w in observations)
     sw2 = sum(w * w for _, w in observations)
@@ -142,10 +119,10 @@ def weighted_probability(observations):
 def ema(seq, k):
     if not seq:
         return 0.5
-    a = 2.0 / (k + 1)
+    alpha = 2.0 / (k + 1)
     val = seq[0]
     for x in seq[1:]:
-        val = a * x + (1.0 - a) * val
+        val = alpha * x + (1.0 - alpha) * val
     return val
 
 def trend_features(seq):
@@ -197,13 +174,35 @@ def run_length_score(seq):
         return 0.0
     return (min(run_length(seq), 10) / 10.0) * (2 * seq[-1] - 1)
 
+def regime_counts(history):
+    seq = [x["size"] for x in history]
+    out = {
+        "RUN": {"big": 0, "small": 0, "total": 0},
+        "ALT": {"big": 0, "small": 0, "total": 0},
+        "IMBAL": {"big": 0, "small": 0, "total": 0},
+        "MIXED": {"big": 0, "small": 0, "total": 0},
+        "COLD": {"big": 0, "small": 0, "total": 0},
+    }
+    if not seq:
+        return out
+
+    for i in range(1, len(seq)):
+        reg = get_regime(seq[max(0, i-24):i])
+        out.setdefault(reg, {"big": 0, "small": 0, "total": 0})
+        out[reg]["total"] += 1
+        if seq[i] == 1:
+            out[reg]["big"] += 1
+        else:
+            out[reg]["small"] += 1
+    return out
+
 def recent_suffix_scores(history, max_len=8):
     seq = [x["size"] for x in history]
     if not seq:
         return {}
 
     scores = {}
-    for L in range(1, min(max_len, len(seq)) + 1):
+    for L in range(5, min(max_len, len(seq)) + 1):
         suffix = tuple(seq[-L:])
         cnt_big = 0
         cnt_small = 0
@@ -241,7 +240,7 @@ def strong_reversal_allowed(history, current_regime):
     return False
 
 # -----------------------------
-# HISTORY PARSER
+# PARSE HISTORY
 # -----------------------------
 def parse_history(payload):
     obj = payload
@@ -420,13 +419,13 @@ class Database:
         }
 
 # -----------------------------
-# PREDICTOR ENGINE
+# PATTERN TRACKER ENGINE
 # -----------------------------
 class Engine:
     def __init__(self, db):
         self.db = db
 
-    def build_exact_patterns(self, seq):
+    def exact_long_patterns(self, seq):
         results = []
         max_len = min(CFG.max_pattern_len, len(seq) // 2)
         for L in range(5, max_len + 1):
@@ -447,7 +446,7 @@ class Engine:
         results.sort(key=lambda x: (abs(x[3] - 0.5), x[2]), reverse=True)
         return results[:8]
 
-    def build_markov(self, seq):
+    def markov_model(self, seq):
         model = []
         for L in range(1, 5):
             if len(seq) <= L:
@@ -487,26 +486,29 @@ class Engine:
         reg_counts = reg_map.get(reg, {"big": 1, "small": 1, "total": 2})
         reg_prob = (reg_counts["big"] / reg_counts["total"]) if reg_counts["total"] else 0.5
 
-        exact_patterns = self.build_exact_patterns(seq)
+        # exact long pattern probability
+        exact_patterns = self.exact_long_patterns(seq)
         exact_prob = 0.5
         pattern_list = []
         if exact_patterns:
             weights = []
             vals = []
             for L, suffix, count, p in exact_patterns:
-                w = min(1.0, count / 30.0) * (1.0 + (L * 0.15))
+                w = min(1.0, count / 30.0) * (1.0 + (L * 0.18))
                 weights.append(w)
                 vals.append(p * w)
             exact_prob = sum(vals) / sum(weights) if sum(weights) else 0.5
             for L, suffix, count, p in exact_patterns[:5]:
                 pattern_list.append({"key": f"suffix:{L}:{suffix}", "p": p, "support": count})
 
-        markov = self.build_markov(seq)
+        # Markov probability
+        markov = self.markov_model(seq)
         markov_prob = 0.5
         if markov:
             total_w = sum(w for _, _, w in markov)
             markov_prob = sum(p * w for _, p, w in markov) / total_w if total_w else 0.5
 
+        # recent exact suffix probability
         suffix_scores = recent_suffix_scores(history, max_len=8)
         recent_suffix_prob = 0.5
         if suffix_scores:
@@ -517,15 +519,14 @@ class Engine:
         tail = seq[-8:]
         tail_prob = sum(tail) / len(tail)
         run_score = run_length_score(seq)
-        alternation = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
 
         p_big = (
-            0.40 * exact_prob +
+            0.42 * exact_prob +
             0.22 * reg_prob +
             0.18 * markov_prob +
             0.10 * recent_suffix_prob +
             0.06 * tail_prob +
-            0.04 * (0.5 + run_score * 0.5)
+            0.02 * (0.5 + run_score * 0.5)
         )
         p_big = clip(p_big, 0.02, 0.98)
 
@@ -542,6 +543,7 @@ class Engine:
 
         side = "BIG" if p_big >= 0.5 else "SMALL"
 
+        # number prediction based on exact suffix matches only
         num_dist = [1.0] * 10
         if nums:
             for L in range(5, min(12, len(nums)) + 1):
@@ -582,7 +584,7 @@ class Engine:
             "edge": edge,
             "confidence": confidence,
             "regime": reg,
-            "source": "📊 Strong Exact Pattern Engine",
+            "source": "📊 Exact Pattern Tracker",
             "patterns": pattern_list,
             "recovery_mode": recovery_mode,
             "strong_reversal": strong_reversal,
