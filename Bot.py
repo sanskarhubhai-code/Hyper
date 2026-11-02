@@ -31,11 +31,10 @@ class Config:
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
-    name: str = "Deep Advanced Predictor"
+    name: str = "Elite Predictor"
 
     decay: float = 0.97
     tie_band: float = 0.012
-    confidence_floor: float = 0.51
 
     def validate(self):
         if not self.token or not self.chat or not self.urls:
@@ -217,7 +216,6 @@ class Database:
         return dict(row) if row else {"n": 0.0, "loss": 0.0, "inverse_loss": 0.0, "failures": 0}
 
     def learn(self, key, probability, actual):
-        # actual is 1 for BIG and 0 for SMALL
         m = self.memory(key)
         n = CFG.decay * m["n"] + 1.0
         err = probability - actual
@@ -280,10 +278,10 @@ class SignalPredictor:
     def __init__(self, db):
         self.db = db
 
-    def exact_suffix_signal(self, seq):
+    def exact_pattern(self, seq):
         if len(seq) < 8:
             return 0.5
-        candidates = []
+        hits = []
         for length in range(3, min(12, len(seq) // 2) + 1):
             suffix = tuple(seq[-length:])
             obs = []
@@ -292,10 +290,10 @@ class SignalPredictor:
                     obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 320.0)))
             if len(obs) >= 3:
                 p, _ = weighted_probability(obs)
-                candidates.append(p)
-        return mean(candidates) if candidates else 0.5
+                hits.append(p)
+        return mean(hits) if hits else 0.5
 
-    def markov_signal(self, seq):
+    def markov_pattern(self, seq):
         if len(seq) < 8:
             return 0.5
         vals = []
@@ -329,8 +327,6 @@ class SignalPredictor:
         if not seq:
             return 0.5
         recent = seq[-35:]
-        if not recent:
-            return 0.5
         s1 = mean(recent[-5:])
         s2 = mean(recent[-10:])
         s3 = mean(recent[-20:])
@@ -343,7 +339,6 @@ class SignalPredictor:
             return 0.5
         short = mean(seq[-5:])
         mid = mean(seq[-12:])
-        long = mean(seq[-25:])
         cur = seq[-1]
         val = 0.35 * (short - 0.5) + 0.35 * (mid - 0.5) + 0.30 * (cur - 0.5)
         return clip(0.5 + val)
@@ -380,11 +375,10 @@ class SignalPredictor:
         tail = seq[-15:]
         return clip(mean(tail))
 
-    def big_share(self, seq):
+    def big_share_signal(self, seq):
         if not seq:
             return 0.5
-        recent = seq[-40:]
-        return clip(mean(recent))
+        return clip(mean(seq[-40:]))
 
     def adapt_probability(self, signal_map):
         base = {
@@ -404,9 +398,11 @@ class SignalPredictor:
         for key in signal_map:
             derived = weights.get(f"expert:{key}", 1.0)
             final[key] = base.get(key, 1.0) * (0.55 + derived)
+
         total = sum(final.values())
         if total <= 0:
             return 0.5
+
         res = 0.5
         for key, val in signal_map.items():
             res += (val - 0.5) * final[key] / total
@@ -457,51 +453,35 @@ class SignalPredictor:
                 )
                 self.db.queue("result", issue, msg, time.time() + 60.0)
 
-    def choose_exact_number(self, side, nums, history, regime):
+    def choose_exact_number(self, side, nums, regime):
         valid = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
-
         freq = Counter(nums)
         recent = nums[-12:]
         scores = {n: 0.0 for n in range(10)}
 
-        # frequency baseline
         total = max(1, len(nums))
         for n in range(10):
             scores[n] += 1.0 + 5.0 * (freq.get(n, 0) / total)
 
-        # recency weighting
         if recent:
             for n in range(10):
                 scores[n] += 2.5 * (recent.count(n) / len(recent))
 
-        # weighted side bias
         for n in valid:
             scores[n] += 1.8
 
-        # recent exact repeats
         if len(nums) >= 3:
             last3 = nums[-3:]
             for n in valid:
                 scores[n] += 2.0 * last3.count(n)
 
-        # regime tuning
         if regime == "RUN":
-            if side == "BIG":
-                for n in range(5, 10):
-                    scores[n] += 1.2
-            else:
-                for n in range(0, 5):
-                    scores[n] += 1.2
+            for n in valid:
+                scores[n] += 1.2
         elif regime == "ALT":
-            # alternate patterns reward the opposite cluster sometimes
-            if side == "BIG":
-                for n in range(5, 10):
-                    scores[n] += 0.6
-            else:
-                for n in range(0, 5):
-                    scores[n] += 0.6
+            for n in valid:
+                scores[n] += 0.5
 
-        # choose based on weighted sampling
         pool = []
         for n in valid:
             weight = int(max(1, round(scores[n] * 100)))
@@ -509,7 +489,6 @@ class SignalPredictor:
 
         if not pool:
             return random.choice(valid)
-
         return random.choice(pool)
 
     def predict(self, history, issue):
@@ -542,8 +521,8 @@ class SignalPredictor:
         regime = get_regime(seq)
 
         signal_map = {
-            "exact": self.exact_suffix_signal(seq),
-            "markov": self.markov_signal(seq),
+            "exact": self.exact_pattern(seq),
+            "markov": self.markov_pattern(seq),
             "regime": self.regime_signal(seq),
             "trend": self.trend_signal(seq),
             "momentum": self.momentum_signal(seq),
@@ -551,12 +530,11 @@ class SignalPredictor:
             "distribution": self.distribution_signal(seq),
             "entropy": self.entropy_signal(seq),
             "recent_bias": self.recent_bias_signal(seq),
-            "big_share": self.big_share(seq),
+            "big_share": self.big_share_signal(seq),
         }
 
         p = self.adapt_probability(signal_map)
 
-        # regime boost
         if regime == "RUN":
             p = clip(0.5 + (p - 0.5) * 1.25)
         elif regime == "ALT":
@@ -566,14 +544,13 @@ class SignalPredictor:
         elif regime == "COLD":
             p = clip(0.5 + (p - 0.5) * 0.9)
 
-        # unbiased 50/50 tie breaking
         if abs(p - 0.5) <= CFG.tie_band:
             side = random.choice(["BIG", "SMALL"])
             p = 0.5
         else:
             side = "BIG" if p > 0.5 else "SMALL"
 
-        num = self.choose_exact_number(side, nums, history, regime)
+        num = self.choose_exact_number(side, nums, regime)
 
         return {
             "issue": issue,
@@ -797,7 +774,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("Deep advanced predictor started")
+            LOG.info("Elite predictor started")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
 
