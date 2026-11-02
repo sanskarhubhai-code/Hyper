@@ -33,7 +33,7 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_ultra_v25.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_ultra_v34.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "2"))
     timeout: float = 18.0
