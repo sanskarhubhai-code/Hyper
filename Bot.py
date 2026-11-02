@@ -31,9 +31,9 @@ class Config:
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
-    name: str = "Elite Predictor"
+    name: str = "Ultra Predictor"
 
-    decay: float = 0.97
+    decay: float = 0.975
     tie_band: float = 0.012
 
     def validate(self):
@@ -216,6 +216,7 @@ class Database:
         return dict(row) if row else {"n": 0.0, "loss": 0.0, "inverse_loss": 0.0, "failures": 0}
 
     def learn(self, key, probability, actual):
+        # actual = 1 for BIG, 0 for SMALL
         m = self.memory(key)
         n = CFG.decay * m["n"] + 1.0
         err = probability - actual
@@ -278,6 +279,7 @@ class SignalPredictor:
     def __init__(self, db):
         self.db = db
 
+    # ---------- Core signals ----------
     def exact_pattern(self, seq):
         if len(seq) < 8:
             return 0.5
@@ -380,6 +382,49 @@ class SignalPredictor:
             return 0.5
         return clip(mean(seq[-40:]))
 
+    def volatility_signal(self, seq):
+        if len(seq) < 5:
+            return 0.5
+        tail = seq[-20:]
+        sigma = stddev(tail)
+        # More volatility usually means less certain, so closer to 0.5
+        if sigma < 0.12:
+            return 0.65
+        if sigma > 0.38:
+            return 0.45
+        return 0.5
+
+    def autocorrelation_signal(self, seq):
+        if len(seq) < 6:
+            return 0.5
+        tail = seq[-12:]
+        if len(tail) < 2:
+            return 0.5
+        mean_val = mean(tail)
+        cov = sum((a - mean_val) * (b - mean_val) for a, b in zip(tail, tail[1:]))
+        var = sum((x - mean_val) ** 2 for x in tail)
+        if var == 0:
+            return 0.5
+        corr = cov / max(1e-9, var)
+        return clip(0.5 + corr * 0.7)
+
+    def cycle_signal(self, seq):
+        if len(seq) < 10:
+            return 0.5
+        tail = seq[-20:]
+        # local pulse detection
+        period_hints = []
+        for k in range(2, min(8, len(tail) // 2) + 1):
+            aa = tail[::k]
+            if len(aa) < 3:
+                continue
+            period_hints.append(mean(aa))
+        if not period_hints:
+            return 0.5
+        pulse = mean(period_hints)
+        return clip(0.5 + (pulse - 0.5) * 1.2)
+
+    # ---------- adaptive fusion ----------
     def adapt_probability(self, signal_map):
         base = {
             "exact": 1.30,
@@ -392,6 +437,9 @@ class SignalPredictor:
             "entropy": 0.70,
             "recent_bias": 1.00,
             "big_share": 1.00,
+            "volatility": 0.75,
+            "autocorrelation": 0.85,
+            "cycle": 0.88,
         }
         weights = self.db.expert_weights()
         final = {}
@@ -408,6 +456,7 @@ class SignalPredictor:
             res += (val - 0.5) * final[key] / total
         return clip(res)
 
+    # ---------- settle prediction ----------
     def settle(self, history):
         lookup = {str(r["issue"]): r for r in history}
         pending_rows = self.db.get_pending_predictions()
@@ -453,6 +502,7 @@ class SignalPredictor:
                 )
                 self.db.queue("result", issue, msg, time.time() + 60.0)
 
+    # ---------- exact number chooser ----------
     def choose_exact_number(self, side, nums, regime):
         valid = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
         freq = Counter(nums)
@@ -491,6 +541,7 @@ class SignalPredictor:
             return random.choice(valid)
         return random.choice(pool)
 
+    # ---------- final prediction ----------
     def predict(self, history, issue):
         if not history:
             side = random.choice(["BIG", "SMALL"])
@@ -513,6 +564,9 @@ class SignalPredictor:
                     "entropy": 0.5,
                     "recent_bias": 0.5,
                     "big_share": 0.5,
+                    "volatility": 0.5,
+                    "autocorrelation": 0.5,
+                    "cycle": 0.5,
                 },
             }
 
@@ -531,19 +585,23 @@ class SignalPredictor:
             "entropy": self.entropy_signal(seq),
             "recent_bias": self.recent_bias_signal(seq),
             "big_share": self.big_share_signal(seq),
+            "volatility": self.volatility_signal(seq),
+            "autocorrelation": self.autocorrelation_signal(seq),
+            "cycle": self.cycle_signal(seq),
         }
 
         p = self.adapt_probability(signal_map)
 
         if regime == "RUN":
-            p = clip(0.5 + (p - 0.5) * 1.25)
+            p = clip(0.5 + (p - 0.5) * 1.28)
         elif regime == "ALT":
-            p = clip(0.5 + (p - 0.5) * 0.75)
+            p = clip(0.5 + (p - 0.5) * 0.72)
         elif regime == "IMBAL":
-            p = clip(0.5 + (p - 0.5) * 1.18)
+            p = clip(0.5 + (p - 0.5) * 1.16)
         elif regime == "COLD":
             p = clip(0.5 + (p - 0.5) * 0.9)
 
+        # unbiased 50/50 tie breaker
         if abs(p - 0.5) <= CFG.tie_band:
             side = random.choice(["BIG", "SMALL"])
             p = 0.5
@@ -558,7 +616,7 @@ class SignalPredictor:
             "side": side,
             "num": num,
             "regime": regime,
-            "source": "deep-ensemble",
+            "source": "ultra-deep-ensemble",
             "experts": {
                 "exact": signal_map["exact"],
                 "markov": signal_map["markov"],
@@ -570,6 +628,9 @@ class SignalPredictor:
                 "entropy": signal_map["entropy"],
                 "recent_bias": signal_map["recent_bias"],
                 "big_share": signal_map["big_share"],
+                "volatility": signal_map["volatility"],
+                "autocorrelation": signal_map["autocorrelation"],
+                "cycle": signal_map["cycle"],
             },
         }
 
@@ -774,7 +835,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("Elite predictor started")
+            LOG.info("Ultra predictor started")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
 
