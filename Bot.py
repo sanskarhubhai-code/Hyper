@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (V22 ULTRA — Tail-Matching Pattern Engine)
+# bot.py — FTW VIP PREDICTOR (V23 QUANTUM ULTRA)
 # Python 3.10+  |  Deps: aiohttp
 
 import asyncio
@@ -13,7 +13,7 @@ import signal
 import socket
 import sqlite3
 import time
-from collections import Counter, deque
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -28,19 +28,19 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v32.db") # <--- NEW DB PATH
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v33.db") # <--- NAYA DB
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
-    min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
+    min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "12")) # Support badha diya
     learning_rate: float = 0.035
     meta_lr: float = 0.03
     decay: float = 0.985
-    max_pattern: int = 20
+    max_pattern: int = 6 # Lamba pattern hata diya
     delivery_ttl: float = 300.0  
-    name: str = "FTW VIP PREDICTOR (ULTRA V22)"
+    name: str = "FTW PREDICTOR (QUANTUM V23)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -83,12 +83,6 @@ def get_regime(seq):
     if abs(sum(tail) / len(tail) - 0.5) > 0.20: return "IMBAL"
     return "MIXED"
 
-def calculate_entropy(seq):
-    if len(seq) < 10: return 0.0
-    counts = Counter(seq)
-    probs = [c / len(seq) for c in counts.values()]
-    return -sum(p * math.log2(p) for p in probs if p > 0)
-
 def numeric(value):
     if isinstance(value, bool): return None
     text = str(value).strip()
@@ -120,7 +114,7 @@ def weighted_probability(observations):
     probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
     return clip(probability), effective_n
 
-# ─── ULTRA PATTERN ENGINE (TAIL-MATCHING) ───────────────────
+# ─── QUANTUM PATTERN ENGINE ─────────────────────────────────
 def family_run(seq):
     if not seq: return []
     out, current, count = [], seq[0], 1
@@ -134,37 +128,31 @@ def family_run(seq):
 
 def family_signature(seq): return tuple((int(v), cnt) for v, cnt in family_run(seq))
 
-class UltraTailTracker:
-    def __init__(self, min_len=5, min_support=8):
-        self.min_len, self.min_support = min_len, min_support
+class QuantumTracker:
+    def __init__(self, min_len=3, max_len=6, min_support=12): # Max length 6
+        self.min_len, self.max_len, self.min_support = min_len, max_len, min_support
 
     def match_tail_patterns(self, seq):
-        """Only finds patterns that match the CURRENT end of the sequence."""
         n = len(seq)
-        if n < self.min_len * 2: return []
-        
+        if n < 20: return []
         results = []
-        # Look for longest possible match from current tail, down to min_len
-        for length in range(min(30, n - 1), self.min_len - 1, -1):
+        # Sirf chhote aur reliable patterns dhoondho
+        for length in range(self.max_len, self.min_len - 1, -1):
             suffix = seq[-length:]
             sig = family_signature(suffix)
-            
             obs = []
-            # Find historical matches of this exact signature
             for i in range(n - length):
                 if family_signature(seq[i:i+length]) == sig:
-                    w = 0.5 ** ((n - 1 - (i+length)) / 420.0)
+                    w = 0.5 ** ((n - 1 - (i+length)) / 400.0)
                     obs.append((seq[i+length], w))
             
+            # Strict support check
             if len(obs) >= self.min_support:
                 p, eff_n = weighted_probability(obs)
                 score = abs(p - 0.5) * math.sqrt(eff_n)
                 if score > 0:
-                    results.append({
-                        "sig": sig, "p": p, "support": len(obs), "eff_n": eff_n, "score": score
-                    })
-            # Take top 3 longest matching patterns
-            if len(results) >= 3:
+                    results.append({"sig": sig, "p": p, "support": len(obs), "eff_n": eff_n, "score": score})
+            if len(results) >= 1: # Best pattern only
                 break
         return results
 
@@ -195,7 +183,7 @@ def trend_features(seq):
 
 EXPERT_NAMES = [
     "patterns", "markov1", "markov2", "markov3", "markov4",
-    "run", "regime", "base", "trend", "momentum", "contrarian", "entropy"
+    "run", "regime", "base", "trend", "momentum", "reversal"
 ]
 
 def logistic(weights, features): return sigmoid(sum(w * x for w, x in zip(weights, features)))
@@ -284,10 +272,10 @@ class Engine:
     def __init__(self, db): self.db = db
 
     def mine_patterns(self, seq):
-        if len(seq) < 12: return []
-        tracker = UltraTailTracker(min_len=5, min_support=CFG.min_support)
+        if len(seq) < 20: return []
+        tracker = QuantumTracker(min_len=3, max_len=6, min_support=12)
         results = tracker.match_tail_patterns(seq)
-        return [(item["score"], item["p"], item["support"], item["eff_n"], "tail:" + "-".join(f"{'B' if v else 'S'}{c}" for v, c in item["sig"])) for item in results]
+        return [(item["score"], item["p"], item["support"], item["eff_n"], "q:" + "-".join(f"{'B' if v else 'S'}{c}" for v, c in item["sig"])) for item in results]
 
     def mine_experts(self, seq, is_recovery):
         n = len(seq)
@@ -300,7 +288,7 @@ class Engine:
             den = sum(w * math.sqrt(eff_n) for _, p, _, eff_n, key in patterns for _, w in [self.db.adapt(key, p)])
             if den > 0: experts["patterns"] = num / den
 
-        for order in (1, 2, 3, 4):
+        for order in (1, 2, 3):
             suffix = tuple(seq[-order:])
             obs = [(seq[i], weight(i)) for i in range(order, n - order) if tuple(seq[i - order:i]) == suffix]
             if len(obs) >= CFG.min_support: experts[f"markov{order}"] = weighted_probability(obs)[0]
@@ -323,13 +311,9 @@ class Engine:
         if not isinstance(tw, list) or len(tw) != len(features): tw = [0.0] * len(features)
         experts["trend"] = logistic(tw, features)
         
-        momentum = sum(seq[-5:]) / 5.0 if seq else 0.5
+        momentum = sum(seq[-4:]) / 4.0 if seq else 0.5
         experts["momentum"] = 0.2 + (momentum * 0.6)
-        
-        # ULTRA RECOVERY EXPERTS
-        experts["contrarian"] = 1.0 - experts.get("momentum", 0.5) 
-        entropy = calculate_entropy(seq[-20:])
-        experts["entropy"] = 0.5 + (0.1 if entropy > 0.8 else -0.1) 
+        experts["reversal"] = 1.0 - experts["momentum"]
 
         return experts, patterns, features, current_regime
 
@@ -363,13 +347,17 @@ class Engine:
         for name, p in experts.items():
             corrected, weight = self.db.adapt(f"expert:{name}:{current_regime}", p)
             
-            if name == "patterns": weight *= 3.0 # Pattern priority
-            if current_streak >= 4 and name in ("momentum", "run"): weight *= 2.0
+            if name == "patterns": weight *= 3.0 
             
-            # 🔥 RECOVERY OVERRIDE (Smarter)
+            # 🔥 QUANTUM RECOVERY OVERRIDE
             if is_recovery:
-                if name in ("momentum", "run", "trend"): weight *= 0.5 # Kill blindly following trend
-                if name in ("contrarian", "entropy"): weight *= 3.0 # Boost trap catchers
+                if loss_streak == 1:
+                    # Level 1: Trend ko mat maaro, bas confidence adjust karo
+                    if name in ("momentum", "run"): weight *= 1.5 
+                elif loss_streak >= 2:
+                    # Level 2: Stubborn trend ko maaro, Reversal ko boost karo
+                    if name in ("momentum", "run", "trend"): weight *= 0.3 
+                    if name == "reversal": weight *= 4.0
             
             adjusted.append((corrected, weight))
 
@@ -384,11 +372,16 @@ class Engine:
         alpha = min(self.db.get("meta_n", 0) / 80.0, 1.0)
         p_raw = alpha * p_meta + (1 - alpha) * p_avg
 
-        # If pattern is very strong, respect it even in recovery
-        if patterns and abs(patterns[0][1] - 0.5) > 0.15 and patterns[0][2] > 10:
-            p_raw = (p_raw + patterns[0][1]) / 2.0
-
-        if current_streak >= 4 and not is_recovery: p_raw = 0.9 * float(seq[-1]) + 0.1 * p_raw
+        # 🧠 ANTI-STUBBORN LOGIC
+        if loss_streak >= 2:
+            # Agar 2 baar loss ho gaya, toh seedha recent trend ka ulta maaro
+            recent_momentum = sum(seq[-3:]) / 3.0
+            if recent_momentum > 0.66: # Agar BIG chal raha tha
+                p_raw = 0.3 # Force SMALL
+            elif recent_momentum < 0.33: # Agar SMALL chal raha tha
+                p_raw = 0.7 # Force BIG
+            else:
+                p_raw = 0.5 + (p_raw - 0.5) * 0.5
 
         bucket = min(19, int(p_raw * 20))
         n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
@@ -405,9 +398,9 @@ class Engine:
 
         return {
             "issue": issue, "p": p_cal, "p_raw": p_raw, "side": pred_side, "num": num_pred, "num_probability": num_conf,
-            "regime": current_regime, "source": "🎯 Meta+Evidence", "trend_shift": trend_shift,
+            "regime": current_regime, "source": "🎯 Quantum Engine", "trend_shift": trend_shift,
             "pattern_str": _pattern_str(patterns), "edge": abs(p_cal - 0.5), "confidence": max(p_cal, 1 - p_cal),
-            "experts": experts, "features": features, "meta_feats": m_feats, "is_recovery": is_recovery,
+            "experts": experts, "features": features, "meta_feats": m_feats, "is_recovery": is_recovery, "loss_streak": loss_streak,
             "patterns": [{"key": k, "p": p, "support": s} for _, p, s, _, k in patterns],
         }
 
@@ -478,7 +471,13 @@ def format_prediction(p):
     quality = "🔥 HIGH VIP" if conf >= 65 else "⭐ VIP" if conf >= 60 else "✅ NORMAL"
     stake = "2.0x" if conf >= 65 else "1.5x" if conf >= 60 else "1x"
 
-    rec_tag = "🚨 <b>ULTRA RECOVERY MODE ACTIVE</b> 🚨\n" if p.get("is_recovery") else ""
+    rec_tag = ""
+    if p.get("is_recovery"):
+        if p.get("loss_streak") == 1:
+            rec_tag = "⚠️ <b>RECOVERY LEVEL 1</b> ⚠️\n"
+        else:
+            rec_tag = "🚨 <b>QUANTUM REVERSAL (LVL 2)</b> 🚨\n"
+
     shift = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
     pat = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") and p.get("pattern_str") != "None" else ""
 
@@ -594,7 +593,7 @@ async def main():
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             tasks = [asyncio.create_task(runtime.worker(session), name="worker"), asyncio.create_task(runtime.sender(session), name="sender")]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info(f"{CFG.name} ULTRA V22 Tail-Matching Started")
+            LOG.info(f"{CFG.name} Started")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
             for task in tasks:
