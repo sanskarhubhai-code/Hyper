@@ -1,14 +1,10 @@
 # bot.py
-# ADVANCED SIGNAL-FIRST PREDICTOR
-# No last-result bias
-# Random tie-breaker for 50/50 states
-# Adaptive ensemble: Exact Pattern + Markov + Regime + Trend + Number Prior
-# Valid side and valid number selection
-# Fixes:
-# - AttributeError
-# - win/loss settlement bug
-# - random tie handling
-# - no forced BIG only
+# ADVANCED STRONG SIGNAL-FIRST PREDICTOR
+# NO last-result bias
+# Adaptive weight ensemble
+# Tie-breaker with random when near 50/50
+# Valid number selection from side range
+# Win/Loss settlement fixed
 # Python 3.10+
 # pip install aiohttp
 
@@ -39,17 +35,14 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "advanced_signal_predictor.db")
+    db_path: str = os.getenv("DB_PATH", "advanced_strong_predictor.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     decay: float = 0.95
-    name: str = "Advanced Signal Predictor"
-    win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
-    loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
-    jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
+    name: str = "Advanced Strong Predictor"
 
     def validate(self):
         if not self.token or not self.chat or not self.urls:
@@ -254,37 +247,10 @@ class Database:
         ).fetchall()
 
 
-# ─── ADVANCED ENSEMBLE ─────────────────────────────────────────
-class NumberModel:
-    def __init__(self):
-        pass
-
-    def distribution(self, nums):
-        if not nums:
-            return [0.1] * 10
-        freq = Counter(nums)
-        dist = [1.0] * 10
-        total = len(nums)
-        if total > 0:
-            for i in range(10):
-                dist[i] += 6.0 * (freq.get(i, 0) / total)
-        if len(nums) >= 4:
-            recent = nums[-8:]
-            for i in range(10):
-                dist[i] += 2.0 * (recent.count(i) / len(recent))
-        s = sum(dist)
-        return [x / s for x in dist]
-
-    def pick_best(self, nums, side):
-        dist = self.distribution(nums)
-        valid = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
-        best = max(valid, key=lambda n: dist[n])
-        return best
-
-class AdaptiveSignalPredictor:
+# ─── ADVANCED SIGNAL PREDICTOR ─────────────────────────────────
+class AdvancedSignalPredictor:
     def __init__(self, db):
         self.db = db
-        self.number_model = NumberModel()
 
     def exact_pattern(self, seq):
         if len(seq) < 8:
@@ -316,7 +282,9 @@ class AdaptiveSignalPredictor:
             if len(obs) >= 3:
                 p, _ = weighted_probability(obs)
                 vals.append(p)
-        return sum(vals) / len(vals) if vals else 0.5
+        if not vals:
+            return 0.5
+        return sum(vals) / len(vals)
 
     def regime_signal(self, seq):
         reg = get_regime(seq)
@@ -338,22 +306,86 @@ class AdaptiveSignalPredictor:
         z = sum(feats)
         return clip(1.0 / (1.0 + math.exp(-z / 8.0)))
 
+    def volatility_signal(self, seq):
+        if len(seq) < 3:
+            return 0.5
+        recent = seq[-12:]
+        if not recent:
+            return 0.5
+        v = sum(abs(a - b) for a, b in zip(recent, recent[1:])) / max(1, len(recent) - 1)
+        return clip(0.5 + (v - 0.5) * 0.8)
+
     def frequency_signal(self, seq):
         if not seq:
             return 0.5
-        return mean(seq[-25:])  # 0..1, bigger = more BIG tendency
+        return mean(seq[-30:])
+
+    def dynamic_weights(self, seq, reg):
+        # more exact/markov in stable sequences
+        if reg == "RUN":
+            return {
+                "exact": 0.28,
+                "markov": 0.22,
+                "regime": 0.20,
+                "trend": 0.18,
+                "freq": 0.08,
+                "vol": 0.04,
+            }
+        if reg == "ALT":
+            return {
+                "exact": 0.30,
+                "markov": 0.24,
+                "regime": 0.16,
+                "trend": 0.14,
+                "freq": 0.08,
+                "vol": 0.08,
+            }
+        if reg == "IMBAL":
+            return {
+                "exact": 0.22,
+                "markov": 0.18,
+                "regime": 0.18,
+                "trend": 0.20,
+                "freq": 0.14,
+                "vol": 0.08,
+            }
+        return {
+            "exact": 0.26,
+            "markov": 0.20,
+            "regime": 0.18,
+            "trend": 0.16,
+            "freq": 0.12,
+            "vol": 0.08,
+        }
+
+    def candidate_distribution(self, nums, side):
+        if not nums:
+            return {n: 0.1 for n in range(10)}
+        freq = Counter(nums)
+        dist = {n: 1.0 for n in range(10)}
+        total = len(nums)
+        for n in range(10):
+            dist[n] += 6.0 * (freq.get(n, 0) / total if total else 0.0)
+        recent = nums[-10:]
+        if recent:
+            for n in range(10):
+                dist[n] += 2.0 * (recent.count(n) / len(recent))
+        s = sum(dist.values())
+        dist = {n: dist[n] / s for n in dist}
+        valid = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
+        return {n: dist.get(n, 0.0) for n in valid}
 
     def predict(self, history, issue):
         if not history:
             side = random.choice(["BIG", "SMALL"])
-            num = 5 if side == "BIG" else 4
+            num = random.choice([5, 4])
             return {
                 "issue": issue,
                 "p": 0.5,
                 "side": side,
                 "num": num,
                 "regime": "COLD",
-                "source": "random fallback",
+                "source": "fallback",
                 "experts": {},
             }
 
@@ -361,58 +393,48 @@ class AdaptiveSignalPredictor:
         nums = [r["num"] for r in history]
         reg = get_regime(seq)
 
-        p_exact = self.exact_pattern(seq)
-        p_markov = self.markov(seq)
-        p_regime = self.regime_signal(seq)
-        p_trend = self.trend_signal(seq)
-        p_freq = self.frequency_signal(seq)
+        exact = self.exact_pattern(seq)
+        markov = self.markov(seq)
+        regime = self.regime_signal(seq)
+        trend = self.trend_signal(seq)
+        volatility = self.volatility_signal(seq)
+        frequency = self.frequency_signal(seq)
 
-        # adaptive weights
-        weights = {
-            "exact": 0.29,
-            "markov": 0.21,
-            "regime": 0.20,
-            "trend": 0.18,
-            "freq": 0.12,
-        }
+        weights = self.dynamic_weights(seq, reg)
 
         p = (
-            weights["exact"] * p_exact +
-            weights["markov"] * p_markov +
-            weights["regime"] * p_regime +
-            weights["trend"] * p_trend +
-            weights["freq"] * p_freq
+            weights["exact"] * exact +
+            weights["markov"] * markov +
+            weights["regime"] * regime +
+            weights["trend"] * trend +
+            weights["freq"] * frequency +
+            weights["vol"] * volatility
         )
         p = clip(p)
 
-        # neutral handling
+        # tie-break neutral region
         if abs(p - 0.5) < 0.02:
-            p = 0.5
             side = random.choice(["BIG", "SMALL"])
+            p = 0.5
         else:
-            side = "BIG" if p >= 0.5 else "SMALL"
+            side = "BIG" if p > 0.5 else "SMALL"
 
-        # regime tuning
+        # slight smoothing for regime
         if reg == "RUN":
             if side == "BIG":
-                p = clip(p + 0.06)
+                p = clip(p + 0.04)
             else:
-                p = clip(p - 0.06)
+                p = clip(p - 0.04)
         elif reg == "ALT":
             p = clip(0.5 + (p - 0.5) * 0.75)
 
-        # final side decision
         if abs(p - 0.5) < 0.02:
             side = random.choice(["BIG", "SMALL"])
             p = 0.5
 
-        side = "BIG" if p >= 0.5 else "SMALL"
-
         valid_range = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
-        best_num = self.number_model.pick_best(nums, side)
-
-        if best_num not in valid_range:
-            best_num = 5 if side == "BIG" else 4
+        cand = self.candidate_distribution(nums, side)
+        best_num = max(valid_range, key=lambda n: cand.get(n, 0.0))
 
         return {
             "issue": issue,
@@ -422,19 +444,20 @@ class AdaptiveSignalPredictor:
             "regime": reg,
             "source": "adaptive-signal-ensemble",
             "experts": {
-                "exact": p_exact,
-                "markov": p_markov,
-                "regime": p_regime,
-                "trend": p_trend,
-                "freq": p_freq,
+                "exact": exact,
+                "markov": markov,
+                "regime": regime,
+                "trend": trend,
+                "frequency": frequency,
+                "volatility": volatility,
             },
         }
 
     def settle(self, history):
         lookup = {str(r["issue"]): r for r in history}
-        pending_rows = self.db.get_pending_predictions()
+        pending = self.db.get_pending_predictions()
 
-        for row in pending_rows:
+        for row in pending:
             if row is None:
                 continue
 
@@ -470,7 +493,7 @@ class AdaptiveSignalPredictor:
                     f"<b>Issue:</b> {issue}\n"
                     f"<b>Actual:</b> {actual['num']} ({actual_side})\n"
                     f"<b>Prediction:</b> {pred_side} -> {pred.get('num', '?')}\n"
-                    f"<b>Confidence:</b> {max(pred.get('p', 0.5), 1 - pred.get('p', 0.5)) * 100:.1f}%"
+                    f"<b>Confidence:</b> {max(pred.get('p', 0.5), 1-pred.get('p', 0.5)) * 100:.1f}%"
                 )
                 self.db.queue("result", issue, msg, time.time() + 60.0)
 
@@ -513,7 +536,7 @@ def format_prediction(p):
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = AdaptiveSignalPredictor(db)
+        self.engine = AdvancedSignalPredictor(db)
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
 
@@ -562,7 +585,6 @@ class Runtime:
                     exists = self.db.c.execute(
                         "SELECT 1 FROM predictions WHERE issue=?", (issue,)
                     ).fetchone()
-
                     if not exists:
                         pred = self.engine.predict(history, issue)
                         with self.db.transaction():
