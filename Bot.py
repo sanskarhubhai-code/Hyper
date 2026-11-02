@@ -1,4 +1,4 @@
-# FTW PREDICTOR — HYPER PRODUCTION FINAL VERSION
+# FTW PREDICTOR — FULL ADVANCED PRODUCTION VERSION
 # Python 3.10+
 # Deps: aiohttp
 
@@ -31,7 +31,7 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_production.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_full_advanced.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "2.0"))
     timeout: float = 18.0
@@ -42,7 +42,7 @@ class Config:
     meta_lr: float = 0.07
     decay: float = 0.985
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (HYPER PRODUCTION)"
+    name: str = "FTW PREDICTOR (FULL ADVANCED)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -54,7 +54,7 @@ class Config:
 
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOG = logging.getLogger("ftw_hyper_prod")
+LOG = logging.getLogger("ftw_full_advanced")
 
 
 # ============================================================
@@ -196,7 +196,7 @@ def trend_features(seq):
         mean(3) - mean(12),
         mean(8) - mean(24),
         (mean(12) - mean(48)),
-        (mean(6) - mean(24)),
+        (mean(6) - mean(24))
     ]
 
 def logistic(weights, features):
@@ -233,7 +233,7 @@ def parse_history(payload):
 
 
 # ============================================================
-# QUANTUM PATTERN TRACKER
+# QUANTUM PATTERN MATCHER
 # ============================================================
 
 class QuantumTracker:
@@ -406,7 +406,7 @@ class Database:
 
 
 # ============================================================
-# EXACT NUMBER MODEL + 120 WALK-FORWARD
+# MULTI-ENGINE / WALK-FORWARD
 # ============================================================
 
 MODEL_NAMES = ("global", "recent60", "recent120", "markov1", "markov2", "markov3")
@@ -420,9 +420,9 @@ def _normalize(values):
 def _prior(nums):
     counts = Counter(nums)
     total = len(nums)
-    if not nums:
+    if total <= 0:
         return [0.1] * 10
-    return _normalize([counts.get(k, 0) + 1.0 for k in range(10)]) if total else [0.1]*10
+    return _normalize([counts.get(k, 0) + 1.0 for k in range(10)])
 
 def _forecast_one(nums, model):
     if not nums:
@@ -463,37 +463,51 @@ def _forecast_one(nums, model):
 def _brier10(probabilities, actual):
     return sum((probabilities[k] - (1.0 if k == actual else 0.0)) ** 2 for k in range(10)) / 2.0
 
-def _walk_forward_weights(nums, validation_steps=120, loss_streak=0):
-    n = len(nums)
-    if n < 30:
-        return {
-            name: 1.0 / len(MODEL_NAMES) for name in MODEL_NAMES
-        }, {"steps": 0, "scores": None, "recovery": loss_streak >= 1}
+def _walk_forward_scores(nums, steps=900, min_train=100):
+    if len(nums) < min_train + 1:
+        return []
 
-    first_target = max(20, n - validation_steps)
-    losses = {name: [] for name in MODEL_NAMES}
+    start = max(min_train, len(nums) - steps)
+    outcomes = []
 
-    for target_idx in range(first_target, n):
+    for target_idx in range(start, len(nums)):
         past = nums[:target_idx]
         actual = nums[target_idx]
-        for name in MODEL_NAMES:
-            dist = _forecast_one(past, name)
-            losses[name].append(_brier10(dist, actual))
+        forecasts = {
+            name: _forecast_one(past, name)
+            for name in MODEL_NAMES
+        }
+        outcomes.append({"actual": actual, "forecasts": forecasts})
 
-    if min((len(v) for v in losses.values()), default=0) < 12:
-        equal = 1.0 / len(MODEL_NAMES)
-        return {name: equal for name in MODEL_NAMES}, {"steps": 0, "scores": None, "recovery": loss_streak >= 1}
+    return outcomes
+
+def _score_models_from_walkforward(nums, steps=900, min_train=100, loss_streak=0):
+    outcomes = _walk_forward_scores(nums, steps=steps, min_train=min_train)
+    if not outcomes:
+        return {
+            name: 1.0 / len(MODEL_NAMES) for name in MODEL_NAMES
+        }, {
+            "steps": 0,
+            "scores": None,
+            "recovery": loss_streak >= 1,
+        }
+
+    losses = {name: [] for name in MODEL_NAMES}
+    for item in outcomes:
+        actual = item["actual"]
+        for name in MODEL_NAMES:
+            losses[name].append(_brier10(item["forecasts"][name], actual))
 
     decay = 0.94 if loss_streak >= 1 else 0.985
     scores = {}
-    for name, model_losses in losses.items():
-        weights = [decay ** (len(model_losses) - 1 - i) for i in range(len(model_losses))]
-        scores[name] = sum(w * loss for w, loss in zip(weights, model_losses)) / sum(weights)
+    for name, values in losses.items():
+        weights = [decay ** (len(values) - 1 - i) for i in range(len(values))]
+        scores[name] = sum(w * v for w, v in zip(weights, values)) / sum(weights)
 
     best = min(scores.values())
     raw = {name: math.exp(-8.0 * min(1.0, max(0.0, score - best))) for name, score in scores.items()}
     total = sum(raw.values())
-    learned = {name: value / total for name, value in raw.items()}
+    learned = {name: raw[name] / total for name in MODEL_NAMES}
     uniform = 1.0 / len(MODEL_NAMES)
     learned_share = 0.60
     final = {
@@ -502,43 +516,87 @@ def _walk_forward_weights(nums, validation_steps=120, loss_streak=0):
     }
 
     return final, {
-        "steps": len(next(iter(losses.values()))),
+        "steps": len(outcomes),
         "scores": scores,
         "recovery": loss_streak >= 1,
     }
 
-def predict_next(history, loss_streak=0):
-    nums = [int(row["num"]) for row in history if isinstance(row.get("num"), int) and 0 <= row["num"] <= 9]
-    model_weights, wf = _walk_forward_weights(nums, validation_steps=120, loss_streak=loss_streak)
+def exact_number_model(history, side_bias):
+    if not history:
+        return [1.0] * 10, "cold"
 
-    dist_by_model = {name: _forecast_one(nums, name) for name in MODEL_NAMES}
-    exact = [
-        sum(model_weights[name] * dist_by_model[name][k] for name in MODEL_NAMES)
-        for k in range(10)
-    ]
-    exact = _normalize(exact)
+    nums = [x["num"] for x in history]
+    sizes = [x["size"] for x in history]
+    regime = get_regime([x["size"] for x in history])
+    base = [1.0] * 10
 
-    p_big = sum(exact[5:10])
-    p_small = sum(exact[0:5])
-    side = "BIG" if p_big >= p_small else "SMALL"
+    freq = Counter(nums)
+    for k in range(10):
+        base[k] *= 1.0 + 2.8 * freq.get(k, 0)
 
-    number = max(range(10), key=lambda k: exact[k])
-    if (number >= 5) != (side == "BIG"):
-        allowed = range(5, 10) if side == "BIG" else range(0, 5)
-        number = max(allowed, key=lambda k: exact[k])
+    recent = nums[-12:]
+    recent_counter = Counter(recent)
+    for k in range(10):
+        base[k] *= 1.0 + 1.6 * recent_counter.get(k, 0)
 
-    return {
-        "side": side,
-        "num": number,
-        "p_big": p_big,
-        "p_small": p_small,
-        "num_probability": exact[number],
-        "exact_distribution": exact,
-        "model_weights": model_weights,
-        "walk_forward": wf,
-        "recovery_active": loss_streak >= 1,
-        "loss_streak": loss_streak,
-    }
+    trans = {}
+    for i in range(1, len(nums)):
+        prev = nums[i - 1]
+        cur = nums[i]
+        trans[(prev, cur)] = trans.get((prev, cur), 0) + 1
+
+    last_num = nums[-1] if nums else 0
+    for k in range(10):
+        base[k] *= 1.0 + 0.9 * trans.get((last_num, k), 0)
+        base[k] *= 1.0 + 0.45 * trans.get((k, last_num), 0)
+
+    if side_bias >= 0.5:
+        for k in range(0, 5):
+            base[k] *= 0.35
+        for k in range(5, 10):
+            base[k] *= 1.5
+    else:
+        for k in range(5, 10):
+            base[k] *= 0.35
+        for k in range(0, 5):
+            base[k] *= 1.5
+
+    if regime == "RUN":
+        if len(nums) >= 3:
+            if nums[-1] >= 5:
+                for k in range(5, 10):
+                    base[k] *= 1.2
+            else:
+                for k in range(0, 5):
+                    base[k] *= 1.2
+    elif regime == "ALT":
+        if len(nums) >= 4:
+            a, b = nums[-2], nums[-1]
+            for k in range(10):
+                if k in (a, b):
+                    base[k] *= 1.1
+    elif regime == "IMBAL":
+        avg = sum(recent) / len(recent)
+        if avg >= 5:
+            for k in range(5, 10):
+                base[k] *= 1.2
+        else:
+            for k in range(0, 5):
+                base[k] *= 1.2
+
+    if len(sizes) >= 4:
+        recent_size = sum(sizes[-6:]) / len(sizes[-6:])
+        if recent_size > 0.7:
+            for k in range(5, 10):
+                base[k] *= 1.15
+        elif recent_size < 0.3:
+            for k in range(0, 5):
+                base[k] *= 1.15
+
+    total = sum(base)
+    if total <= 0:
+        return [1.0] * 10, regime
+    return [x / total for x in base], regime
 
 
 # ============================================================
@@ -558,7 +616,6 @@ class RecoveryController:
 
         recent = sum(seq[-5:]) / max(1, len(seq[-5:])) if seq else 0.5
 
-        # Ultra recovery ON immediately after 1 loss
         if loss_streak == 1:
             if recent > 0.70:
                 return 0.24, True
@@ -566,7 +623,6 @@ class RecoveryController:
                 return 0.76, True
             return 0.5 + (base_p - 0.5) * 0.58, True
 
-        # More severe but still mathematically controlled
         if recent > 0.72:
             return 0.19, True
         if recent < 0.28:
@@ -575,7 +631,7 @@ class RecoveryController:
 
 
 # ============================================================
-# ENGINE
+# FINAL ENGINE
 # ============================================================
 
 EXPERT_NAMES = [
@@ -712,20 +768,36 @@ class Engine:
         alpha = min(self.db.get("meta_n", 0) / 100.0, 1.0)
         p_raw = alpha * p_meta + (1.0 - alpha) * p_avg
 
-        # exact model side + distribution
-        exact_model = predict_next(history, loss_streak=loss_streak)
-        p_side = exact_model["p_big"]
-        exact_dist = exact_model["exact_distribution"]
+        # exact model and walk-forward weights
+        wf_weights, wf_meta = _score_models_from_walkforward(nums, steps=900, min_train=100, loss_streak=loss_streak)
+        exact_dist, _ = exact_number_model(history, p_raw)
+        exact_mem = self.db.get("exact_mem", {})
+        if isinstance(exact_mem, dict):
+            for k in range(10):
+                exact_dist[k] = exact_dist[k] * 0.72 + float(exact_mem.get(str(k), 0.1)) * 0.28
 
-        # combine with ensemble side
-        p_raw = 0.5 * p_raw + 0.5 * p_side
+        # combine exact number model with weighted model distributions
+        weighted_exact = [0.0] * 10
+        for name in MODEL_NAMES:
+            model_dist = _forecast_one(nums, name)
+            for k in range(10):
+                weighted_exact[k] += wf_weights[name] * model_dist[k]
 
-        # ultra recovery after first loss
+        for k in range(10):
+            exact_dist[k] = 0.55 * exact_dist[k] + 0.45 * weighted_exact[k]
+
+        # side probability from exact dist
+        p_big = sum(exact_dist[5:10])
+        p_small = sum(exact_dist[:5])
+        pred_side = "BIG" if p_big >= p_small else "SMALL"
+
+        # ultra recovery on 1st loss, controlled
         if loss_streak >= 1:
             p_raw, recovery_used = self.recovery.adjust(seq, p_raw, loss_streak)
         else:
             recovery_used = False
 
+        # anti-stubborn but no blind reversal
         if len(seq) >= 8:
             short = sum(seq[-6:]) / 6.0
             if short > 0.80 and p_raw > 0.66:
@@ -733,14 +805,16 @@ class Engine:
             if short < 0.20 and p_raw < 0.34:
                 p_raw = 0.34
 
+        # combine side probability from direct ensemble and number dist
+        p_raw = 0.5 * p_raw + 0.5 * (p_big if pred_side == "BIG" else p_small)
+
         bucket = min(19, int(p_raw * 20))
         n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
         p_cal = clip((32 * p_raw + s_g) / (32 + n_g))
 
-        pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
         valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
 
-        # exact number selection
+        # exact selection with side restriction
         dist = list(exact_dist)
         for k in range(10):
             if k in valid_nums:
@@ -756,7 +830,6 @@ class Engine:
 
         num_pred = max(range(10), key=lambda k: dist[k])
         num_conf = dist[num_pred]
-
         if num_pred not in valid_nums:
             num_pred = max(valid_nums, key=lambda k: dist[k])
             num_conf = dist[num_pred]
@@ -772,7 +845,7 @@ class Engine:
             "num": num_pred,
             "num_probability": num_conf,
             "regime": regime,
-            "source": "🎯 Hyper Production Engine",
+            "source": "🎯 Full Advanced Engine",
             "trend_shift": trend_shift,
             "pattern_str": _pattern_str(patterns),
             "edge": abs(p_cal - 0.5),
@@ -784,8 +857,8 @@ class Engine:
             "loss_streak": loss_streak,
             "patterns": [{"key": k, "p": p, "support": s} for _, p, s, _, k in patterns],
             "exact_distribution": dist,
-            "walk_forward": exact_model["walk_forward"],
-            "model_weights": exact_model["model_weights"],
+            "walk_forward": wf_meta,
+            "model_weights": wf_weights,
         }
         return payload
 
@@ -899,7 +972,7 @@ def format_prediction(p):
         else:
             rec_tag = "🚨 <b>ULTRA RECOVERY L2</b> 🚨\n"
 
-    wf = f"\n📈 <b>WF120:</b> {p.get('walk_forward', {}).get('recovery', False)}" if p.get("walk_forward") else ""
+    wf = f"\n📈 <b>WF900:</b> {p.get('walk_forward', {}).get('steps', 0)} steps" if p.get("walk_forward") else ""
     shift = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
     pat = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") and p.get("pattern_str") != "None" else ""
 
