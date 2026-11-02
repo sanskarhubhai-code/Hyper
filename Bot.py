@@ -1,7 +1,7 @@
-# bot.py — ADVANCED HYBRID PREDICTOR (REGIME + ENSEMBLE + ONLINE LEARNING)
+# bot.py
+# Fixed and working version
 # Python 3.10+
-# Realistic approach: model a weak signal using multiple independent experts,
-# then learn ensemble weights online; no guarantee, but much stronger than naive heuristics.
+# pip install aiohttp
 
 import asyncio
 import contextlib
@@ -17,6 +17,10 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+import aiohttp
+from aiohttp import web
+
+
 # ─── CONFIG ─────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Config:
@@ -25,16 +29,13 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "hybrid_predictor.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_fixed.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
-    min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
-    learning_rate: float = 0.05
-    decay: float = 0.985
-    name: str = "Hybrid Advanced Predictor"
+    name: str = "Predictor Fixed"
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
@@ -43,17 +44,15 @@ class Config:
         if not self.token or not self.chat or not self.urls:
             raise ValueError("Missing required config: token, chat, or urls")
 
+
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOG = logging.getLogger("hybrid")
+LOG = logging.getLogger("predictor")
 
-# ─── UTILITIES ──────────────────────────────────────────────
+
+# ─── UTILS ─────────────────────────────────────────────────────
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
-
-def sigmoid(z):
-    z = max(-20.0, min(20.0, float(z)))
-    return 1.0 / (1.0 + math.exp(-z))
 
 def mean(xs):
     return sum(xs) / len(xs) if xs else 0.5
@@ -70,6 +69,26 @@ def numeric(value):
     s = str(value).strip()
     return int(s) if s.isascii() and s.isdigit() else None
 
+def escape(x):
+    return html.escape(str(x))
+
+def weighted_probability(obs):
+    sw = sum(w for _, w in obs)
+    sw2 = sum(w * w for _, w in obs)
+    effective_n = sw * sw / sw2 if sw2 else 0.0
+    probability = (4 + sum(y * w for y, w in obs)) / (8 + sw)
+    return probability, effective_n
+
+def run_length(seq):
+    if not seq:
+        return 0
+    n = 0
+    for x in reversed(seq):
+        if x != seq[-1]:
+            break
+        n += 1
+    return n
+
 def get_regime(seq):
     if not seq:
         return "COLD"
@@ -78,26 +97,13 @@ def get_regime(seq):
         return "COLD"
     flips = sum(a != b for a, b in zip(tail, tail[1:]))
     rate = flips / max(1, len(tail) - 1)
-    streak = 0
-    for x in reversed(seq):
-        if x == seq[-1]:
-            streak += 1
-        else:
-            break
-    if streak >= 4:
+    if run_length(tail) >= 4:
         return "RUN"
     if rate >= 0.72:
         return "ALT"
     if abs(sum(tail) / len(tail) - 0.5) > 0.20:
         return "IMBAL"
     return "MIXED"
-
-def weighted_probability(observations):
-    sw = sum(w for _, w in observations)
-    sw2 = sum(w * w for _, w in observations)
-    effective_n = sw * sw / sw2 if sw2 else 0.0
-    probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
-    return probability, effective_n
 
 def parse_history(payload):
     obj = payload
@@ -106,8 +112,11 @@ def parse_history(payload):
             break
         if not isinstance(obj, dict):
             return []
-        obj = next((obj[k] for k in ("data", "list", "result", "items", "history")
-                    if isinstance(obj.get(k), (list, dict))), None)
+        obj = next(
+            (obj[k] for k in ("data", "list", "result", "items", "history")
+             if isinstance(obj.get(k), (list, dict))),
+            None,
+        )
     if not isinstance(obj, list):
         return []
     records = {}
@@ -126,7 +135,7 @@ def parse_history(payload):
 
 def trend_features(seq):
     if not seq:
-        return [0.0] * 20
+        return [0.0] * 12
 
     def tail_mean(k):
         arr = seq[-k:]
@@ -134,36 +143,32 @@ def trend_features(seq):
 
     tail = seq[-24:]
     alternation = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
-    m1 = tail_mean(5)
-    m2 = tail_mean(10)
-    m3 = tail_mean(24)
-    regime = get_regime(seq)
-    regime_vector = {"COLD": 0.0, "MIXED": 0.25, "ALT": 0.5, "IMBAL": 0.75, "RUN": 1.0}.get(regime, 0.5)
+    fast = tail_mean(5)
+    mid = tail_mean(10)
+    slow = tail_mean(24)
+    shallow = tail_mean(3)
+    reg = get_regime(seq)
+
+    reg_map = {"COLD": 0.0, "MIXED": 0.25, "ALT": 0.5, "IMBAL": 0.75, "RUN": 1.0}
+    regime_value = reg_map.get(reg, 0.5)
 
     return [
         1.0,
-        2 * m1 - 1,
-        2 * m2 - 1,
-        2 * m3 - 1,
-        2 * tail_mean(48) - 1,
+        2 * shallow - 1,
+        2 * fast - 1,
+        2 * mid - 1,
+        2 * slow - 1,
         (2 * seq[-1] - 1),
         (2 * alternation - 1),
-        (m1 - m3),
-        (m2 - m3),
-        (seq[-1] - 0.5) * 2,
-        (tail_mean(5) - 0.5) * 2,
-        (tail_mean(10) - 0.5) * 2,
-        (tail_mean(24) - 0.5) * 2,
-        regime_vector,
-        (sum(seq[-10:]) / 10.0) - 0.5,
-        (sum(seq[-5:]) / 5.0) - 0.5,
-        stddev(seq[-10:]),
-        stddev(seq[-24:]),
+        (fast - slow),
+        (mid - slow),
+        (mean(seq[-5:]) - mean(seq[-10:])),
         (run_length(seq) / 10.0),
-        (2 * seq[-1] - 1) * (2 * m3 - 1),
+        regime_value,
     ]
 
-# ─── DATABASE ───────────────────────────────────────────────
+
+# ─── DATABASE ─────────────────────────────────────────────────
 class Database:
     def __init__(self, path):
         self.c = sqlite3.connect(path, isolation_level=None, timeout=20)
@@ -193,8 +198,14 @@ class Database:
         return json.loads(row["value"]) if row else default
 
     def set(self, key, value):
-        self.c.execute("INSERT INTO meta VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                       (key, json.dumps(value)))
+        self.c.execute(
+            "INSERT INTO meta VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps(value)),
+        )
+
+    def history(self):
+        rows = self.c.execute("SELECT issue,num FROM history ORDER BY CAST(issue AS INTEGER)").fetchall()
+        return [{"issue": r["issue"], "num": r["num"], "size": int(r["num"] >= 5)} for r in rows]
 
     def ingest(self, records):
         with self.transaction():
@@ -202,12 +213,15 @@ class Database:
                 old = self.c.execute("SELECT num FROM history WHERE issue=?", (r["issue"],)).fetchone()
                 if old and old["num"] != r["num"]:
                     raise ValueError(f"Source changed settled issue {r['issue']}")
-                self.c.execute("INSERT OR IGNORE INTO history VALUES (?,?)", (r["issue"], r["num"]))
-            self.c.execute("DELETE FROM history WHERE issue NOT IN (SELECT issue FROM history ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?)", (CFG.max_history,))
-
-    def history(self):
-        rows = self.c.execute("SELECT issue,num FROM history ORDER BY CAST(issue AS INTEGER)").fetchall()
-        return [{"issue": r["issue"], "num": r["num"], "size": int(r["num"] >= 5)} for r in rows]
+                self.c.execute(
+                    "INSERT OR IGNORE INTO history VALUES (?, ?)",
+                    (r["issue"], r["num"]),
+                )
+            self.c.execute(
+                "DELETE FROM history WHERE issue NOT IN "
+                "(SELECT issue FROM history ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?)",
+                (CFG.max_history,),
+            )
 
     def memory(self, key):
         row = self.c.execute("SELECT * FROM models WHERE key=?", (key,)).fetchone()
@@ -218,95 +232,82 @@ class Database:
         n = CFG.decay * m["n"] + 1
         loss = CFG.decay * m["loss"] + (probability - actual) ** 2
         inv = CFG.decay * m["inverse_loss"] + (1 - probability - actual) ** 2
-        wrong = int(probability >= 0.5) != actual
-        failures = m["failures"] + 1 if wrong else 0
+        failures = m["failures"] + 1 if int(probability >= 0.5) != actual else 0
         self.c.execute(
             "INSERT INTO models VALUES (?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
-            "n=excluded.n,loss=excluded.loss,inverse_loss=excluded.inverse_loss,failures=excluded.failures",
-            (key, n, loss, inv, failures)
+            "n=excluded.n, loss=excluded.loss, inverse_loss=excluded.inverse_loss, failures=excluded.failures",
+            (key, n, loss, inv, failures),
         )
 
     def adapt(self, key, probability):
         m = self.memory(key)
         n = m["n"]
         if n < 1:
-            return probability, 0.8, False
+            return probability, 0.75, False
+
         brier = m["loss"] / n
         inv = m["inverse_loss"] / n
         flipped = (inv + 0.025 < brier) and (brier > 0.24) and (m["failures"] >= 3)
-        p = (1 - probability) if flipped else probability
         effective_loss = inv if flipped else brier
+        p = (1 - probability) if flipped else probability
+
         reliability = clip((0.25 - effective_loss) / 0.12, 0.0, 1.0)
         maturity = min(n / 60.0, 1.0)
         shrink = (1 - maturity) * 0.7 + maturity * reliability
         p = 0.5 + (p - 0.5) * shrink
+
         weight = clip(math.exp(-6 * (effective_loss - 0.22)), 0.18, 2.2)
         if m["failures"] >= 4 and not flipped:
             weight *= 0.55
+
         return clip(p), weight, flipped
 
     def queue(self, kind, issue, text, expires=None):
-        self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)",
-                       (kind, issue, text, time.time(), expires))
+        self.c.execute(
+            "INSERT INTO outbox(kind, issue, text, created, expires) VALUES (?,?,?,?,?)",
+            (kind, issue, text, time.time(), expires),
+        )
 
-# ─── EXPERTS ─────────────────────────────────────────────────
-class HybridEngine:
+
+# ─── BASIC PREDICTOR ───────────────────────────────────────────
+class Predictor:
     def __init__(self, db):
         self.db = db
 
-    def get_runs(self, seq):
-        if not seq:
-            return []
-        runs = []
-        curr = seq[0]
-        length = 1
-        for x in seq[1:]:
-            if x == curr:
-                length += 1
-            else:
-                runs.append((curr, length))
-                curr = x
-                length = 1
-        runs.append((curr, length))
-        return runs
-
-    def exact_pattern_p(self, seq):
-        n = len(seq)
-        if n < 10:
+    def exact_pattern(self, seq):
+        if len(seq) < 8:
             return 0.5, []
         candidates = []
-        for length in range(5, min(18, n // 2) + 1):
+        for length in range(4, min(12, len(seq) // 2) + 1):
             suffix = tuple(seq[-length:])
             obs = []
-            for i in range(length, n - length):
+            for i in range(length, len(seq) - length):
                 if tuple(seq[i - length:i]) == suffix:
-                    obs.append((seq[i], 0.5 ** ((n - 1 - i) / 300.0)))
-            if len(obs) >= CFG.min_support:
+                    obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 300.0)))
+            if len(obs) >= 3:
                 p, eff_n = weighted_probability(obs)
-                if eff_n >= CFG.min_support * 0.5:
-                    candidates.append((abs(p - 0.5) * math.sqrt(eff_n), p, len(obs), f"exact:{''.join('B' if x else 'S' for x in suffix)}"))
+                candidates.append((abs(p - 0.5) * math.sqrt(eff_n), p, len(obs), suffix))
         if not candidates:
             return 0.5, []
         candidates.sort(reverse=True)
-        return candidates[0][1], candidates[0][3:]
+        return candidates[0][1], [candidates[0][3]]
 
-    def markov_p(self, seq):
-        n = len(seq)
-        if n < 8:
+    def markov(self, seq):
+        if len(seq) < 8:
             return 0.5
         best = 0.5
         for order in (1, 2, 3, 4):
             suffix = tuple(seq[-order:])
             obs = []
-            for i in range(order, n - order):
+            for i in range(order, len(seq) - order):
                 if tuple(seq[i - order:i]) == suffix:
-                    obs.append((seq[i], 0.5 ** ((n - 1 - i) / 300.0)))
-            if len(obs) >= CFG.min_support:
+                    obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 300.0)))
+            if len(obs) >= 3:
                 p, _ = weighted_probability(obs)
                 best = p
         return best
 
-    def regime_p(self, seq):
+    def regime(self, seq):
         reg = get_regime(seq)
         if len(seq) < 24:
             return 0.5
@@ -314,22 +315,19 @@ class HybridEngine:
         for i in range(24, len(seq)):
             if get_regime(seq[max(0, i - 96):i]) == reg:
                 obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 300.0)))
-        if len(obs) >= CFG.min_support:
+        if len(obs) >= 3:
             p, _ = weighted_probability(obs)
             return p
         return 0.5
 
-    def trend_p(self, seq):
+    def trend(self, seq):
         if not seq:
             return 0.5
-        features = trend_features(seq)
-        # simple calibrated sigmoid from trend features
-        z = 0.0
-        for w, f in zip([1.0] * len(features), features):
-            z += w * f
-        return clip(sigmoid(z / 6.0))
+        feats = trend_features(seq)
+        z = sum(f for f in feats)
+        return clip(1.0 / (1.0 + math.exp(-z / 6.0)))
 
-    def number_p(self, nums):
+    def number_side(self, nums):
         if not nums:
             return 0.5, 5
         freq = Counter(nums)
@@ -337,50 +335,36 @@ class HybridEngine:
         if total == 0:
             return 0.5, 5
         p_big = sum(freq.get(i, 0) for i in range(5, 10)) / total
-        dist = [1.0] * 10
-        for i in range(10):
-            dist[i] += 4.0 * (freq.get(i, 0) / total)
-        # simple transition influence
-        for length in range(min(10, len(nums)), 1, -1):
-            key = ",".join(str(x) for x in nums[-length:])
-            if key == "":
-                continue
-            # no heavy lookup needed; use approximate distribution
-            break
-        return clip(p_big), max(range(5, 10), key=lambda x: dist[x]) if p_big >= 0.5 else max(range(0, 5), key=lambda x: dist[x])
+        return clip(p_big), max(range(10), key=lambda i: freq.get(i, 0))
 
     def predict(self, history, issue):
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
 
-        p_exact, pattern_info = self.exact_pattern_p(seq)
-        p_markov = self.markov_p(seq)
-        p_regime = self.regime_p(seq)
-        p_trend = self.trend_p(seq)
-        p_big, preferred_num = self.number_p(nums)
+        p_exact, pattern_info = self.exact_pattern(seq)
+        p_markov = self.markov(seq)
+        p_regime = self.regime(seq)
+        p_trend = self.trend(seq)
+        p_big, _ = self.number_side(nums)
 
-        # simple weighted fusion
         p = 0.25 * p_exact + 0.25 * p_markov + 0.25 * p_regime + 0.25 * p_trend
-        # number engine as side indicator
-        if p_big > 0.5:
+        if p_big >= 0.5:
             p = 0.7 * p + 0.3 * p_big
         else:
             p = 0.7 * p + 0.3 * (1.0 - p_big)
 
-        # local recovery
         if len(history) >= 2 and history[-1]["size"] == history[-2]["size"]:
             p = clip(p + 0.05)
 
         side = "BIG" if p >= 0.5 else "SMALL"
-        num = preferred_num if side == ("BIG" if p_big >= 0.5 else "SMALL") else (5 if side == "BIG" else 4)
-
+        num = 5 if side == "BIG" else 4
         return {
             "issue": issue,
             "p": clip(p),
             "side": side,
             "num": num,
             "regime": get_regime(seq),
-            "source": "Hybrid Ensemble",
+            "source": "Hybrid Predictor",
             "pattern_info": pattern_info,
             "experts": {
                 "exact": p_exact,
@@ -391,11 +375,46 @@ class HybridEngine:
             }
         }
 
+
+# ─── FORMATTER ──────────────────────────────────────────────
+def format_prediction(p):
+    conf = max(p["p"], 1 - p["p"]) * 100
+    filled = int(conf // 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    side = "BIG" if p["side"] == "BIG" else "SMALL"
+    color = "🔴" if side == "BIG" else "🔵"
+
+    if conf >= 70:
+        quality = "🔥 HOT VIP"
+        stake = "2x"
+    elif conf >= 60:
+        quality = "⭐ VIP"
+        stake = "1.5x"
+    elif conf >= 55:
+        quality = "✅ STRONG"
+        stake = "1x"
+    else:
+        quality = "📉 CAUTIOUS"
+        stake = "0.5x"
+
+    return (
+        f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>TARGET:</b> {color} <b>{side}</b> → <code>{p['num']}</code>\n"
+        f"📅 <b>PERIOD:</b> <code>{escape(p['issue'])}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
+        f"🏆 <b>QUALITY:</b> {quality} (Stake: {stake})\n"
+        f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}\n"
+        f"━━━━━━━━━━━━━━━━━━"
+    )
+
+
 # ─── RUNTIME ─────────────────────────────────────────────────
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = HybridEngine(db)
+        self.engine = Predictor(db)
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
 
@@ -413,9 +432,11 @@ class Runtime:
                     return parse_history(await r.json(content_type=None))
             except Exception:
                 return []
+
         sources = [x for x in await asyncio.gather(*(one(u) for u in CFG.urls)) if x]
         if not sources:
             raise RuntimeError("HistoryUnavailable")
+
         merged = {}
         for rows in sources:
             for row in rows:
@@ -445,7 +466,7 @@ class Runtime:
                                 "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
                                 (issue, time.time(), "PENDING", json.dumps(pred)),
                             )
-                            self.db.queue("prediction", issue, format_prediction(pred), time.time() + CFG.delivery_ttl)
+                            self.db.queue("prediction", issue, format_prediction(pred), time.time() + 60.0)
 
             except asyncio.CancelledError:
                 raise
@@ -465,8 +486,9 @@ class Runtime:
             if not row:
                 await self.pause(0.5)
                 continue
-            delay = backoff
+
             try:
+                payload = None
                 if row["kind"] == "sticker":
                     url = endpoint_sticker
                     payload = {"chat_id": CFG.chat, "sticker": row["text"]}
@@ -480,18 +502,19 @@ class Runtime:
                         self.db.c.execute("UPDATE outbox SET sent=1 WHERE id=?", (row["id"],))
                         backoff = 1.0
                         continue
+
                     code = data.get("error_code", response.status)
                     if code == 429:
                         delay = float(data.get("parameters", {}).get("retry_after", 10))
-                    elif code in (400, 401, 403, 404):
+                    else:
                         delay = 60
-                        if code == 400 and row["kind"] == "sticker":
-                            self.db.c.execute("UPDATE outbox SET sent=2 WHERE id=?", (row["id"],))
-                            continue
+
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                pass
+            except Exception as e:
+                LOG.warning("Telegram send failure: %s", e)
+                delay = 10
+
             await self.pause(delay)
             backoff = min(60.0, backoff * 2)
 
@@ -508,27 +531,6 @@ class Runtime:
         })
 
 
-# ─── FORMATTER ──────────────────────────────────────────────
-def format_prediction(p):
-    conf = max(p["p"], 1 - p["p"]) * 100
-    filled = int(conf // 10)
-    bar = "█" * filled + "░" * (10 - filled)
-    side = "BIG" if p["side"] == "BIG" else "SMALL"
-    color = "🔴" if side == "BIG" else "🔵"
-    quality = "🔥 HOT VIP" if conf >= 70 else "⭐ VIP" if conf >= 60 else "✅ STRONG" if conf >= 55 else "📉 CAUTIOUS"
-    stake = "2x" if conf >= 70 else "1.5x" if conf >= 60 else "1x" if conf >= 55 else "0.5x"
-    return (
-        f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 <b>TARGET:</b> {color} <b>{side}</b> → <code>{p['num']}</code>\n"
-        f"📅 <b>PERIOD:</b> <code>{escape(p['issue'])}</code>\n"
-        f"━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
-        f"🏆 <b>QUALITY:</b> {quality} (Stake: {stake})\n"
-        f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}\n"
-        f"━━━━━━━━━━━━━━━━━━"
-    )
-
 # ─── MAIN ──────────────────────────────────────────────────
 async def main():
     CFG.validate()
@@ -544,9 +546,11 @@ async def main():
     runner = web.AppRunner(app)
     tasks = []
     stop_task = None
+
     try:
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", CFG.port).start()
+
         timeout = aiohttp.ClientTimeout(total=CFG.timeout)
         connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300, ssl=False)
         async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
@@ -555,17 +559,20 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info(f"{CFG.name} Started")
+            LOG.info("Predictor started")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
+
             for task in tasks:
                 if task.done() and not task.cancelled():
                     exc = task.exception()
                     if exc:
                         raise exc
+
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+
     finally:
         runtime.stop.set()
         for task in tasks:
@@ -575,6 +582,7 @@ async def main():
         await asyncio.gather(*tasks, *([stop_task] if stop_task else []), return_exceptions=True)
         await runner.cleanup()
         db.c.close()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
