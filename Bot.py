@@ -1,8 +1,6 @@
 # bot.py
 # FIXED VERSION
 # Safe, working, no AttributeError
-# Python 3.10+
-# pip install aiohttp
 
 import asyncio
 import contextlib
@@ -40,6 +38,9 @@ class Config:
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
+    
+    # 👇 FIXED: Added the missing decay variable used in Database.learn()
+    decay: float = 0.95 
 
     def validate(self):
         if not self.token or not self.chat or not self.urls:
