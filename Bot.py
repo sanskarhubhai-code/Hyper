@@ -1,6 +1,5 @@
 # bot.py
-# QUANTUM-INSPIRED ZERO-DRIFT PREDICTOR
-# A to Z core
+# Full fixed working version
 # Python 3.10+
 # pip install aiohttp
 
@@ -30,7 +29,7 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "quantum_zero_drift.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_fixed.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -38,9 +37,7 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     learning_rate: float = 0.06
     decay: float = 0.985
-    drift_window: int = 20
-    drift_threshold: float = 0.18
-    name: str = "Quantum Zero Drift Engine"
+    name: str = "Fixed Predictor"
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
@@ -52,21 +49,15 @@ class Config:
 
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOG = logging.getLogger("qzd")
+LOG = logging.getLogger("predictor")
 
 
-# ─── UTILS ─────────────────────────────────────────────────────
+# ─── HELPERS ──────────────────────────────────────────────────
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
 
 def mean(xs):
     return sum(xs) / len(xs) if xs else 0.5
-
-def stddev(xs):
-    if len(xs) < 2:
-        return 0.0
-    m = mean(xs)
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
 
 def numeric(value):
     if isinstance(value, bool):
@@ -148,10 +139,10 @@ def trend_features(seq):
 
     tail = seq[-24:]
     alternation = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
+
     fast = tail_mean(5)
     mid = tail_mean(10)
     slow = tail_mean(24)
-
     reg = get_regime(seq)
     reg_map = {"COLD": 0.0, "MIXED": 0.25, "ALT": 0.5, "IMBAL": 0.75, "RUN": 1.0}
     regime_value = reg_map.get(reg, 0.5)
@@ -206,7 +197,7 @@ class Database:
         )
 
     def history(self):
-        rows = self.c.execute("SELECT issue,num FROM history ORDER BY CAST(issue AS INTEGER)").fetchall()
+        rows = self.c.execute("SELECT issue, num FROM history ORDER BY CAST(issue AS INTEGER)").fetchall()
         return [{"issue": r["issue"], "num": r["num"], "size": int(r["num"] >= 5)} for r in rows]
 
     def ingest(self, records):
@@ -215,7 +206,10 @@ class Database:
                 old = self.c.execute("SELECT num FROM history WHERE issue=?", (r["issue"],)).fetchone()
                 if old and old["num"] != r["num"]:
                     raise ValueError(f"Source changed settled issue {r['issue']}")
-                self.c.execute("INSERT OR IGNORE INTO history VALUES (?,?)", (r["issue"], r["num"]))
+                self.c.execute(
+                    "INSERT OR IGNORE INTO history VALUES (?, ?)",
+                    (r["issue"], r["num"]),
+                )
             self.c.execute(
                 "DELETE FROM history WHERE issue NOT IN "
                 "(SELECT issue FROM history ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?)",
@@ -244,15 +238,18 @@ class Database:
         n = m["n"]
         if n < 1:
             return probability, 0.75, False
+
         brier = m["loss"] / n
         inv = m["inverse_loss"] / n
         flipped = (inv + 0.025 < brier) and (brier > 0.24) and (m["failures"] >= 3)
-        p = (1 - probability) if flipped else probability
         effective_loss = inv if flipped else brier
+        p = (1 - probability) if flipped else probability
+
         reliability = clip((0.25 - effective_loss) / 0.12, 0.0, 1.0)
         maturity = min(n / 60.0, 1.0)
         shrink = (1 - maturity) * 0.7 + maturity * reliability
         p = 0.5 + (p - 0.5) * shrink
+
         weight = clip(math.exp(-6 * (effective_loss - 0.22)), 0.18, 2.2)
         if m["failures"] >= 4 and not flipped:
             weight *= 0.55
@@ -270,8 +267,8 @@ class Database:
         ).fetchall()
 
 
-# ─── QUANTUM-INSPIRED ZERO-DRIFT ENGINE ───────────────────────
-class QuantumZeroDriftEngine:
+# ─── PREDICTOR ─────────────────────────────────────────────────
+class Predictor:
     def __init__(self, db):
         self.db = db
 
@@ -308,12 +305,12 @@ class QuantumZeroDriftEngine:
                 best = p
         return best
 
-    def regime_signal(self, seq):
+    def regime_strength(self, seq):
         reg = get_regime(seq)
-        if len(seq) < 18:
+        if len(seq) < 20:
             return 0.5
         obs = []
-        for i in range(18, len(seq)):
+        for i in range(20, len(seq)):
             if get_regime(seq[max(0, i - 96):i]) == reg:
                 obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 300.0)))
         if len(obs) >= 3:
@@ -321,39 +318,22 @@ class QuantumZeroDriftEngine:
             return p
         return 0.5
 
-    def trend_signal(self, seq):
+    def trend_strength(self, seq):
         if not seq:
             return 0.5
         feats = trend_features(seq)
         z = sum(feats)
         return clip(1.0 / (1.0 + math.exp(-z / 8.0)))
 
-    def number_distribution(self, nums):
+    def number_side_bias(self, nums):
         if not nums:
-            return [0.1] * 10
+            return 0.5
         freq = Counter(nums)
-        dist = [1.0] * 10
-        total = len(nums)
-        if total > 0:
-            for i in range(10):
-                dist[i] += 6.0 * (freq.get(i, 0) / total)
-        if len(nums) >= 4:
-            recent = nums[-8:]
-            for i in range(10):
-                dist[i] += 1.5 * (recent.count(i) / len(recent))
-        s = sum(dist)
-        return [x / s for x in dist]
-
-    def estimate_drift(self, seq):
-        if len(seq) < 8:
-            return 0.0
-        recent = seq[-CFG.drift_window:]
-        if len(recent) < 2:
-            return 0.0
-        # drift: how much recent mean differs from full history mean
-        base = mean(seq[:-len(recent)]) if len(seq) > len(recent) else mean(seq[:max(1, len(seq)//2)])
-        current = mean(recent)
-        return abs(current - base)
+        total = sum(freq.values())
+        if total == 0:
+            return 0.5
+        p_big = sum(freq.get(i, 0) for i in range(5, 10)) / total
+        return clip(p_big)
 
     def predict(self, history, issue):
         if not history:
@@ -369,57 +349,53 @@ class QuantumZeroDriftEngine:
 
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
-        reg = get_regime(seq)
-        drift = self.estimate_drift(seq)
 
-        # experts
-        p_exact = self.exact_pattern(seq)
-        p_markov = self.markov(seq)
-        p_regime = self.regime_signal(seq)
-        p_trend = self.trend_signal(seq)
-        p_big = sum(self.number_distribution(nums)[5:])  # probability of BIG class
-        base_p = 0.5 * p_exact + 0.2 * p_markov + 0.2 * p_regime + 0.1 * p_trend
-
-        # zero-drift correction
-        # if drift is high, dampen confident direction and shift to balanced
-        if drift > CFG.drift_threshold:
-            base_p = 0.5 + (base_p - 0.5) * 0.65
-
-        # mild bias only if there is some real signal
         last_size = history[-1]["size"]
         last_bias = 0.52 if last_size == 1 else 0.48
 
-        # fusion
-        p = 0.20 * last_bias + 0.25 * p_exact + 0.20 * p_markov + 0.20 * p_regime + 0.15 * p_trend + 0.20 * p_big
+        p_exact = self.exact_pattern(seq)
+        p_markov = self.markov(seq)
+        p_regime = self.regime_strength(seq)
+        p_trend = self.trend_strength(seq)
+        p_big = self.number_side_bias(nums)
+
+        p = (
+            0.18 * last_bias +
+            0.24 * p_exact +
+            0.20 * p_markov +
+            0.20 * p_regime +
+            0.18 * p_trend +
+            0.20 * p_big
+        )
         p = clip(p)
 
-        # regime posture
+        reg = get_regime(seq)
         if reg == "RUN":
             if last_size == 1:
                 p = clip(p + 0.08)
             else:
                 p = clip(p - 0.08)
         elif reg == "ALT":
-            p = clip(0.5 + (p - 0.5) * 0.75)
+            p = clip(0.5 + (p - 0.5) * 0.7)
 
         side = "BIG" if p >= 0.5 else "SMALL"
-        valid = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
-        dist = self.number_distribution(nums)
-        score = {n: dist[n] for n in valid}
-        best_num = max(valid, key=lambda n: score[n])
-
-        # if side confidence low, select nearest valid number
-        if p < 0.55 and best_num not in valid:
-            best_num = 5 if side == "BIG" else 4
+        valid_range = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
+        dist = [1.0] * 10
+        freq = Counter(nums)
+        total = len(nums)
+        if total > 0:
+            for i in range(10):
+                dist[i] += 6.0 * (freq.get(i, 0) / total)
+        score = {n: dist[n] for n in valid_range}
+        best_num = max(valid_range, key=lambda n: score[n])
 
         return {
             "issue": issue,
-            "p": p,
+            "p": clip(p),
             "side": side,
             "num": best_num,
             "regime": reg,
-            "source": "Quantum-inspired zero-drift ensemble",
-            "drift": drift,
+            "source": "practical",
             "experts": {
                 "last_result": last_bias,
                 "exact": p_exact,
@@ -427,7 +403,7 @@ class QuantumZeroDriftEngine:
                 "regime": p_regime,
                 "trend": p_trend,
                 "big_prior": p_big,
-            }
+            },
         }
 
     def settle(self, history):
@@ -438,7 +414,7 @@ class QuantumZeroDriftEngine:
             if issue not in lookup:
                 continue
 
-            pred = json.loads(row["payload")]
+            pred = json.loads(row["payload"])
             actual = lookup[issue]
             y = actual["size"]
             won_side = int(pred["p"] >= 0.5) == y
@@ -450,7 +426,7 @@ class QuantumZeroDriftEngine:
                 )
 
                 for name, val in pred.get("experts", {}).items():
-                    self.db.learn(f"{pred.get('source','default')}:{name}:{pred.get('regime', 'N/A')}", val, y)
+                    self.db.learn(f"expert:{name}:{pred.get('regime', 'N/A')}", val, y)
 
                 msg = (
                     f"<b>{'✅ WIN' if won_side else '❌ LOSS'}</b>\n"
@@ -471,7 +447,7 @@ def format_prediction(p):
     color = "🔴" if side == "BIG" else "🔵"
 
     if conf >= 70:
-        quality = "🔥 QUANTUM HOT"
+        quality = "🔥 HOT"
         stake = "2x"
     elif conf >= 60:
         quality = "⭐ STRONG"
@@ -500,7 +476,7 @@ def format_prediction(p):
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = QuantumZeroDriftEngine(db)
+        self.engine = Predictor(db)
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
 
@@ -546,17 +522,20 @@ class Runtime:
                 latest = int(history[-1]["issue"])
                 if len(history) >= CFG.min_history:
                     issue = str(latest + 1)
-                    exists = self.db.c.execute(
-                        "SELECT 1 FROM predictions WHERE issue=?", (issue,)
-                    ).fetchone()
+                    exists = self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
                     if not exists:
                         pred = self.engine.predict(history, issue)
                         with self.db.transaction():
                             self.db.c.execute(
                                 "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                (issue, time.time(), "PENDING", json.dumps(pred))
+                                (issue, time.time(), "PENDING", json.dumps(pred)),
                             )
-                            self.db.queue("prediction", issue, format_prediction(pred), time.time() + 60.0)
+                            self.db.queue(
+                                "prediction",
+                                issue,
+                                format_prediction(pred),
+                                time.time() + 60.0,
+                            )
 
             except asyncio.CancelledError:
                 raise
@@ -650,7 +629,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("Quantum Zero Drift Engine started")
+            LOG.info("Fixed predictor started")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
 
