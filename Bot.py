@@ -24,8 +24,8 @@ from aiohttp import web
 # ─── CONFIG ─────────────────────────────────────────────────
 @dataclass(frozen=True)
 class Config:
-    token: str = "5837138236:AAFMJPMY8SeXu0CIF-fyywY5M_u3aQm-HiI"
-    chat: str = "-1004472318983"
+    token: str = "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c"
+    chat: str = "-1004368817214"
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
