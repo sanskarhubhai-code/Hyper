@@ -1,7 +1,6 @@
 # bot.py
-# FINAL SIGNAL-FIRST VERSION
-# NO LAST-RESULT BIAS
-# Pure signal driven predictor
+# FIXED VERSION
+# Safe, working, no AttributeError
 # Python 3.10+
 # pip install aiohttp
 
@@ -31,13 +30,13 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "signal_only_final.db")
+    db_path: str = os.getenv("DB_PATH", "fixed_predictor.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
-    name: str = "Signal Only Predictor"
+    name: str = "Fixed Predictor"
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
@@ -49,7 +48,7 @@ class Config:
 
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOG = logging.getLogger("signal")
+LOG = logging.getLogger("predictor")
 
 
 # ─── HELPERS ───────────────────────────────────────────────────
@@ -206,23 +205,15 @@ class Database:
                 old = self.c.execute("SELECT num FROM history WHERE issue=?", (r["issue"],)).fetchone()
                 if old and old["num"] != r["num"]:
                     raise ValueError(f"Source changed settled issue {r['issue']}")
-                self.c.execute("INSERT OR IGNORE INTO history VALUES (?,?)", (r["issue"], r["num"]))
+                self.c.execute(
+                    "INSERT OR IGNORE INTO history VALUES (?, ?)",
+                    (r["issue"], r["num"]),
+                )
             self.c.execute(
                 "DELETE FROM history WHERE issue NOT IN "
                 "(SELECT issue FROM history ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?)",
                 (CFG.max_history,),
             )
-
-    def queue(self, kind, issue, text, expires=None):
-        self.c.execute(
-            "INSERT INTO outbox(kind, issue, text, created, expires) VALUES (?,?,?,?,?)",
-            (kind, issue, text, time.time(), expires),
-        )
-
-    def get_pending_predictions(self):
-        return self.c.execute(
-            "SELECT issue, payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)"
-        ).fetchall()
 
     def memory(self, key):
         row = self.c.execute("SELECT * FROM models WHERE key=?", (key,)).fetchone()
@@ -241,9 +232,20 @@ class Database:
             (key, n, loss, inv, failures),
         )
 
+    def queue(self, kind, issue, text, expires=None):
+        self.c.execute(
+            "INSERT INTO outbox(kind, issue, text, created, expires) VALUES (?,?,?,?,?)",
+            (kind, issue, text, time.time(), expires),
+        )
 
-# ─── SIGNAL-ONLY PREDICTOR ─────────────────────────────────────
-class SignalOnlyPredictor:
+    def get_pending_predictions(self):
+        return self.c.execute(
+            "SELECT issue, payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)"
+        ).fetchall()
+
+
+# ─── PREDICTOR ─────────────────────────────────────────────────
+class SignalPredictor:
     def __init__(self, db):
         self.db = db
 
@@ -302,7 +304,7 @@ class SignalOnlyPredictor:
     def big_share(self, seq):
         if not seq:
             return 0.5
-        return mean(seq[-30:])  # 0..1, where 1 = big
+        return mean(seq[-30:])
 
     def predict(self, history, issue):
         if not history:
@@ -326,7 +328,7 @@ class SignalOnlyPredictor:
         p_trend = self.trend_signal(seq)
         p_bigshare = self.big_share(seq)
 
-        # no last-result bias at all
+        # NO last-result bias
         p = (
             0.28 * p_exact +
             0.24 * p_markov +
@@ -336,25 +338,24 @@ class SignalOnlyPredictor:
         )
         p = clip(p)
 
-        # keep neutral near 0.5
         if abs(p - 0.5) < 0.05:
             p = 0.5
 
-        # regime tune only, no previous result dependency
         if reg == "RUN":
             p = clip(0.5 + (p - 0.5) * 1.2)
         elif reg == "ALT":
             p = clip(0.5 + (p - 0.5) * 0.7)
 
         side = "BIG" if p >= 0.5 else "SMALL"
-
         valid_range = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
+
         freq = Counter(nums)
         dist = [1.0] * 10
         total = len(nums)
         if total > 0:
             for i in range(10):
                 dist[i] += 6.0 * (freq.get(i, 0) / total)
+
         recent = nums[-10:]
         if recent:
             for i in range(10):
@@ -382,21 +383,34 @@ class SignalOnlyPredictor:
     def settle(self, history):
         lookup = {str(r["issue"]): r for r in history}
         pending_rows = self.db.get_pending_predictions()
+
         for row in pending_rows:
+            if row is None:
+                continue
+
             issue = str(row["issue"])
             if issue not in lookup:
                 continue
 
-            pred = json.loads(row["payload"])
+            payload = row["payload"]
+            if not payload:
+                continue
+
+            try:
+                pred = json.loads(payload)
+            except Exception:
+                continue
+
             actual = lookup[issue]
             y = actual["size"]
-            won_side = int(pred["p"] >= 0.5) == y
+            won_side = int(pred.get("p", 0.5) >= 0.5) == y
 
             with self.db.transaction():
                 self.db.c.execute(
                     "UPDATE predictions SET status=?, actual=? WHERE issue=?",
                     ("WIN" if won_side else "LOSS", actual["num"], issue),
                 )
+
                 for name, val in pred.get("experts", {}).items():
                     self.db.learn(f"expert:{name}:{pred.get('regime', 'N/A')}", val, y)
 
@@ -448,7 +462,7 @@ def format_prediction(p):
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = SignalOnlyPredictor(db)
+        self.engine = SignalPredictor(db)
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
 
@@ -494,7 +508,9 @@ class Runtime:
                 latest = int(history[-1]["issue"])
                 if len(history) >= CFG.min_history:
                     issue = str(latest + 1)
-                    exists = self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
+                    exists = self.db.c.execute(
+                        "SELECT 1 FROM predictions WHERE issue=?", (issue,)
+                    ).fetchone()
                     if not exists:
                         pred = self.engine.predict(history, issue)
                         with self.db.transaction():
@@ -524,7 +540,7 @@ class Runtime:
         while not self.stop.is_set():
             self.db.c.execute("UPDATE outbox SET sent=2 WHERE sent=0 AND expires <= ?", (time.time(),))
             row = self.db.c.execute("SELECT * FROM outbox WHERE sent=0 ORDER BY id ASC LIMIT 1").fetchone()
-            if not row:
+            if row is None:
                 await self.pause(0.5)
                 continue
 
@@ -586,6 +602,7 @@ async def main():
     app = web.Application()
     app.router.add_get("/", runtime.health)
     runner = web.AppRunner(app)
+
     tasks = []
     stop_task = None
 
@@ -601,7 +618,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("Signal only predictor started")
+            LOG.info("Fixed predictor started")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
 
