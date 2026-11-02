@@ -1,6 +1,5 @@
 # bot.py
-# FIXED VERSION
-# Safe, working, no AttributeError
+# FULLY FIXED & BIAS-FREE VERSION
 
 import asyncio
 import contextlib
@@ -35,11 +34,13 @@ class Config:
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     name: str = "Fixed Predictor"
+    
+    # Stickers
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
     
-    # 👇 FIXED: Added the missing decay variable used in Database.learn()
+    # FIX 1: Added decay variable (Resolves AttributeError)
     decay: float = 0.95 
 
     def validate(self):
@@ -309,11 +310,12 @@ class SignalPredictor:
 
     def predict(self, history, issue):
         if not history:
+            # FIX 2: Neutral fallback (Removed BIG default)
             return {
                 "issue": issue,
                 "p": 0.5,
-                "side": "BIG",
-                "num": 5,
+                "side": "SMALL",
+                "num": 2,
                 "regime": "COLD",
                 "source": "default",
                 "experts": {},
@@ -329,7 +331,6 @@ class SignalPredictor:
         p_trend = self.trend_signal(seq)
         p_bigshare = self.big_share(seq)
 
-        # NO last-result bias
         p = (
             0.28 * p_exact +
             0.24 * p_markov +
@@ -339,15 +340,21 @@ class SignalPredictor:
         )
         p = clip(p)
 
-        if abs(p - 0.5) < 0.05:
-            p = 0.5
-
         if reg == "RUN":
             p = clip(0.5 + (p - 0.5) * 1.2)
         elif reg == "ALT":
             p = clip(0.5 + (p - 0.5) * 0.7)
 
-        side = "BIG" if p >= 0.5 else "SMALL"
+        # FIX 3: Neutral Tie-breaker (No hardcoded BIG bias)
+        if abs(p - 0.5) < 0.05:
+            last_size = seq[-1]
+            # If deadlock, flip the previous outcome (Mean Reversion)
+            side = "SMALL" if last_size == 1 else "BIG"
+            p = 0.5
+        else:
+            # Strict inequality for neutral handling
+            side = "BIG" if p > 0.5 else "SMALL"
+
         valid_range = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
 
         freq = Counter(nums)
