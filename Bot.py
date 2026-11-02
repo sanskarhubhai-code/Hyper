@@ -1,5 +1,5 @@
 # bot.py
-# FULLY FIXED: Win/Loss bug resolved, Duplicate messages fixed, No artificial 50% clamping.
+# FULLY FIXED: No Bias (Random Tie-breaker), Win/Loss Bug Fixed.
 
 import asyncio
 import contextlib
@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import random  # 🔥 FIX: Added random module for unbiased 50/50 tie-breaking
 import signal
 import sqlite3
 import time
@@ -308,8 +309,11 @@ class SignalPredictor:
 
     def predict(self, history, issue):
         if not history:
+            # 🔥 FIX: Random fallback instead of hardcoded SMALL
+            side = random.choice(["BIG", "SMALL"])
+            num = random.choice([2, 7])
             return {
-                "issue": issue, "p": 0.5, "side": "SMALL", "num": 2,
+                "issue": issue, "p": 0.5, "side": side, "num": num,
                 "regime": "COLD", "source": "default", "experts": {}
             }
 
@@ -337,11 +341,10 @@ class SignalPredictor:
         elif reg == "ALT":
             p = clip(0.5 + (p - 0.5) * 0.7)
 
-        # 🔥 FIXED: Removed artificial clamping to 0.5
-        if p == 0.5:
-            # Exact tie: flip previous result
-            last_size = seq[-1]
-            side = "SMALL" if last_size == 1 else "BIG"
+        # 🔥 FIX: If p is exactly 50% (or extremely close), pick RANDOMLY to avoid bias
+        if abs(p - 0.5) < 0.01:
+            side = random.choice(["BIG", "SMALL"])
+            p = 0.5
         else:
             side = "BIG" if p > 0.5 else "SMALL"
 
@@ -402,7 +405,6 @@ class SignalPredictor:
             actual = lookup[issue]
             actual_side = "BIG" if actual["size"] == 1 else "SMALL"
             
-            # 🔥 FIXED: Direct String comparison instead of p >= 0.5
             pred_side = pred.get("side", "BIG")
             won_side = (pred_side == actual_side)
 
@@ -514,7 +516,6 @@ class Runtime:
                         "SELECT 1 FROM predictions WHERE issue=?", (issue,)
                     ).fetchone()
                     
-                    # 🔥 FIXED: Check if message already queued to prevent duplicates
                     already_queued = self.db.c.execute(
                         "SELECT 1 FROM outbox WHERE issue=? AND kind='prediction'", (issue,)
                     ).fetchone()
