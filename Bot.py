@@ -1,7 +1,7 @@
 # bot.py
-# Fixed and working version
-# Python 3.10+
-# pip install aiohttp
+# BEST PRACTICAL PREDICTOR
+# Strong anchor on last result + regime + trend + exact-pattern + number bias
+# Includes: prediction, result settlement, Telegram send, no NameError, no skip logic
 
 import asyncio
 import contextlib
@@ -29,13 +29,15 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_fixed.db")
+    db_path: str = os.getenv("DB_PATH", "best_practical_predictor.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
-    name: str = "Predictor Fixed"
+    learning_rate: float = 0.06
+    decay: float = 0.985
+    name: str = "Best Practical Predictor"
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
@@ -50,7 +52,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 LOG = logging.getLogger("predictor")
 
 
-# ─── UTILS ─────────────────────────────────────────────────────
+# ─── UTILITIES ──────────────────────────────────────────────
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
 
@@ -71,13 +73,6 @@ def numeric(value):
 
 def escape(x):
     return html.escape(str(x))
-
-def weighted_probability(obs):
-    sw = sum(w for _, w in obs)
-    sw2 = sum(w * w for _, w in obs)
-    effective_n = sw * sw / sw2 if sw2 else 0.0
-    probability = (4 + sum(y * w for y, w in obs)) / (8 + sw)
-    return probability, effective_n
 
 def run_length(seq):
     if not seq:
@@ -104,6 +99,13 @@ def get_regime(seq):
     if abs(sum(tail) / len(tail) - 0.5) > 0.20:
         return "IMBAL"
     return "MIXED"
+
+def weighted_probability(obs):
+    sw = sum(w for _, w in obs)
+    sw2 = sum(w * w for _, w in obs)
+    effective_n = sw * sw / sw2 if sw2 else 0.0
+    probability = (4 + sum(y * w for y, w in obs)) / (8 + sw)
+    return probability, effective_n
 
 def parse_history(payload):
     obj = payload
@@ -143,26 +145,23 @@ def trend_features(seq):
 
     tail = seq[-24:]
     alternation = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
+
     fast = tail_mean(5)
     mid = tail_mean(10)
     slow = tail_mean(24)
-    shallow = tail_mean(3)
     reg = get_regime(seq)
-
     reg_map = {"COLD": 0.0, "MIXED": 0.25, "ALT": 0.5, "IMBAL": 0.75, "RUN": 1.0}
     regime_value = reg_map.get(reg, 0.5)
 
     return [
         1.0,
-        2 * shallow - 1,
         2 * fast - 1,
         2 * mid - 1,
         2 * slow - 1,
-        (2 * seq[-1] - 1),
-        (2 * alternation - 1),
+        2 * seq[-1] - 1,
+        2 * alternation - 1,
         (fast - slow),
         (mid - slow),
-        (mean(seq[-5:]) - mean(seq[-10:])),
         (run_length(seq) / 10.0),
         regime_value,
     ]
@@ -213,10 +212,7 @@ class Database:
                 old = self.c.execute("SELECT num FROM history WHERE issue=?", (r["issue"],)).fetchone()
                 if old and old["num"] != r["num"]:
                     raise ValueError(f"Source changed settled issue {r['issue']}")
-                self.c.execute(
-                    "INSERT OR IGNORE INTO history VALUES (?, ?)",
-                    (r["issue"], r["num"]),
-                )
+                self.c.execute("INSERT OR IGNORE INTO history VALUES (?,?)", (r["issue"], r["num"]))
             self.c.execute(
                 "DELETE FROM history WHERE issue NOT IN "
                 "(SELECT issue FROM history ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?)",
@@ -232,7 +228,8 @@ class Database:
         n = CFG.decay * m["n"] + 1
         loss = CFG.decay * m["loss"] + (probability - actual) ** 2
         inv = CFG.decay * m["inverse_loss"] + (1 - probability - actual) ** 2
-        failures = m["failures"] + 1 if int(probability >= 0.5) != actual else 0
+        wrong = int(probability >= 0.5) != actual
+        failures = m["failures"] + 1 if wrong else 0
         self.c.execute(
             "INSERT INTO models VALUES (?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
             "n=excluded.n, loss=excluded.loss, inverse_loss=excluded.inverse_loss, failures=excluded.failures",
@@ -243,23 +240,19 @@ class Database:
         m = self.memory(key)
         n = m["n"]
         if n < 1:
-            return probability, 0.75, False
-
+            return probability, 0.8, False
         brier = m["loss"] / n
         inv = m["inverse_loss"] / n
         flipped = (inv + 0.025 < brier) and (brier > 0.24) and (m["failures"] >= 3)
-        effective_loss = inv if flipped else brier
         p = (1 - probability) if flipped else probability
-
+        effective_loss = inv if flipped else brier
         reliability = clip((0.25 - effective_loss) / 0.12, 0.0, 1.0)
         maturity = min(n / 60.0, 1.0)
         shrink = (1 - maturity) * 0.7 + maturity * reliability
         p = 0.5 + (p - 0.5) * shrink
-
         weight = clip(math.exp(-6 * (effective_loss - 0.22)), 0.18, 2.2)
         if m["failures"] >= 4 and not flipped:
             weight *= 0.55
-
         return clip(p), weight, flipped
 
     def queue(self, kind, issue, text, expires=None):
@@ -268,15 +261,20 @@ class Database:
             (kind, issue, text, time.time(), expires),
         )
 
+    def get_pending_predictions(self):
+        return self.c.execute(
+            "SELECT issue, payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)"
+        ).fetchall()
 
-# ─── BASIC PREDICTOR ───────────────────────────────────────────
-class Predictor:
+
+# ─── BEST PRACTICAL PREDICTOR ─────────────────────────────────
+class BestPredictor:
     def __init__(self, db):
         self.db = db
 
     def exact_pattern(self, seq):
         if len(seq) < 8:
-            return 0.5, []
+            return 0.5
         candidates = []
         for length in range(4, min(12, len(seq) // 2) + 1):
             suffix = tuple(seq[-length:])
@@ -286,11 +284,11 @@ class Predictor:
                     obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 300.0)))
             if len(obs) >= 3:
                 p, eff_n = weighted_probability(obs)
-                candidates.append((abs(p - 0.5) * math.sqrt(eff_n), p, len(obs), suffix))
+                candidates.append((abs(p - 0.5) * math.sqrt(eff_n), p))
         if not candidates:
-            return 0.5, []
+            return 0.5
         candidates.sort(reverse=True)
-        return candidates[0][1], [candidates[0][3]]
+        return candidates[0][1]
 
     def markov(self, seq):
         if len(seq) < 8:
@@ -307,12 +305,12 @@ class Predictor:
                 best = p
         return best
 
-    def regime(self, seq):
+    def regime_strength(self, seq):
         reg = get_regime(seq)
-        if len(seq) < 24:
+        if len(seq) < 20:
             return 0.5
         obs = []
-        for i in range(24, len(seq)):
+        for i in range(20, len(seq)):
             if get_regime(seq[max(0, i - 96):i]) == reg:
                 obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 300.0)))
         if len(obs) >= 3:
@@ -320,14 +318,14 @@ class Predictor:
             return p
         return 0.5
 
-    def trend(self, seq):
+    def trend_strength(self, seq):
         if not seq:
             return 0.5
         feats = trend_features(seq)
-        z = sum(f for f in feats)
-        return clip(1.0 / (1.0 + math.exp(-z / 6.0)))
+        z = sum(feats)
+        return clip(1.0 / (1.0 + math.exp(-z / 8.0)))
 
-    def number_side(self, nums):
+    def number_bias(self, nums):
         if not nums:
             return 0.5, 5
         freq = Counter(nums)
@@ -338,35 +336,72 @@ class Predictor:
         return clip(p_big), max(range(10), key=lambda i: freq.get(i, 0))
 
     def predict(self, history, issue):
+        if not history:
+            return {
+                "issue": issue,
+                "p": 0.5,
+                "side": "BIG",
+                "num": 5,
+                "regime": "COLD",
+                "source": "Default anchor",
+                "experts": {},
+            }
+
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
+        last_size = history[-1]["size"]
+        last_num = history[-1]["num"]
 
-        p_exact, pattern_info = self.exact_pattern(seq)
+        # strong anchor on last result
+        last_bias = 0.82 if last_size == 1 else 0.18
+
+        # supporting signals
+        p_exact = self.exact_pattern(seq)
         p_markov = self.markov(seq)
-        p_regime = self.regime(seq)
-        p_trend = self.trend(seq)
-        p_big, _ = self.number_side(nums)
+        p_regime = self.regime_strength(seq)
+        p_trend = self.trend_strength(seq)
+        p_big, _ = self.number_bias(nums)
 
-        p = 0.25 * p_exact + 0.25 * p_markov + 0.25 * p_regime + 0.25 * p_trend
+        # fusion
+        p = (
+            0.35 * last_bias +
+            0.20 * p_exact +
+            0.15 * p_markov +
+            0.15 * p_regime +
+            0.15 * p_trend
+        )
+
         if p_big >= 0.5:
-            p = 0.7 * p + 0.3 * p_big
+            p = 0.75 * p + 0.25 * p_big
         else:
-            p = 0.7 * p + 0.3 * (1.0 - p_big)
+            p = 0.75 * p + 0.25 * (1.0 - p_big)
 
-        if len(history) >= 2 and history[-1]["size"] == history[-2]["size"]:
-            p = clip(p + 0.05)
+        reg = get_regime(seq)
+        if reg == "RUN":
+            if last_size == 1:
+                p = clip(p + 0.05)
+            else:
+                p = clip(p - 0.05)
+        elif reg == "ALT":
+            p = clip(0.5 + (p - 0.5) * 0.6)
 
+        p = clip(p)
         side = "BIG" if p >= 0.5 else "SMALL"
         num = 5 if side == "BIG" else 4
+        if last_num >= 5 and side == "SMALL":
+            num = 5
+        if last_num < 5 and side == "BIG":
+            num = 4
+
         return {
             "issue": issue,
-            "p": clip(p),
+            "p": p,
             "side": side,
             "num": num,
-            "regime": get_regime(seq),
-            "source": "Hybrid Predictor",
-            "pattern_info": pattern_info,
+            "regime": reg,
+            "source": "Anchor + regime + pattern + number prior",
             "experts": {
+                "last_result": last_bias,
                 "exact": p_exact,
                 "markov": p_markov,
                 "regime": p_regime,
@@ -374,6 +409,37 @@ class Predictor:
                 "big_prior": p_big,
             }
         }
+
+    def settle(self, history):
+        lookup = {str(r["issue"]): r for r in history}
+        pending_rows = self.db.get_pending_predictions()
+        for row in pending_rows:
+            issue = str(row["issue"])
+            if issue not in lookup:
+                continue
+
+            pred = json.loads(row["payload"])
+            actual = lookup[issue]
+            y = actual["size"]
+            won_side = int(pred["p"] >= 0.5) == y
+
+            with self.db.transaction():
+                self.db.c.execute(
+                    "UPDATE predictions SET status=?, actual=? WHERE issue=?",
+                    ("WIN" if won_side else "LOSS", actual["num"], issue),
+                )
+
+                for name, val in pred.get("experts", {}).items():
+                    self.db.learn(f"expert:{name}:{pred.get('regime', 'N/A')}", val, y)
+
+                msg = (
+                    f"<b>{'✅ WIN' if won_side else '❌ LOSS'}</b>\n"
+                    f"<b>Issue:</b> {issue}\n"
+                    f"<b>Actual:</b> {actual['num']} ({'BIG' if y else 'SMALL'})\n"
+                    f"<b>Prediction:</b> {pred.get('side', 'UNKNOWN')} -> {pred.get('num', '?')}\n"
+                    f"<b>Confidence:</b> {pred.get('p', 0.5) * 100:.1f}%"
+                )
+                self.db.queue("result", issue, msg, time.time() + 60.0)
 
 
 # ─── FORMATTER ──────────────────────────────────────────────
@@ -385,13 +451,13 @@ def format_prediction(p):
     color = "🔴" if side == "BIG" else "🔵"
 
     if conf >= 70:
-        quality = "🔥 HOT VIP"
+        quality = "🔥 HOT FOLLOW"
         stake = "2x"
     elif conf >= 60:
-        quality = "⭐ VIP"
+        quality = "⭐ STRONG"
         stake = "1.5x"
     elif conf >= 55:
-        quality = "✅ STRONG"
+        quality = "✅ STABLE"
         stake = "1x"
     else:
         quality = "📉 CAUTIOUS"
@@ -414,7 +480,7 @@ def format_prediction(p):
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = Predictor(db)
+        self.engine = BestPredictor(db)
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
 
@@ -455,18 +521,27 @@ class Runtime:
                 self.last_fetch = time.time()
                 failures = 0
 
+                self.engine.settle(history)
+
                 latest = int(history[-1]["issue"])
                 if len(history) >= CFG.min_history:
                     issue = str(latest + 1)
-                    exists = self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
+                    exists = self.db.c.execute(
+                        "SELECT 1 FROM predictions WHERE issue=?", (issue,)
+                    ).fetchone()
                     if not exists:
                         pred = self.engine.predict(history, issue)
                         with self.db.transaction():
                             self.db.c.execute(
                                 "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                                (issue, time.time(), "PENDING", json.dumps(pred)),
+                                (issue, time.time(), "PENDING", json.dumps(pred))
                             )
-                            self.db.queue("prediction", issue, format_prediction(pred), time.time() + 60.0)
+                            self.db.queue(
+                                "prediction",
+                                issue,
+                                format_prediction(pred),
+                                time.time() + 60.0,
+                            )
 
             except asyncio.CancelledError:
                 raise
@@ -487,8 +562,8 @@ class Runtime:
                 await self.pause(0.5)
                 continue
 
+            delay = backoff
             try:
-                payload = None
                 if row["kind"] == "sticker":
                     url = endpoint_sticker
                     payload = {"chat_id": CFG.chat, "sticker": row["text"]}
@@ -537,6 +612,7 @@ async def main():
     db = Database(CFG.db_path)
     runtime = Runtime(db)
     loop = asyncio.get_running_loop()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
             loop.add_signal_handler(sig, runtime.stop.set)
@@ -559,7 +635,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("Predictor started")
+            LOG.info("Best practical predictor started")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
 
