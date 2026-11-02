@@ -1,6 +1,3 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V21 — NO-SKIP + TEST ENDPOINT)
-# Python 3.10+  |  Deps: aiohttp
-
 import asyncio
 import contextlib
 import html
@@ -24,7 +21,7 @@ from aiohttp import web
 @dataclass(frozen=True)
 class Config:
     token: str = "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c"
-    chat: str = "-1004368817214"
+    chat: str = "-1004485961768"  # <--- Tera naya Chat ID yahan daal diya hai
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
@@ -39,7 +36,7 @@ class Config:
     meta_lr: float = 0.03
     decay: float = 0.985
     max_pattern: int = 15
-    delivery_ttl: float = 120.0  # TTL badhaya gaya hai
+    delivery_ttl: float = 600.0  
     name: str = "FTW VIP PREDICTOR (HYPER)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
