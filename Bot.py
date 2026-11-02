@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (ADVANCED BEAST ENGINE)
+# bot.py — FTW VIP PREDICTOR (VERY ADVANCED / MIN PATTERN LEN = 5)
 # Python 3.10+ | aiohttp
 
 import asyncio
@@ -32,19 +32,19 @@ class Config:
     ) or (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_beast.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_advanced_min5.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 5000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
+    max_pattern_len: int = int(os.getenv("MAX_PATTERN_LEN", "12"))
     learning_rate: float = 0.05
     meta_lr: float = 0.045
     decay: float = 0.988
-    max_pattern: int = 20
     delivery_ttl: float = 55.0
-    name: str = "FTW VIP PREDICTOR (BEAST)"
+    name: str = "FTW VIP PREDICTOR (ADVANCED MIN5)"
     win_sticker: str = os.getenv("WIN_STICKER", "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E")
     loss_sticker: str = os.getenv("LOSS_STICKER", "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E")
     jack_sticker: str = os.getenv("JACK_STICKER", "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E")
@@ -56,13 +56,15 @@ class Config:
             raise ValueError("CHAT_ID is missing or invalid")
         if not self.urls:
             raise ValueError("History URLs are missing")
+        if self.max_pattern_len < 5:
+            raise ValueError("MAX_PATTERN_LEN must be >= 5")
 
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("predictor")
 
 # -----------------------------
-# UTILS
+# UTIL
 # -----------------------------
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
@@ -139,112 +141,41 @@ def trend_features(seq):
         return math.sqrt(sum((x - m) ** 2 for x in arr) / len(arr))
 
     tail = seq[-12:]
-    runs = run_length(seq)
     recent_avg = sum(seq[-6:]) / len(seq[-6:])
     recent_short = sum(seq[-3:]) / len(seq[-3:])
     alternation = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
-    ema12 = ema(seq, 12)
-    ema6 = ema(seq, 6)
+    e12 = ema(seq, 12)
+    e6 = ema(seq, 6)
 
     return [
         1.0,
         2 * mean(3) - 1,
         2 * mean(5) - 1,
-        2 * mean(10) - 1,
+        2 * mean(8) - 1,
+        2 * mean(12) - 1,
         2 * recent_avg - 1,
         2 * recent_short - 1,
-        (2 * seq[-1] - 1),
-        (2 * alternation - 1),
-        (2 * ema12 - 1),
-        (2 * ema6 - 1),
-        (2 * std(5) - 1),
-        (2 * std(10) - 1),
-        (min(runs, 10) / 10.0) * (2 * seq[-1] - 1),
+        2 * seq[-1] - 1,
+        2 * alternation - 1,
+        2 * e12 - 1,
+        2 * e6 - 1,
+        2 * std(5) - 1,
+        2 * std(10) - 1,
         (sum(seq[-10:]) / 10.0) - 0.5,
         (sum(seq[-5:]) / 5.0) - 0.5,
-        (ema12 - ema6) * 2,
+        (e12 - e6) * 2,
     ]
 
 def logistic(weights, features):
     return sigmoid(sum(w * x for w, x in zip(weights, features)))
 
-def suffix_count(seq, length):
-    if len(seq) < length:
-        return {}
-    counts = {}
-    for i in range(len(seq) - length + 1):
-        s = tuple(seq[i:i+length])
-        counts[s] = counts.get(s, 0) + 1
-    return counts
-
-def recent_suffix_scores(history, max_len=8):
-    seq = [x["size"] for x in history]
+def run_length_score(seq):
     if not seq:
-        return {}
-
-    scores = {}
-    for L in range(1, min(max_len, len(seq)) + 1):
-        suffix = tuple(seq[-L:])
-        cnt_big = 0
-        cnt_small = 0
-        total = 0
-        for i in range(len(seq) - L):
-            cand = tuple(seq[i:i+L])
-            if cand == suffix:
-                total += 1
-                if seq[i+L] == 1:
-                    cnt_big += 1
-                else:
-                    cnt_small += 1
-        if total:
-            scores[L] = {
-                "suffix": suffix,
-                "big": cnt_big / total,
-                "small": cnt_small / total,
-                "total": total,
-                "bias": (cnt_big - cnt_small) / total
-            }
-    return scores
-
-def regime_counts(history):
-    seq = [x["size"] for x in history]
-    out = {
-        "RUN": {"big": 0, "small": 0, "total": 0},
-        "ALT": {"big": 0, "small": 0, "total": 0},
-        "IMBAL": {"big": 0, "small": 0, "total": 0},
-        "MIXED": {"big": 0, "small": 0, "total": 0},
-        "COLD": {"big": 0, "small": 0, "total": 0},
-    }
-    if not seq:
-        return out
-
-    for i in range(1, len(seq)):
-        reg = get_regime(seq[max(0, i-24):i])
-        out.setdefault(reg, {"big": 0, "small": 0, "total": 0})
-        out[reg]["total"] += 1
-        if seq[i] == 1:
-            out[reg]["big"] += 1
-        else:
-            out[reg]["small"] += 1
-
-    return out
-
-def strong_reversal_allowed(history, current_regime):
-    if len(history) < 12:
-        return False
-    seq = [x["size"] for x in history]
-    tail = seq[-12:]
-    recent_big_ratio = sum(tail) / len(tail)
-    recent_run = run_length(tail)
-
-    if current_regime in ("ALT", "RUN", "IMBAL"):
-        if recent_big_ratio <= 0.35 or recent_big_ratio >= 0.65:
-            if recent_run >= 3 or abs(recent_big_ratio - 0.5) >= 0.15:
-                return True
-    return False
+        return 0.0
+    return (min(run_length(seq), 10) / 10.0) * (2 * seq[-1] - 1)
 
 # -----------------------------
-# PARSE HISTORY
+# HISTORY PARSER
 # -----------------------------
 def parse_history(payload):
     obj = payload
@@ -423,32 +354,34 @@ class Database:
         }
 
 # -----------------------------
-# ENGINE
+# PREDICTOR ENGINE
 # -----------------------------
 class Engine:
     def __init__(self, db):
         self.db = db
 
-    def build_suffix_model(self, seq):
-        model = []
-        if not seq:
-            return model
-
-        for L in range(1, min(8, len(seq)) + 1):
+    def build_exact_patterns(self, seq):
+        results = []
+        max_len = min(CFG.max_pattern_len, len(seq) // 2)
+        for L in range(5, max_len + 1):
+            if len(seq) < L + 1:
+                continue
             suffix = tuple(seq[-L:])
             count = 0
-            big_count = 0
+            big_after = 0
             for i in range(len(seq) - L):
                 cand = tuple(seq[i:i+L])
                 if cand == suffix:
                     count += 1
                     if seq[i+L] == 1:
-                        big_count += 1
-            if count > 0:
-                model.append((L, suffix, count, big_count / count))
-        return sorted(model, key=lambda x: (x[2], abs(x[3]-0.5)), reverse=True)[:5]
+                        big_after += 1
+            if count >= CFG.min_support:
+                p = big_after / count
+                results.append((L, suffix, count, p))
+        results.sort(key=lambda x: (abs(x[3] - 0.5), x[2]), reverse=True)
+        return results[:8]
 
-    def build_markov_model(self, seq):
+    def build_markov(self, seq):
         model = []
         for L in range(1, 5):
             if len(seq) <= L:
@@ -464,6 +397,20 @@ class Engine:
             if total:
                 model.append((L, big_after / total, total))
         return model
+
+    def build_transition_table(self, seq):
+        table = {}
+        for L in range(5, min(len(seq), CFG.max_pattern_len) + 1):
+            prefix = tuple(seq[-L:])
+            table.setdefault(prefix, {"big": 0, "small": 0, "total": 0})
+            if len(seq) > L:
+                nxt = seq[-1]
+                if nxt == 1:
+                    table[prefix]["big"] += 1
+                else:
+                    table[prefix]["small"] += 1
+                table[prefix]["total"] += 1
+        return table
 
     def predict(self, history, issue):
         seq = [x["size"] for x in history]
@@ -484,44 +431,72 @@ class Engine:
                 "strong_reversal": False,
             }
 
+        # regime
         reg = get_regime(seq)
         reg_map = regime_counts(history)
         reg_counts = reg_map.get(reg, {"big": 1, "small": 1, "total": 2})
         reg_prob = (reg_counts["big"] / reg_counts["total"]) if reg_counts["total"] else 0.5
 
-        suffix_model = self.build_suffix_model(seq)
-        suffix_weight_total = 0.0
-        suffix_weighted_prob = 0.0
-        suffix_patterns = []
-        for L, suffix, count, p in suffix_model:
-            w = min(1.0, count / 20.0) * (1.0 + (L * 0.15))
-            suffix_weight_total += w
-            suffix_weighted_prob += p * w
-            suffix_patterns.append({"key": f"suffix:{L}:{suffix}", "p": p, "support": count})
+        # exact pattern signal
+        exact_patterns = self.build_exact_patterns(seq)
+        exact_prob = 0.5
+        pattern_list = []
+        if exact_patterns:
+            weights = []
+            vals = []
+            for L, suffix, count, p in exact_patterns:
+                w = min(1.0, count / 30.0) * (1.0 + (L * 0.15))
+                weights.append(w)
+                vals.append(p * w)
+            exact_prob = sum(vals) / sum(weights) if sum(weights) else 0.5
+            for L, suffix, count, p in exact_patterns[:5]:
+                pattern_list.append({"key": f"suffix:{L}:{suffix}", "p": p, "support": count})
 
-        suffix_prob = suffix_weighted_prob / suffix_weight_total if suffix_weight_total else 0.5
-
-        markov_model = self.build_markov_model(seq)
+        # Markov signal
+        markov = self.build_markov(seq)
         markov_prob = 0.5
-        if markov_model:
-            total_w = sum(w for _, _, w in markov_model)
-            markov_prob = sum(p * w for _, p, w in markov_model) / total_w if total_w else 0.5
+        if markov:
+            total_w = sum(w for _, _, w in markov)
+            markov_prob = sum(p * w for _, p, w in markov) / total_w if total_w else 0.5
 
+        # recent suffix history
+        suffix_scores = {}
+        for L in range(5, min(12, len(seq)) + 1):
+            suffix = tuple(seq[-L:])
+            count = 0
+            big_after = 0
+            for i in range(len(seq) - L):
+                cand = tuple(seq[i:i+L])
+                if cand == suffix:
+                    count += 1
+                    if seq[i+L] == 1:
+                        big_after += 1
+            if count:
+                suffix_scores[L] = {"big": big_after / count, "count": count}
+
+        recent_suffix_prob = 0.5
+        if suffix_scores:
+            best = max(suffix_scores.items(), key=lambda kv: kv[1]["count"])
+            recent_suffix_prob = best[1]["big"]
+
+        # tail / run / alternation
         tail = seq[-8:]
         tail_prob = sum(tail) / len(tail)
+        run_score = run_length_score(seq)
+        alternation = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
 
-        recent_suffix = recent_suffix_scores(history, max_len=8)
-        recent_best_prob = 0.5
-        if recent_suffix:
-            best = max(recent_suffix.items(), key=lambda kv: kv[1]["total"])
-            _, data = best
-            recent_best_prob = data["big"]
-
-        # exact final blended probability
-        p_big = 0.35 * suffix_prob + 0.25 * reg_prob + 0.20 * markov_prob + 0.12 * tail_prob + 0.08 * recent_best_prob
+        # combined weighted probability
+        p_big = (
+            0.40 * exact_prob +
+            0.22 * reg_prob +
+            0.18 * markov_prob +
+            0.10 * recent_suffix_prob +
+            0.06 * tail_prob +
+            0.04 * (0.5 + run_score * 0.5)
+        )
         p_big = clip(p_big, 0.02, 0.98)
 
-        # recovery logic
+        # recovery after loss
         recovery = self.db.get_recovery_state()
         loss_streak = max(0, int(recovery["consecutive_losses"]))
         recovery_mode = bool(recovery["recovery_mode"]) or loss_streak > 0
@@ -536,10 +511,10 @@ class Engine:
         # choose side
         side = "BIG" if p_big >= 0.5 else "SMALL"
 
-        # exact number selection
+        # number prediction based on sequence suffix
         num_dist = [1.0] * 10
         if nums:
-            for L in range(1, min(8, len(nums)) + 1):
+            for L in range(5, min(12, len(nums)) + 1):
                 suffix = tuple(nums[-L:])
                 count = 0
                 dist = {}
@@ -577,8 +552,8 @@ class Engine:
             "edge": edge,
             "confidence": confidence,
             "regime": reg,
-            "source": "📊 Advanced State Engine",
-            "patterns": suffix_patterns,
+            "source": "📊 Strong Exact Pattern Engine",
+            "patterns": pattern_list,
             "recovery_mode": recovery_mode,
             "strong_reversal": strong_reversal,
         }
@@ -653,7 +628,6 @@ def settle_history(db, history):
                 "UPDATE predictions SET status=?, actual=? WHERE issue=?",
                 (final_status, actual_num, issue)
             )
-
             if won_side and won_num:
                 db.update_recovery_state("WIN")
                 sticker = CFG.jack_sticker
