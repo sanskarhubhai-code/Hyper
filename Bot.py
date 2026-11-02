@@ -1,15 +1,13 @@
-# bot.py — FTW VIP PREDICTOR (HYPER V19 — NO-SKIP ADVANCED ENGINE)
+# bot.py — FTW VIP PREDICTOR (HYPER V21 — ULTRA ADVANCED NO-SKIP ENGINE)
 # Python 3.10+ | Deps: aiohttp
 #
-# Features:
-# - No skip gate (always predicts if history is enough)
-# - Multi-expert ensemble
-# - Pattern + Markov + regime + trend + momentum + state + neighbors + ngram
-# - Anti-overfit calibration
-# - Number engine with distribution fusion
-# - Recovery after losses
-# - Telegram send + DB persistence
-# - Fixed class inheritance and settlement logic
+# This version is built for:
+# - strong multi-model fusion
+# - regime-aware weighting
+# - better number prediction
+# - anti-drawdown recovery
+# - always predicting when history exists
+# - no skip gate
 
 import asyncio
 import contextlib
@@ -22,7 +20,7 @@ import signal
 import socket
 import sqlite3
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -38,19 +36,19 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v19.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v21.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
-    learning_rate: float = 0.05
-    meta_lr: float = 0.05
+    learning_rate: float = 0.060
+    meta_lr: float = 0.060
     decay: float = 0.985
-    max_pattern: int = 20
+    max_pattern: int = 24
     delivery_ttl: float = 60.0
-    name: str = "FTW VIP PREDICTOR (HYPER V19)"
+    name: str = "FTW VIP PREDICTOR (HYPER V21)"
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
@@ -128,8 +126,11 @@ def parse_history(payload):
             break
         if not isinstance(obj, dict):
             return []
-        obj = next((obj[k] for k in ("data", "list", "result", "items", "history")
-                    if isinstance(obj.get(k), (list, dict))), None)
+        obj = next(
+            (obj[k] for k in ("data", "list", "result", "items", "history")
+             if isinstance(obj.get(k), (list, dict))),
+            None,
+        )
     if not isinstance(obj, list):
         return []
     records = {}
@@ -342,7 +343,7 @@ class Database:
         )
 
 
-# ─── BASE ENGINE ──────────────────────────────────────────────
+# ─── ENGINE ─────────────────────────────────────────────────
 class Engine:
     def __init__(self, db):
         self.db = db
@@ -619,12 +620,14 @@ class NumberEngine:
     def get_distribution(self, nums):
         ngram_db = self.db.get("num_ngrams", {})
         dist = [1.0] * 10
+
         if nums:
             freq = Counter(nums)
             total = sum(freq.values())
             if total > 0:
                 for i in range(10):
                     dist[i] += 3.0 * (freq.get(i, 0) / total)
+
         for length in range(min(10, len(nums)), 1, -1):
             seq_key = ",".join(str(x) for x in nums[-length:])
             if seq_key in ngram_db:
@@ -637,6 +640,7 @@ class NumberEngine:
         return self.normalize(dist)
 
     def _predict_number(self, seq_nums):
+        # global prior
         ngram_db = self.db.get("num_ngrams", {})
         freq = self.db.get("num_freq", {})
         prior = [1.0] * 10
@@ -664,7 +668,7 @@ class NumberEngine:
         return best, dist[best] / total
 
 
-# ─── ADVANCED ENGINE (NO SKIP) ───────────────────────────────
+# ─── ADVANCED PREDICTOR ───────────────────────────────────────
 class UpgradedEngine(Engine):
     def __init__(self, db):
         super().__init__(db)
@@ -779,13 +783,10 @@ class UpgradedEngine(Engine):
         best_num = max(valid_nums, key=lambda x: num_dist[x])
         num_prob = num_dist[best_num]
 
-        # extra number adjustment for stronger accuracy
         num_pred, num_conf = self.num_engine._predict_number(nums)
-        if num_pred in valid_nums:
-            # Fuse number engine with distribution model
-            if num_conf > num_prob:
-                best_num = num_pred
-                num_prob = num_conf
+        if num_pred in valid_nums and num_conf > num_prob:
+            best_num = num_pred
+            num_prob = num_conf
 
         change_score = self.calculate_change_score(seq)
         edge = abs(p_cal - 0.5)
@@ -794,7 +795,6 @@ class UpgradedEngine(Engine):
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         trend_shift = f"{prev_regime} ➡️ {current_regime}" if prev_regime != current_regime else None
 
-        # NO SKIP: always send prediction
         return {
             "issue": issue,
             "p": p_cal,
@@ -978,7 +978,6 @@ class Runtime:
     async def health(self, request):
         total = self.db.c.execute("SELECT COUNT(*) FROM predictions WHERE status IN ('WIN','LOSS')").fetchone()[0]
         wins = self.db.c.execute("SELECT COUNT(*) FROM predictions WHERE status='WIN'").fetchone()[0]
-        skips = self.db.c.execute("SELECT COUNT(*) FROM predictions WHERE status='SKIP'").fetchone()[0]
         acc = (wins / total * 100) if total else 0.0
         return web.json_response({
             "status": "ok" if self.last_fetch and time.time() - self.last_fetch < 90 else "degraded",
@@ -986,7 +985,6 @@ class Runtime:
             "settled": total,
             "wins": wins,
             "win_rate": f"{acc:.1f}%",
-            "skipped": skips,
         })
 
 
@@ -1019,7 +1017,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info(f"{CFG.name} V19 Started (No-Skip Advanced Engine)")
+            LOG.info(f"{CFG.name} V21 Started (Ultra Advanced No-Skip Engine)")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
             for task in tasks:
