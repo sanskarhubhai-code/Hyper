@@ -1,7 +1,8 @@
 # bot.py
-# BEST PRACTICAL PREDICTOR
-# Strong anchor on last result + regime + trend + exact-pattern + number bias
-# Includes: prediction, result settlement, Telegram send, no NameError, no skip logic
+# SIGNAL-FIRST PREDICTOR
+# Last result is NOT dominant. It is only a mild bias.
+# Better for weak/noisy sequence.
+# Includes: prediction + settlement + Telegram result output
 
 import asyncio
 import contextlib
@@ -29,7 +30,7 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "best_practical_predictor.db")
+    db_path: str = os.getenv("DB_PATH", "signal_first_predictor.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -37,7 +38,7 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     learning_rate: float = 0.06
     decay: float = 0.985
-    name: str = "Best Practical Predictor"
+    name: str = "Signal First Predictor"
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
@@ -145,7 +146,6 @@ def trend_features(seq):
 
     tail = seq[-24:]
     alternation = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
-
     fast = tail_mean(5)
     mid = tail_mean(10)
     slow = tail_mean(24)
@@ -240,7 +240,7 @@ class Database:
         m = self.memory(key)
         n = m["n"]
         if n < 1:
-            return probability, 0.8, False
+            return probability, 0.75, False
         brier = m["loss"] / n
         inv = m["inverse_loss"] / n
         flipped = (inv + 0.025 < brier) and (brier > 0.24) and (m["failures"] >= 3)
@@ -267,8 +267,8 @@ class Database:
         ).fetchall()
 
 
-# ─── BEST PRACTICAL PREDICTOR ─────────────────────────────────
-class BestPredictor:
+# ─── SIGNAL-FIRST PREDICTOR ─────────────────────────────────────
+class SignalFirstPredictor:
     def __init__(self, db):
         self.db = db
 
@@ -327,13 +327,13 @@ class BestPredictor:
 
     def number_bias(self, nums):
         if not nums:
-            return 0.5, 5
+            return 0.5
         freq = Counter(nums)
         total = sum(freq.values())
         if total == 0:
-            return 0.5, 5
+            return 0.5
         p_big = sum(freq.get(i, 0) for i in range(5, 10)) / total
-        return clip(p_big), max(range(10), key=lambda i: freq.get(i, 0))
+        return clip(p_big)
 
     def predict(self, history, issue):
         if not history:
@@ -343,55 +343,43 @@ class BestPredictor:
                 "side": "BIG",
                 "num": 5,
                 "regime": "COLD",
-                "source": "Default anchor",
-                "experts": {},
+                "source": "signal-first default",
+                "experts": {}
             }
 
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
+
+        # strong signal-based prediction, no last-result dominance
         last_size = history[-1]["size"]
-        last_num = history[-1]["num"]
+        last_bias = 0.55 if last_size == 1 else 0.45  # only mild bias
 
-        # strong anchor on last result
-        last_bias = 0.82 if last_size == 1 else 0.18
-
-        # supporting signals
         p_exact = self.exact_pattern(seq)
         p_markov = self.markov(seq)
         p_regime = self.regime_strength(seq)
         p_trend = self.trend_strength(seq)
-        p_big, _ = self.number_bias(nums)
+        p_big = self.number_bias(nums)
 
-        # fusion
+        # Balanced weighting
         p = (
-            0.35 * last_bias +
-            0.20 * p_exact +
-            0.15 * p_markov +
-            0.15 * p_regime +
-            0.15 * p_trend
+            0.18 * last_bias +
+            0.25 * p_exact +
+            0.20 * p_markov +
+            0.20 * p_regime +
+            0.17 * p_trend +
+            0.20 * p_big
         )
+        p = clip(p)
 
-        if p_big >= 0.5:
-            p = 0.75 * p + 0.25 * p_big
-        else:
-            p = 0.75 * p + 0.25 * (1.0 - p_big)
-
+        # Regime smoothing
         reg = get_regime(seq)
         if reg == "RUN":
-            if last_size == 1:
-                p = clip(p + 0.05)
-            else:
-                p = clip(p - 0.05)
+            p = clip(0.65 * p + 0.35 * (0.82 if last_size == 1 else 0.18))
         elif reg == "ALT":
-            p = clip(0.5 + (p - 0.5) * 0.6)
+            p = clip(0.5 + (p - 0.5) * 0.8)
 
-        p = clip(p)
         side = "BIG" if p >= 0.5 else "SMALL"
         num = 5 if side == "BIG" else 4
-        if last_num >= 5 and side == "SMALL":
-            num = 5
-        if last_num < 5 and side == "BIG":
-            num = 4
 
         return {
             "issue": issue,
@@ -399,7 +387,7 @@ class BestPredictor:
             "side": side,
             "num": num,
             "regime": reg,
-            "source": "Anchor + regime + pattern + number prior",
+            "source": "signal-first",
             "experts": {
                 "last_result": last_bias,
                 "exact": p_exact,
@@ -430,7 +418,7 @@ class BestPredictor:
                 )
 
                 for name, val in pred.get("experts", {}).items():
-                    self.db.learn(f"expert:{name}:{pred.get('regime', 'N/A')}", val, y)
+                    self.db.learn(f"signal:{name}:{pred.get('regime', 'N/A')}", val, y)
 
                 msg = (
                     f"<b>{'✅ WIN' if won_side else '❌ LOSS'}</b>\n"
@@ -451,13 +439,13 @@ def format_prediction(p):
     color = "🔴" if side == "BIG" else "🔵"
 
     if conf >= 70:
-        quality = "🔥 HOT FOLLOW"
+        quality = "🔥 HOT"
         stake = "2x"
     elif conf >= 60:
         quality = "⭐ STRONG"
         stake = "1.5x"
     elif conf >= 55:
-        quality = "✅ STABLE"
+        quality = "✅ BALANCED"
         stake = "1x"
     else:
         quality = "📉 CAUTIOUS"
@@ -480,7 +468,7 @@ def format_prediction(p):
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = BestPredictor(db)
+        self.engine = SignalFirstPredictor(db)
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
 
@@ -540,7 +528,7 @@ class Runtime:
                                 "prediction",
                                 issue,
                                 format_prediction(pred),
-                                time.time() + 60.0,
+                                time.time() + 60.0
                             )
 
             except asyncio.CancelledError:
@@ -635,7 +623,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("Best practical predictor started")
+            LOG.info("Signal-first predictor started")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
 
