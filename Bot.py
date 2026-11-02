@@ -1,4 +1,4 @@
-# FTW PREDICTOR — EXACT NUMBER + SIDE MODEL (MAX TUNED V28 - FIXED)
+# FTW PREDICTOR — ULTRA RECOVERY + 120 WALK-FORWARD + EXACT NUMBER MODELS V30 (Fixed)
 # Python 3.10+
 # Deps: aiohttp
 
@@ -32,18 +32,18 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_exact_side_v36.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_ultra_wf_v37.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "2.0"))
     timeout: float = 18.0
-    max_history: int = 3500 # 🔥 8000 se 3500 kar diya taaki Render crash na ho
+    max_history: int = 3500 # 🔥 12000 se 3500 kar diya taaki Render crash na ho
     min_history: int = int(os.getenv("MIN_HISTORY", "180"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "12"))
-    learning_rate: float = 0.055
-    meta_lr: float = 0.065
+    learning_rate: float = 0.058
+    meta_lr: float = 0.07
     decay: float = 0.985
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (EXACT SIDE V28)"
+    name: str = "FTW PREDICTOR (WF ULTRA V30)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -56,7 +56,7 @@ class Config:
 
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOG = logging.getLogger("ftw_exact_side")
+LOG = logging.getLogger("ftw_wf_ultra")
 
 
 # ============================================================
@@ -235,7 +235,7 @@ def parse_history(payload):
 
 
 # ============================================================
-# QUANTUM PATTERN MATCHER
+# PATTERN MATCHER
 # ============================================================
 
 class QuantumTracker:
@@ -248,7 +248,6 @@ class QuantumTracker:
         n = len(seq)
         if n < 18:
             return []
-
         results = []
         for length in range(self.max_len, self.min_len - 1, -1):
             suffix = seq[-length:]
@@ -409,7 +408,7 @@ class Database:
 
 
 # ============================================================
-# RECOVERY MODEL
+# RECOVERY LOGIC: Ultra recovery on 1 loss only, no blind reversal
 # ============================================================
 
 class RecoveryController:
@@ -425,18 +424,54 @@ class RecoveryController:
 
         recent = sum(seq[-5:]) / max(1, len(seq[-5:])) if seq else 0.5
 
+        # 1 loss pe ultra recovery ON
         if loss_streak == 1:
+            # deep calculated anti-bias, not blind reversal
             if recent > 0.70:
-                return 0.25, True
+                return 0.24, True
             if recent < 0.30:
-                return 0.75, True
-            return 0.5 + (base_p - 0.5) * 0.6, True
+                return 0.76, True
+            return 0.5 + (base_p - 0.5) * 0.58, True
 
+        # 2+ loss me bhi deep reversal but controlled
         if recent > 0.72:
-            return 0.18, True
+            return 0.19, True
         if recent < 0.28:
-            return 0.82, True
-        return 0.5 + (base_p - 0.5) * 0.45, True
+            return 0.81, True
+        return 0.5 + (base_p - 0.5) * 0.44, True
+
+
+# ============================================================
+# 120-WALK FORWARD CALCULATION
+# ============================================================
+
+def walk_forward_120(history, p_raw):
+    if len(history) < 30:
+        return 0.0, 0.0
+
+    window = history[-120:]
+    sizes = [row["size"] for row in window]
+    nums = [row["num"] for row in window]
+
+    recent = sizes[-20:]
+    recent_big = sum(recent) / len(recent) if recent else 0.5
+    big_ratio = sum(sizes) / len(sizes) if sizes else 0.5
+    swing = abs(sum(sizes[-12:]) / max(1, len(sizes[-12:]))) - 0.5
+    entropy = entropy_bits(nums[-20:]) / 3.32
+    run_bias = 1.0 if run_length(sizes[-10:]) >= 4 else 0.0
+
+    # deep moving calibration
+    wf = 0.0
+    wf += (recent_big - 0.5) * 0.35
+    wf += (big_ratio - 0.5) * 0.25
+    wf += (swing * 0.7)
+    wf += (entropy - 0.5) * 0.4
+    wf += (run_bias - 0.5) * 0.35
+
+    # final walk-forward adjustment, controlled
+    wf = clip(wf, -0.50, 0.50)
+    p_adj = clip(p_raw + wf, 0.02, 0.98)
+    return p_adj, wf
 
 
 # ============================================================
@@ -444,25 +479,24 @@ class RecoveryController:
 # ============================================================
 
 def exact_number_model(history, side_bias):
-    n = len(history)
-    if n == 0:
+    if not history:
         return [1.0] * 10, "cold"
 
     nums = [x["num"] for x in history]
     sizes = [x["size"] for x in history]
-    recent = nums[-12:]
     regime = get_regime([x["size"] for x in history])
-
     base = [1.0] * 10
+
     freq = Counter(nums)
     for k in range(10):
-        base[k] *= 1.0 + 2.0 * freq.get(k, 0)
+        base[k] *= 1.0 + 2.8 * freq.get(k, 0)
 
+    recent = nums[-12:]
     recent_counter = Counter(recent)
     for k in range(10):
-        base[k] *= 1.0 + 1.5 * recent_counter.get(k, 0)
+        base[k] *= 1.0 + 1.6 * recent_counter.get(k, 0)
 
-    # transition matrix
+   # transitions
     trans = {}
     for i in range(1, len(nums)):
         prev = nums[i - 1]
@@ -470,37 +504,36 @@ def exact_number_model(history, side_bias):
         trans[(prev, cur)] = trans.get((prev, cur), 0) + 1
     last_num = nums[-1] if nums else 0
     for k in range(10):
-        base[k] *= 1.0 + 0.8 * trans.get((last_num, k), 0)
-        base[k] *= 1.0 + 0.4 * trans.get((k, last_num), 0)
+        base[k] *= 1.0 + 0.9 * trans.get((last_num, k), 0)
+        base[k] *= 1.0 + 0.45 * trans.get((k, last_num), 0)
 
     # side bias
     if side_bias >= 0.5:
         for k in range(0, 5):
             base[k] *= 0.35
         for k in range(5, 10):
-            base[k] *= 1.45
+            base[k] *= 1.5
     else:
         for k in range(5, 10):
             base[k] *= 0.35
         for k in range(0, 5):
-            base[k] *= 1.45
+            base[k] *= 1.5
 
-    # regime/tail specific tuning
+    # regime
     if regime == "RUN":
         if len(nums) >= 3:
-            last = nums[-1]
-            if last >= 5:
+            if nums[-1] >= 5:
                 for k in range(5, 10):
-                    base[k] *= 1.25
+                    base[k] *= 1.2
             else:
                 for k in range(0, 5):
-                    base[k] *= 1.25
+                    base[k] *= 1.2
     elif regime == "ALT":
         if len(nums) >= 4:
             a, b = nums[-2], nums[-1]
             for k in range(10):
                 if k in (a, b):
-                    base[k] *= 1.10
+                    base[k] *= 1.1
     elif regime == "IMBAL":
         avg = sum(recent) / len(recent)
         if avg >= 5:
@@ -510,25 +543,24 @@ def exact_number_model(history, side_bias):
             for k in range(0, 5):
                 base[k] *= 1.2
 
-    # recent size trend
     if len(sizes) >= 4:
-        recent_size_avg = sum(sizes[-6:]) / len(sizes[-6:])
-        if recent_size_avg > 0.7:
+        recent_size = sum(sizes[-6:]) / len(sizes[-6:])
+        if recent_size > 0.7:
             for k in range(5, 10):
-                base[k] *= 1.12
-        elif recent_size_avg < 0.3:
+                base[k] *= 1.15
+        elif recent_size < 0.3:
             for k in range(0, 5):
-                base[k] *= 1.12
+                base[k] *= 1.15
 
-    s = sum(base)
-    if s <= 0:
+    total = sum(base)
+    if total <= 0:
         return [1.0] * 10, regime
-    dist = [x / s for x in base]
+    dist = [x / total for x in base]
     return dist, regime
 
 
 # ============================================================
-# MAIN ENGINE
+# ENGINE
 # ============================================================
 
 EXPERT_NAMES = [
@@ -666,13 +698,16 @@ class Engine:
         alpha = min(self.db.get("meta_n", 0) / 100.0, 1.0)
         p_raw = alpha * p_meta + (1.0 - alpha) * p_avg
 
-        # recover after first loss immediately
+        # 120 walk-forward adjustment
+        p_raw, wf_bias = walk_forward_120(history, p_raw)
+
+        # ultra recovery on first loss
         if loss_streak >= 1:
             p_raw, recovery_used = self.recovery.adjust(seq, p_raw, loss_streak)
         else:
             recovery_used = False
 
-        # anti-stubborn
+        # anti-stubborn but not blind reversal
         if len(seq) >= 8:
             short = sum(seq[-6:]) / 6.0
             if short > 0.80 and p_raw > 0.66:
@@ -680,7 +715,7 @@ class Engine:
             if short < 0.20 and p_raw < 0.34:
                 p_raw = 0.34
 
-        # SIDE PROBABILITY
+        # side probability
         bucket = min(19, int(p_raw * 20))
         n_g, s_g = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
         p_cal = clip((32 * p_raw + s_g) / (32 + n_g))
@@ -688,38 +723,32 @@ class Engine:
         pred_side = "BIG" if p_cal >= 0.5 else "SMALL"
         valid_nums = range(5, 10) if pred_side == "BIG" else range(0, 5)
 
-        # EXACT NUMBER MODEL
+        # exact number distribution
         exact_dist, exact_regime = exact_number_model(history, p_cal)
-        # blend with learned exact number memory
         exact_db = self.db.get("exact_mem", {})
         if isinstance(exact_db, dict):
             for k in range(10):
-                exact_dist[k] = exact_dist[k] * 0.72 + float(exact_db.get(str(k), 0.1)) * 0.28
+                exact_dist[k] = exact_dist[k] * 0.75 + float(exact_db.get(str(k), 0.1)) * 0.25
 
-        # exact side enforcement
+        # enforce valid side range
         for k in range(10):
             if k in valid_nums:
                 exact_dist[k] *= 1.5
             else:
                 exact_dist[k] *= 0.35
 
-        # normalize exact weights
-        total_exact = sum(exact_dist)
-        if total_exact <= 0:
+        total = sum(exact_dist)
+        if total <= 0:
             exact_dist = [0.1] * 10
-            total_exact = 10.0
-        exact_dist = [x / total_exact for x in exact_dist]
+            total = 10.0
+        exact_dist = [x / total for x in exact_dist]
 
         num_pred = max(range(10), key=lambda k: exact_dist[k])
         num_conf = exact_dist[num_pred]
 
-        # if exact prediction illegal due to side, adjust
         if num_pred not in valid_nums:
             num_pred = max(valid_nums, key=lambda k: exact_dist[k])
-
-        if num_pred not in valid_nums:
-            num_pred = valid_nums[0]
-            num_conf = 0.18
+            num_conf = exact_dist[num_pred]
 
         prev_regime = get_regime(seq[:-1]) if len(seq) > 1 else "N/A"
         trend_shift = f"{prev_regime} ➡️ {regime}" if prev_regime != regime else None
@@ -732,7 +761,7 @@ class Engine:
             "num": num_pred,
             "num_probability": num_conf,
             "regime": regime,
-            "source": "🎯 Exact Number + Side Engine",
+            "source": "🎯 Ultra WF Exact Engine",
             "trend_shift": trend_shift,
             "pattern_str": _pattern_str(patterns),
             "edge": abs(p_cal - 0.5),
@@ -745,12 +774,13 @@ class Engine:
             "patterns": [{"key": k, "p": p, "support": s} for _, p, s, _, k in patterns],
             "exact_distribution": exact_dist,
             "exact_regime": exact_regime,
+            "wf_bias": wf_bias,
         }
-
         return payload
 
     def settle(self, history):
         lookup = {r["issue"]: r for r in history}
+
         if history:
             sig = f"{history[0]['issue']}-{history[-1]['issue']}-{len(history)}"
             if self.db.get("ngram_sig") != sig:
@@ -767,15 +797,12 @@ class Engine:
                 self.db.set("num_freq", num_freq)
                 self.db.set("ngram_sig", sig)
 
-        # learn exact number memory
         if history:
             exact_mem = self.db.get("exact_mem", {})
-            counts = {}
-            for row in history:
-                num = str(row["num"])
-                counts[num] = counts.get(num, 0) + 1
             for k in range(10):
-                exact_mem[str(k)] = float(counts.get(str(k), 0)) / max(1, len(history))
+                exact_mem[str(k)] = float(exact_mem.get(str(k), 0.1))
+            for row in history:
+                exact_mem[str(row["num"])] = exact_mem.get(str(row["num"]), 0.1) + 1.0
             self.db.set("exact_mem", exact_mem)
 
         pending = self.db.c.execute(
@@ -829,7 +856,6 @@ class Engine:
                 n, s = self.db.get(f"cal20:global:{bucket}", [0.0, 0.0])
                 self.db.set(f"cal20:global:{bucket}", [0.995 * n + 1, 0.995 * s + y])
 
-                # learn exact number result
                 exact_mem = self.db.get("exact_mem", {})
                 for k in range(10):
                     exact_mem[str(k)] = float(exact_mem.get(str(k), 0.1))
@@ -858,10 +884,11 @@ def format_prediction(p):
     rec_tag = ""
     if p.get("is_recovery"):
         if p.get("loss_streak") == 1:
-            rec_tag = "⚠️ <b>RECOVERY LEVEL 1</b> ⚠️\n"
+            rec_tag = "⚠️ <b>ULTRA RECOVERY L1</b> ⚠️\n"
         else:
-            rec_tag = "🚨 <b>ULTRA RECOVERY LEVEL 2</b> 🚨\n"
+            rec_tag = "🚨 <b>ULTRA RECOVERY L2</b> 🚨\n"
 
+    wf = f"\n📈 <b>WF120:</b> {p.get('wf_bias', 0):+.3f}" if 'wf_bias' in p else ""
     shift = f"\n🔄 <b>TREND SHIFT:</b> {escape(p['trend_shift'])}" if p.get("trend_shift") else ""
     pat = f"\n🧩 <b>PATTERN:</b> {p.get('pattern_str', 'None')}" if p.get("pattern_str") and p.get("pattern_str") != "None" else ""
 
@@ -874,7 +901,7 @@ def format_prediction(p):
         f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
         f"🏆 <b>QUALITY:</b> {quality} (Stake: {stake})\n"
         f"🌊 <b>REGIME:</b> {escape(p.get('regime', 'N/A'))}\n"
-        f"🧠 <b>SOURCE:</b> {p.get('source', 'Unknown')}{shift}{pat}\n"
+        f"🧠 <b>SOURCE:</b> {p.get('source', 'Unknown')}{wf}{shift}{pat}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
 
@@ -933,7 +960,6 @@ class Runtime:
                     issue = str(latest + 1)
                     if not self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone():
                         pred = self.engine.predict(history, issue)
-                        # NO SKIP
                         with self.db.transaction():
                             self.db.c.execute(
                                 "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
