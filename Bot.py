@@ -1,5 +1,7 @@
 # bot.py
-# Full fixed working version
+# FINAL SIGNAL-FIRST VERSION
+# NO LAST-RESULT BIAS
+# Pure signal driven predictor
 # Python 3.10+
 # pip install aiohttp
 
@@ -29,15 +31,13 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_fixed.db")
+    db_path: str = os.getenv("DB_PATH", "signal_only_final.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
     max_history: int = 4000
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
-    learning_rate: float = 0.06
-    decay: float = 0.985
-    name: str = "Fixed Predictor"
+    name: str = "Signal Only Predictor"
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
@@ -49,10 +49,10 @@ class Config:
 
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOG = logging.getLogger("predictor")
+LOG = logging.getLogger("signal")
 
 
-# ─── HELPERS ──────────────────────────────────────────────────
+# ─── HELPERS ───────────────────────────────────────────────────
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
 
@@ -206,15 +206,23 @@ class Database:
                 old = self.c.execute("SELECT num FROM history WHERE issue=?", (r["issue"],)).fetchone()
                 if old and old["num"] != r["num"]:
                     raise ValueError(f"Source changed settled issue {r['issue']}")
-                self.c.execute(
-                    "INSERT OR IGNORE INTO history VALUES (?, ?)",
-                    (r["issue"], r["num"]),
-                )
+                self.c.execute("INSERT OR IGNORE INTO history VALUES (?,?)", (r["issue"], r["num"]))
             self.c.execute(
                 "DELETE FROM history WHERE issue NOT IN "
                 "(SELECT issue FROM history ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?)",
                 (CFG.max_history,),
             )
+
+    def queue(self, kind, issue, text, expires=None):
+        self.c.execute(
+            "INSERT INTO outbox(kind, issue, text, created, expires) VALUES (?,?,?,?,?)",
+            (kind, issue, text, time.time(), expires),
+        )
+
+    def get_pending_predictions(self):
+        return self.c.execute(
+            "SELECT issue, payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)"
+        ).fetchall()
 
     def memory(self, key):
         row = self.c.execute("SELECT * FROM models WHERE key=?", (key,)).fetchone()
@@ -233,42 +241,9 @@ class Database:
             (key, n, loss, inv, failures),
         )
 
-    def adapt(self, key, probability):
-        m = self.memory(key)
-        n = m["n"]
-        if n < 1:
-            return probability, 0.75, False
 
-        brier = m["loss"] / n
-        inv = m["inverse_loss"] / n
-        flipped = (inv + 0.025 < brier) and (brier > 0.24) and (m["failures"] >= 3)
-        effective_loss = inv if flipped else brier
-        p = (1 - probability) if flipped else probability
-
-        reliability = clip((0.25 - effective_loss) / 0.12, 0.0, 1.0)
-        maturity = min(n / 60.0, 1.0)
-        shrink = (1 - maturity) * 0.7 + maturity * reliability
-        p = 0.5 + (p - 0.5) * shrink
-
-        weight = clip(math.exp(-6 * (effective_loss - 0.22)), 0.18, 2.2)
-        if m["failures"] >= 4 and not flipped:
-            weight *= 0.55
-        return clip(p), weight, flipped
-
-    def queue(self, kind, issue, text, expires=None):
-        self.c.execute(
-            "INSERT INTO outbox(kind, issue, text, created, expires) VALUES (?,?,?,?,?)",
-            (kind, issue, text, time.time(), expires),
-        )
-
-    def get_pending_predictions(self):
-        return self.c.execute(
-            "SELECT issue, payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)"
-        ).fetchall()
-
-
-# ─── PREDICTOR ─────────────────────────────────────────────────
-class Predictor:
+# ─── SIGNAL-ONLY PREDICTOR ─────────────────────────────────────
+class SignalOnlyPredictor:
     def __init__(self, db):
         self.db = db
 
@@ -283,17 +258,16 @@ class Predictor:
                 if tuple(seq[i - length:i]) == suffix:
                     obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 300.0)))
             if len(obs) >= 3:
-                p, eff_n = weighted_probability(obs)
-                candidates.append((abs(p - 0.5) * math.sqrt(eff_n), p))
+                p, _ = weighted_probability(obs)
+                candidates.append(p)
         if not candidates:
             return 0.5
-        candidates.sort(reverse=True)
-        return candidates[0][1]
+        return sum(candidates) / len(candidates)
 
     def markov(self, seq):
         if len(seq) < 8:
             return 0.5
-        best = 0.5
+        vals = []
         for order in (1, 2, 3, 4):
             suffix = tuple(seq[-order:])
             obs = []
@@ -302,10 +276,10 @@ class Predictor:
                     obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 300.0)))
             if len(obs) >= 3:
                 p, _ = weighted_probability(obs)
-                best = p
-        return best
+                vals.append(p)
+        return sum(vals) / len(vals) if vals else 0.5
 
-    def regime_strength(self, seq):
+    def regime_signal(self, seq):
         reg = get_regime(seq)
         if len(seq) < 20:
             return 0.5
@@ -318,22 +292,17 @@ class Predictor:
             return p
         return 0.5
 
-    def trend_strength(self, seq):
+    def trend_signal(self, seq):
         if not seq:
             return 0.5
         feats = trend_features(seq)
         z = sum(feats)
         return clip(1.0 / (1.0 + math.exp(-z / 8.0)))
 
-    def number_side_bias(self, nums):
-        if not nums:
+    def big_share(self, seq):
+        if not seq:
             return 0.5
-        freq = Counter(nums)
-        total = sum(freq.values())
-        if total == 0:
-            return 0.5
-        p_big = sum(freq.get(i, 0) for i in range(5, 10)) / total
-        return clip(p_big)
+        return mean(seq[-30:])  # 0..1, where 1 = big
 
     def predict(self, history, issue):
         if not history:
@@ -349,60 +318,64 @@ class Predictor:
 
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
-
-        last_size = history[-1]["size"]
-        last_bias = 0.52 if last_size == 1 else 0.48
+        reg = get_regime(seq)
 
         p_exact = self.exact_pattern(seq)
         p_markov = self.markov(seq)
-        p_regime = self.regime_strength(seq)
-        p_trend = self.trend_strength(seq)
-        p_big = self.number_side_bias(nums)
+        p_regime = self.regime_signal(seq)
+        p_trend = self.trend_signal(seq)
+        p_bigshare = self.big_share(seq)
 
+        # no last-result bias at all
         p = (
-            0.18 * last_bias +
-            0.24 * p_exact +
-            0.20 * p_markov +
+            0.28 * p_exact +
+            0.24 * p_markov +
             0.20 * p_regime +
             0.18 * p_trend +
-            0.20 * p_big
+            0.10 * p_bigshare
         )
         p = clip(p)
 
-        reg = get_regime(seq)
+        # keep neutral near 0.5
+        if abs(p - 0.5) < 0.05:
+            p = 0.5
+
+        # regime tune only, no previous result dependency
         if reg == "RUN":
-            if last_size == 1:
-                p = clip(p + 0.08)
-            else:
-                p = clip(p - 0.08)
+            p = clip(0.5 + (p - 0.5) * 1.2)
         elif reg == "ALT":
             p = clip(0.5 + (p - 0.5) * 0.7)
 
         side = "BIG" if p >= 0.5 else "SMALL"
+
         valid_range = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
-        dist = [1.0] * 10
         freq = Counter(nums)
+        dist = [1.0] * 10
         total = len(nums)
         if total > 0:
             for i in range(10):
                 dist[i] += 6.0 * (freq.get(i, 0) / total)
+        recent = nums[-10:]
+        if recent:
+            for i in range(10):
+                dist[i] += 2.0 * (recent.count(i) / len(recent))
+
         score = {n: dist[n] for n in valid_range}
         best_num = max(valid_range, key=lambda n: score[n])
 
         return {
             "issue": issue,
-            "p": clip(p),
+            "p": p,
             "side": side,
             "num": best_num,
             "regime": reg,
-            "source": "practical",
+            "source": "signal-only",
             "experts": {
-                "last_result": last_bias,
                 "exact": p_exact,
                 "markov": p_markov,
                 "regime": p_regime,
                 "trend": p_trend,
-                "big_prior": p_big,
+                "big_share": p_bigshare,
             },
         }
 
@@ -424,7 +397,6 @@ class Predictor:
                     "UPDATE predictions SET status=?, actual=? WHERE issue=?",
                     ("WIN" if won_side else "LOSS", actual["num"], issue),
                 )
-
                 for name, val in pred.get("experts", {}).items():
                     self.db.learn(f"expert:{name}:{pred.get('regime', 'N/A')}", val, y)
 
@@ -476,7 +448,7 @@ def format_prediction(p):
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = Predictor(db)
+        self.engine = SignalOnlyPredictor(db)
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
 
@@ -629,7 +601,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("Fixed predictor started")
+            LOG.info("Signal only predictor started")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
 
