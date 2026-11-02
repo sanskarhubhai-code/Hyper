@@ -1,4 +1,4 @@
-# bot.py — FTW VIP PREDICTOR (FINAL CLEAN VERSION)
+# bot.py — FTW VIP PREDICTOR (ADVANCED BEAST ENGINE)
 # Python 3.10+ | aiohttp
 
 import asyncio
@@ -32,7 +32,7 @@ class Config:
     ) or (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_final.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_beast.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -44,7 +44,7 @@ class Config:
     decay: float = 0.988
     max_pattern: int = 20
     delivery_ttl: float = 55.0
-    name: str = "FTW VIP PREDICTOR (FINAL)"
+    name: str = "FTW VIP PREDICTOR (BEAST)"
     win_sticker: str = os.getenv("WIN_STICKER", "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E")
     loss_sticker: str = os.getenv("LOSS_STICKER", "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E")
     jack_sticker: str = os.getenv("JACK_STICKER", "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E")
@@ -62,7 +62,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 LOG = logging.getLogger("predictor")
 
 # -----------------------------
-# HELPERS
+# UTILS
 # -----------------------------
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
@@ -113,6 +113,60 @@ def weighted_probability(observations):
         return 0.5, 0.0
     probability = (4 + sum(y * w for y, w in observations)) / (8 + sw)
     return probability, effective_n
+
+def ema(seq, k):
+    if not seq:
+        return 0.5
+    a = 2.0 / (k + 1)
+    val = seq[0]
+    for x in seq[1:]:
+        val = a * x + (1.0 - a) * val
+    return val
+
+def trend_features(seq):
+    if not seq:
+        return [0.0] * 16
+
+    def mean(k):
+        arr = seq[-k:]
+        return sum(arr) / len(arr) if arr else 0.5
+
+    def std(k):
+        arr = seq[-k:]
+        if len(arr) < 2:
+            return 0.0
+        m = sum(arr) / len(arr)
+        return math.sqrt(sum((x - m) ** 2 for x in arr) / len(arr))
+
+    tail = seq[-12:]
+    runs = run_length(seq)
+    recent_avg = sum(seq[-6:]) / len(seq[-6:])
+    recent_short = sum(seq[-3:]) / len(seq[-3:])
+    alternation = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
+    ema12 = ema(seq, 12)
+    ema6 = ema(seq, 6)
+
+    return [
+        1.0,
+        2 * mean(3) - 1,
+        2 * mean(5) - 1,
+        2 * mean(10) - 1,
+        2 * recent_avg - 1,
+        2 * recent_short - 1,
+        (2 * seq[-1] - 1),
+        (2 * alternation - 1),
+        (2 * ema12 - 1),
+        (2 * ema6 - 1),
+        (2 * std(5) - 1),
+        (2 * std(10) - 1),
+        (min(runs, 10) / 10.0) * (2 * seq[-1] - 1),
+        (sum(seq[-10:]) / 10.0) - 0.5,
+        (sum(seq[-5:]) / 5.0) - 0.5,
+        (ema12 - ema6) * 2,
+    ]
+
+def logistic(weights, features):
+    return sigmoid(sum(w * x for w, x in zip(weights, features)))
 
 def suffix_count(seq, length):
     if len(seq) < length:
@@ -178,7 +232,6 @@ def regime_counts(history):
 def strong_reversal_allowed(history, current_regime):
     if len(history) < 12:
         return False
-
     seq = [x["size"] for x in history]
     tail = seq[-12:]
     recent_big_ratio = sum(tail) / len(tail)
@@ -190,43 +243,8 @@ def strong_reversal_allowed(history, current_regime):
                 return True
     return False
 
-def weighted_state_predict(history):
-    seq = [x["size"] for x in history]
-    if not seq:
-        return 0.5, 0.0, "MIXED"
-
-    reg = get_regime(seq)
-    reg_map = regime_counts(history)
-    reg_counts = reg_map.get(reg, {"big": 1, "small": 1, "total": 2})
-    reg_prob = (reg_counts["big"] / reg_counts["total"]) if reg_counts["total"] else 0.5
-
-    best = {"score": -1e9, "big_prob": 0.5, "total": 0}
-    for L in range(1, min(8, len(seq)) + 1):
-        suffix = tuple(seq[-L:])
-        cnt = 0
-        big_count = 0
-        for i in range(len(seq) - L):
-            cand = tuple(seq[i:i+L])
-            if cand == suffix:
-                cnt += 1
-                if seq[i+L] == 1:
-                    big_count += 1
-        if cnt > 0:
-            p = big_count / cnt
-            score = cnt * (abs(p - 0.5) + 0.2)
-            if score > best["score"]:
-                best = {"score": score, "big_prob": p, "total": cnt}
-
-    tail = seq[-8:]
-    tail_prob = sum(tail) / len(tail)
-
-    final = 0.45 * (best["big_prob"] if best["total"] else 0.5) + 0.35 * reg_prob + 0.20 * tail_prob
-    final = clip(final, 0.02, 0.98)
-
-    return final, abs(final - 0.5), reg
-
 # -----------------------------
-# HISTORY PARSER
+# PARSE HISTORY
 # -----------------------------
 def parse_history(payload):
     obj = payload
@@ -365,7 +383,6 @@ class Database:
         )
 
     def adapt(self, key, probability):
-        # no inversion at all
         m = self.memory(key)
         n = m["n"]
         if n < 1:
@@ -412,15 +429,12 @@ class Engine:
     def __init__(self, db):
         self.db = db
 
-    def mine_patterns(self, seq):
+    def build_suffix_model(self, seq):
+        model = []
         if not seq:
-            return []
+            return model
 
-        results = []
-        max_len = min(CFG.max_pattern, len(seq) // 2)
-        for L in range(1, max_len + 1):
-            if len(seq) < L * 2:
-                continue
+        for L in range(1, min(8, len(seq)) + 1):
             suffix = tuple(seq[-L:])
             count = 0
             big_count = 0
@@ -430,12 +444,26 @@ class Engine:
                     count += 1
                     if seq[i+L] == 1:
                         big_count += 1
-            if count >= CFG.min_support:
-                p = big_count / count
-                results.append((L, p, count, suffix))
+            if count > 0:
+                model.append((L, suffix, count, big_count / count))
+        return sorted(model, key=lambda x: (x[2], abs(x[3]-0.5)), reverse=True)[:5]
 
-        results.sort(key=lambda x: (abs(x[1] - 0.5), x[2]), reverse=True)
-        return results[:8]
+    def build_markov_model(self, seq):
+        model = []
+        for L in range(1, 5):
+            if len(seq) <= L:
+                continue
+            total = 0
+            big_after = 0
+            for i in range(len(seq) - L):
+                state = tuple(seq[i:i+L])
+                nxt = seq[i+L]
+                total += 1
+                if nxt == 1:
+                    big_after += 1
+            if total:
+                model.append((L, big_after / total, total))
+        return model
 
     def predict(self, history, issue):
         seq = [x["size"] for x in history]
@@ -461,32 +489,39 @@ class Engine:
         reg_counts = reg_map.get(reg, {"big": 1, "small": 1, "total": 2})
         reg_prob = (reg_counts["big"] / reg_counts["total"]) if reg_counts["total"] else 0.5
 
-        pattern_score = 0.5
-        pat_list = []
-        if self.mine_patterns(seq):
-            pattern_candidates = []
-            for L, p, count, suffix in self.mine_patterns(seq):
-                pattern_candidates.append((p, min(1.0, count / 30.0), suffix))
-            total_w = sum(w for _, w, _ in pattern_candidates)
-            if total_w:
-                pattern_score = sum(p * w for p, w, _ in pattern_candidates) / total_w
-            pattern_score = clip(pattern_score, 0.02, 0.98)
-            for L, p, count, suffix in self.mine_patterns(seq)[:5]:
-                pat_list.append({"key": f"suffix:{L}:{suffix}", "p": p, "support": count})
+        suffix_model = self.build_suffix_model(seq)
+        suffix_weight_total = 0.0
+        suffix_weighted_prob = 0.0
+        suffix_patterns = []
+        for L, suffix, count, p in suffix_model:
+            w = min(1.0, count / 20.0) * (1.0 + (L * 0.15))
+            suffix_weight_total += w
+            suffix_weighted_prob += p * w
+            suffix_patterns.append({"key": f"suffix:{L}:{suffix}", "p": p, "support": count})
 
-        suffix_scores = recent_suffix_scores(history, max_len=8)
-        suffix_score = 0.5
-        if suffix_scores:
-            best = max(suffix_scores.items(), key=lambda kv: kv[1]["total"])
-            _, data = best
-            suffix_score = data["big"]
+        suffix_prob = suffix_weighted_prob / suffix_weight_total if suffix_weight_total else 0.5
+
+        markov_model = self.build_markov_model(seq)
+        markov_prob = 0.5
+        if markov_model:
+            total_w = sum(w for _, _, w in markov_model)
+            markov_prob = sum(p * w for _, p, w in markov_model) / total_w if total_w else 0.5
 
         tail = seq[-8:]
         tail_prob = sum(tail) / len(tail)
 
-        combined = 0.42 * pattern_score + 0.28 * reg_prob + 0.20 * suffix_score + 0.10 * tail_prob
-        combined = clip(combined, 0.02, 0.98)
+        recent_suffix = recent_suffix_scores(history, max_len=8)
+        recent_best_prob = 0.5
+        if recent_suffix:
+            best = max(recent_suffix.items(), key=lambda kv: kv[1]["total"])
+            _, data = best
+            recent_best_prob = data["big"]
 
+        # exact final blended probability
+        p_big = 0.35 * suffix_prob + 0.25 * reg_prob + 0.20 * markov_prob + 0.12 * tail_prob + 0.08 * recent_best_prob
+        p_big = clip(p_big, 0.02, 0.98)
+
+        # recovery logic
         recovery = self.db.get_recovery_state()
         loss_streak = max(0, int(recovery["consecutive_losses"]))
         recovery_mode = bool(recovery["recovery_mode"]) or loss_streak > 0
@@ -494,13 +529,14 @@ class Engine:
 
         if recovery_mode:
             if strong_reversal:
-                combined = clip(combined - 0.10, 0.02, 0.98)
+                p_big = clip(p_big - 0.10, 0.02, 0.98)
             else:
-                combined = clip(combined + 0.05 * min(loss_streak + 1, 5), 0.02, 0.98)
+                p_big = clip(p_big + 0.05 * min(loss_streak + 1, 5), 0.02, 0.98)
 
-        side = "BIG" if combined >= 0.5 else "SMALL"
+        # choose side
+        side = "BIG" if p_big >= 0.5 else "SMALL"
 
-        # exact number-based distribution
+        # exact number selection
         num_dist = [1.0] * 10
         if nums:
             for L in range(1, min(8, len(nums)) + 1):
@@ -511,8 +547,8 @@ class Engine:
                     cand = tuple(nums[i:i+L])
                     if cand == suffix:
                         count += 1
-                        v = nums[i+L]
-                        dist[v] = dist.get(v, 0) + 1
+                        nxt = nums[i+L]
+                        dist[nxt] = dist.get(nxt, 0) + 1
                 if count > 0:
                     for n in range(10):
                         num_dist[n] *= 1.0 + 2.0 * dist.get(n, 0) / max(1, count)
@@ -526,23 +562,23 @@ class Engine:
         probs = [x / total_num for x in num_dist]
         num_pred = max(valid_nums, key=lambda n: probs[n])
 
-        edge = abs(combined - 0.5)
-        confidence = max(combined, 1.0 - combined)
+        edge = abs(p_big - 0.5)
+        confidence = max(p_big, 1.0 - p_big)
         if recovery_mode:
             confidence = min(0.99, confidence + 0.06)
             edge = max(edge, 0.12)
 
         return {
             "issue": issue,
-            "p": combined,
-            "p_raw": combined,
+            "p": p_big,
+            "p_raw": p_big,
             "side": side,
             "num": num_pred,
             "edge": edge,
             "confidence": confidence,
             "regime": reg,
-            "source": "📊 State Probability Engine",
-            "patterns": pat_list,
+            "source": "📊 Advanced State Engine",
+            "patterns": suffix_patterns,
             "recovery_mode": recovery_mode,
             "strong_reversal": strong_reversal,
         }
@@ -563,10 +599,9 @@ def format_prediction(p):
     if p.get("regime"):
         shift = f"\n🌊 <b>REGIME:</b> {escape(p['regime'])}"
 
-    pattern = p.get("patterns", [])
     pattern_text = ""
-    if pattern:
-        first = pattern[0]
+    if p.get("patterns"):
+        first = p["patterns"][0]
         pattern_text = f"\n🧩 <b>PATTERN:</b> <code>{escape(first['key'])}</code>"
 
     rec_txt = ""
