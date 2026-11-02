@@ -1,8 +1,8 @@
 # bot.py
-# SIGNAL-FIRST PREDICTOR
-# Last result is NOT dominant. It is only a mild bias.
-# Better for weak/noisy sequence.
-# Includes: prediction + settlement + Telegram result output
+# QUANTUM-INSPIRED ZERO-DRIFT PREDICTOR
+# A to Z core
+# Python 3.10+
+# pip install aiohttp
 
 import asyncio
 import contextlib
@@ -30,7 +30,7 @@ class Config:
     urls: tuple = (
         "https://sky-predictor-1012593186417.asia-southeast1.run.app/api/wingo-history-1m-1000",
     )
-    db_path: str = os.getenv("DB_PATH", "signal_first_predictor.db")
+    db_path: str = os.getenv("DB_PATH", "quantum_zero_drift.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
@@ -38,7 +38,9 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "120"))
     learning_rate: float = 0.06
     decay: float = 0.985
-    name: str = "Signal First Predictor"
+    drift_window: int = 20
+    drift_threshold: float = 0.18
+    name: str = "Quantum Zero Drift Engine"
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
     jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
@@ -50,10 +52,10 @@ class Config:
 
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-LOG = logging.getLogger("predictor")
+LOG = logging.getLogger("qzd")
 
 
-# ─── UTILITIES ──────────────────────────────────────────────
+# ─── UTILS ─────────────────────────────────────────────────────
 def clip(x, low=0.02, high=0.98):
     return max(low, min(high, float(x)))
 
@@ -149,6 +151,7 @@ def trend_features(seq):
     fast = tail_mean(5)
     mid = tail_mean(10)
     slow = tail_mean(24)
+
     reg = get_regime(seq)
     reg_map = {"COLD": 0.0, "MIXED": 0.25, "ALT": 0.5, "IMBAL": 0.75, "RUN": 1.0}
     regime_value = reg_map.get(reg, 0.5)
@@ -267,8 +270,8 @@ class Database:
         ).fetchall()
 
 
-# ─── SIGNAL-FIRST PREDICTOR ─────────────────────────────────────
-class SignalFirstPredictor:
+# ─── QUANTUM-INSPIRED ZERO-DRIFT ENGINE ───────────────────────
+class QuantumZeroDriftEngine:
     def __init__(self, db):
         self.db = db
 
@@ -305,12 +308,12 @@ class SignalFirstPredictor:
                 best = p
         return best
 
-    def regime_strength(self, seq):
+    def regime_signal(self, seq):
         reg = get_regime(seq)
-        if len(seq) < 20:
+        if len(seq) < 18:
             return 0.5
         obs = []
-        for i in range(20, len(seq)):
+        for i in range(18, len(seq)):
             if get_regime(seq[max(0, i - 96):i]) == reg:
                 obs.append((seq[i], 0.5 ** ((len(seq) - 1 - i) / 300.0)))
         if len(obs) >= 3:
@@ -318,22 +321,39 @@ class SignalFirstPredictor:
             return p
         return 0.5
 
-    def trend_strength(self, seq):
+    def trend_signal(self, seq):
         if not seq:
             return 0.5
         feats = trend_features(seq)
         z = sum(feats)
         return clip(1.0 / (1.0 + math.exp(-z / 8.0)))
 
-    def number_bias(self, nums):
+    def number_distribution(self, nums):
         if not nums:
-            return 0.5
+            return [0.1] * 10
         freq = Counter(nums)
-        total = sum(freq.values())
-        if total == 0:
-            return 0.5
-        p_big = sum(freq.get(i, 0) for i in range(5, 10)) / total
-        return clip(p_big)
+        dist = [1.0] * 10
+        total = len(nums)
+        if total > 0:
+            for i in range(10):
+                dist[i] += 6.0 * (freq.get(i, 0) / total)
+        if len(nums) >= 4:
+            recent = nums[-8:]
+            for i in range(10):
+                dist[i] += 1.5 * (recent.count(i) / len(recent))
+        s = sum(dist)
+        return [x / s for x in dist]
+
+    def estimate_drift(self, seq):
+        if len(seq) < 8:
+            return 0.0
+        recent = seq[-CFG.drift_window:]
+        if len(recent) < 2:
+            return 0.0
+        # drift: how much recent mean differs from full history mean
+        base = mean(seq[:-len(recent)]) if len(seq) > len(recent) else mean(seq[:max(1, len(seq)//2)])
+        current = mean(recent)
+        return abs(current - base)
 
     def predict(self, history, issue):
         if not history:
@@ -343,51 +363,63 @@ class SignalFirstPredictor:
                 "side": "BIG",
                 "num": 5,
                 "regime": "COLD",
-                "source": "signal-first default",
-                "experts": {}
+                "source": "default",
+                "experts": {},
             }
 
         seq = [r["size"] for r in history]
         nums = [r["num"] for r in history]
+        reg = get_regime(seq)
+        drift = self.estimate_drift(seq)
 
-        # strong signal-based prediction, no last-result dominance
-        last_size = history[-1]["size"]
-        last_bias = 0.55 if last_size == 1 else 0.45  # only mild bias
-
+        # experts
         p_exact = self.exact_pattern(seq)
         p_markov = self.markov(seq)
-        p_regime = self.regime_strength(seq)
-        p_trend = self.trend_strength(seq)
-        p_big = self.number_bias(nums)
+        p_regime = self.regime_signal(seq)
+        p_trend = self.trend_signal(seq)
+        p_big = sum(self.number_distribution(nums)[5:])  # probability of BIG class
+        base_p = 0.5 * p_exact + 0.2 * p_markov + 0.2 * p_regime + 0.1 * p_trend
 
-        # Balanced weighting
-        p = (
-            0.18 * last_bias +
-            0.25 * p_exact +
-            0.20 * p_markov +
-            0.20 * p_regime +
-            0.17 * p_trend +
-            0.20 * p_big
-        )
+        # zero-drift correction
+        # if drift is high, dampen confident direction and shift to balanced
+        if drift > CFG.drift_threshold:
+            base_p = 0.5 + (base_p - 0.5) * 0.65
+
+        # mild bias only if there is some real signal
+        last_size = history[-1]["size"]
+        last_bias = 0.52 if last_size == 1 else 0.48
+
+        # fusion
+        p = 0.20 * last_bias + 0.25 * p_exact + 0.20 * p_markov + 0.20 * p_regime + 0.15 * p_trend + 0.20 * p_big
         p = clip(p)
 
-        # Regime smoothing
-        reg = get_regime(seq)
+        # regime posture
         if reg == "RUN":
-            p = clip(0.65 * p + 0.35 * (0.82 if last_size == 1 else 0.18))
+            if last_size == 1:
+                p = clip(p + 0.08)
+            else:
+                p = clip(p - 0.08)
         elif reg == "ALT":
-            p = clip(0.5 + (p - 0.5) * 0.8)
+            p = clip(0.5 + (p - 0.5) * 0.75)
 
         side = "BIG" if p >= 0.5 else "SMALL"
-        num = 5 if side == "BIG" else 4
+        valid = list(range(5, 10)) if side == "BIG" else list(range(0, 5))
+        dist = self.number_distribution(nums)
+        score = {n: dist[n] for n in valid}
+        best_num = max(valid, key=lambda n: score[n])
+
+        # if side confidence low, select nearest valid number
+        if p < 0.55 and best_num not in valid:
+            best_num = 5 if side == "BIG" else 4
 
         return {
             "issue": issue,
             "p": p,
             "side": side,
-            "num": num,
+            "num": best_num,
             "regime": reg,
-            "source": "signal-first",
+            "source": "Quantum-inspired zero-drift ensemble",
+            "drift": drift,
             "experts": {
                 "last_result": last_bias,
                 "exact": p_exact,
@@ -406,7 +438,7 @@ class SignalFirstPredictor:
             if issue not in lookup:
                 continue
 
-            pred = json.loads(row["payload"])
+            pred = json.loads(row["payload")]
             actual = lookup[issue]
             y = actual["size"]
             won_side = int(pred["p"] >= 0.5) == y
@@ -418,7 +450,7 @@ class SignalFirstPredictor:
                 )
 
                 for name, val in pred.get("experts", {}).items():
-                    self.db.learn(f"signal:{name}:{pred.get('regime', 'N/A')}", val, y)
+                    self.db.learn(f"{pred.get('source','default')}:{name}:{pred.get('regime', 'N/A')}", val, y)
 
                 msg = (
                     f"<b>{'✅ WIN' if won_side else '❌ LOSS'}</b>\n"
@@ -439,7 +471,7 @@ def format_prediction(p):
     color = "🔴" if side == "BIG" else "🔵"
 
     if conf >= 70:
-        quality = "🔥 HOT"
+        quality = "🔥 QUANTUM HOT"
         stake = "2x"
     elif conf >= 60:
         quality = "⭐ STRONG"
@@ -468,7 +500,7 @@ def format_prediction(p):
 class Runtime:
     def __init__(self, db):
         self.db = db
-        self.engine = SignalFirstPredictor(db)
+        self.engine = QuantumZeroDriftEngine(db)
         self.stop = asyncio.Event()
         self.last_fetch = 0.0
 
@@ -524,12 +556,7 @@ class Runtime:
                                 "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
                                 (issue, time.time(), "PENDING", json.dumps(pred))
                             )
-                            self.db.queue(
-                                "prediction",
-                                issue,
-                                format_prediction(pred),
-                                time.time() + 60.0
-                            )
+                            self.db.queue("prediction", issue, format_prediction(pred), time.time() + 60.0)
 
             except asyncio.CancelledError:
                 raise
@@ -623,7 +650,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("Signal-first predictor started")
+            LOG.info("Quantum Zero Drift Engine started")
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
 
