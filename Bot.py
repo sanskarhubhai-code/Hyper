@@ -1,19 +1,16 @@
 """
-FTW Predictor V33 — safer adaptive baseline
+FTW Predictor V33+ (pattern restored + adaptive model)
 Python 3.10+
-Dependencies: aiohttp
+Deps: aiohttp
 
 Environment variables:
-  TELEGRAM_TOKEN      Required: newly rotated Telegram bot token
-  TELEGRAM_CHAT       Required: destination chat ID
-  HISTORY_URLS        Optional: comma-separated history API URLs
-  DB_PATH             Optional: SQLite path (default: predictor_v33.db)
-  PORT                Optional: health endpoint port (default: 8080)
-  FETCH_EVERY         Optional: seconds between successful polls (default: 3)
-  MIN_HISTORY         Optional: minimum history before predicting (default: 180)
-
-This is an experimental statistical model, not a guarantee of future outcomes.
-It intentionally does not recommend stakes or increase stakes after losses.
+  TELEGRAM_TOKEN    required, rotated bot token
+  TELEGRAM_CHAT     required
+  HISTORY_URLS      optional, comma-separated URLs
+  DB_PATH           optional, default predictor_v33_plus.db
+  PORT              optional, default 8080
+  FETCH_EVERY       optional, default 3.0
+  MIN_HISTORY       optional, default 180
 """
 
 from __future__ import annotations
@@ -36,36 +33,30 @@ from typing import Any
 import aiohttp
 from aiohttp import web
 
-
-# ============================================================
-# CONFIG
-# ============================================================
-
 DEFAULT_HISTORY_URL = (
     "https://sky-predictor-1012593186417.asia-southeast1.run.app/"
     "api/wingo-history-1m-1000"
 )
 
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 @dataclass(frozen=True)
 class Config:
-    # 🔥 Default token aur chat ID set kar diya hai
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
-    db_path: str = os.getenv("DB_PATH", "predictor_v33.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v33_plus.db")
     port: int = int(os.getenv("PORT", "8080"))
-    fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
+    fetch_every: float = float(os.getenv("FETCH_EVERY", "3.0"))
     timeout: float = 18.0
     max_history: int = 3500
     min_history: int = int(os.getenv("MIN_HISTORY", "180"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "12"))
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (V33)"
-
-    # 🔥 Stickers add kar diye hain warna bot crash hota
-    win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
-    loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
+    name: str = "FTW PREDICTOR (V33+ PATTERN)"
 
     @property
     def urls(self) -> tuple[str, ...]:
@@ -73,26 +64,23 @@ class Config:
 
     def validate(self) -> None:
         if not self.token:
-            raise ValueError("TELEGRAM_TOKEN environment variable is required")
+            raise ValueError("TELEGRAM_TOKEN is required")
         if not self.chat:
-            raise ValueError("TELEGRAM_CHAT environment variable is required")
+            raise ValueError("TELEGRAM_CHAT is required")
         if not self.urls:
-            raise ValueError("Set at least one URL in HISTORY_URLS")
-        if self.port < 1 or self.port > 65535:
-            raise ValueError("PORT must be between 1 and 65535")
+            raise ValueError("At least one HISTORY_URL is required")
         if self.fetch_every <= 0:
-            raise ValueError("FETCH_EVERY must be greater than zero")
-        if self.min_history < 1:
-            raise ValueError("MIN_HISTORY must be at least 1")
+            raise ValueError("FETCH_EVERY must be > 0")
+        if self.port < 1 or self.port > 65535:
+            raise ValueError("PORT must be valid")
 
 
 CFG = Config()
-
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-LOG = logging.getLogger("predictor_v33")
+LOG = logging.getLogger("predictor_v33_plus")
 
 
 # ============================================================
@@ -101,6 +89,16 @@ LOG = logging.getLogger("predictor_v33")
 
 def clip(value: float, low: float = 0.02, high: float = 0.98) -> float:
     return max(low, min(high, float(value)))
+
+
+def sigmoid(z: float) -> float:
+    z = max(-25.0, min(25.0, float(z)))
+    return 1.0 / (1.0 + math.exp(-z))
+
+
+def logit(p: float, eps: float = 0.02) -> float:
+    p = max(eps, min(1.0 - eps, float(p)))
+    return math.log(p / (1.0 - p))
 
 
 def escape(value: Any) -> str:
@@ -119,27 +117,47 @@ def numeric(value: Any) -> int | None:
         return None
 
 
-def weighted_probability(observations: list[tuple[int, float]]) -> tuple[float, float]:
-    """Smoothed probability and effective weighted sample size."""
-    if not observations:
+def weighted_probability(obs: list[tuple[int, float]]) -> tuple[float, float]:
+    if not obs:
         return 0.5, 0.0
-
-    weight_sum = sum(weight for _, weight in observations)
-    squared_weight_sum = sum(weight * weight for _, weight in observations)
-    effective_n = (
-        weight_sum * weight_sum / squared_weight_sum
-        if squared_weight_sum > 0 else 0.0
-    )
-    probability = (
-        4.0 + sum(value * weight for value, weight in observations)
-    ) / (8.0 + weight_sum)
-
-    return clip(probability), effective_n
+    sw = sum(w for _, w in obs)
+    sw2 = sum(w * w for _, w in obs)
+    eff = (sw * sw / sw2) if sw2 else 0.0
+    p = (4.0 + sum(y * w for y, w in obs)) / (8.0 + sw)
+    return clip(p), eff
 
 
-def recency_weight(index: int, n: int, half_life: float = 330.0) -> float:
-    age = max(0, n - 1 - index)
-    return 0.5 ** (age / half_life)
+def family_run(seq: list[int]) -> list[tuple[int, int]]:
+    if not seq:
+        return []
+    out: list[tuple[int, int]] = []
+    cur = seq[0]
+    count = 1
+    for x in seq[1:]:
+        if x == cur:
+            count += 1
+        else:
+            out.append((cur, count))
+            cur = x
+            count = 1
+    out.append((cur, count))
+    return out
+
+
+def family_signature(seq: list[int]) -> tuple[tuple[int, int], ...]:
+    return tuple((int(v), cnt) for v, cnt in family_run(seq))
+
+
+def entropy_bits(seq: list[int]) -> float:
+    if not seq:
+        return 0.0
+    c = Counter(seq)
+    total = len(seq)
+    e = 0.0
+    for freq in c.values():
+        p = freq / total
+        e -= p * math.log2(p)
+    return e
 
 
 def get_regime(seq: list[int]) -> str:
@@ -165,10 +183,66 @@ def get_regime(seq: list[int]) -> str:
     return "MIXED"
 
 
-def parse_history(payload: Any) -> list[dict[str, Any]]:
-    """Extract issue/number rows from common nested API response shapes."""
-    obj = payload
+def trend_features(seq: list[int]) -> list[float]:
+    if not seq:
+        return [0.0] * 20
 
+    def mean(k: int) -> float:
+        arr = seq[-k:]
+        return sum(arr) / len(arr) if arr else 0.5
+
+    def ema(k: int) -> float:
+        if not seq:
+            return 0.5
+        alpha = 2.0 / (k + 1)
+        v = float(seq[0])
+        for x in seq[1:]:
+            v = alpha * x + (1.0 - alpha) * v
+        return v
+
+    def std(k: int) -> float:
+        arr = seq[-k:]
+        if len(arr) < 2:
+            return 0.0
+        m = sum(arr) / len(arr)
+        return math.sqrt(sum((x - m) ** 2 for x in arr) / len(arr))
+
+    tail = seq[-24:]
+    alt = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
+    run_score = (2 * seq[-1] - 1) * min(len(list(filter(lambda x: x == seq[-1], seq[-12:]))), 12) / 12.0
+    macd = (ema(12) - ema(26)) * 2.0
+
+    return [
+        1.0,
+        2 * mean(3) - 1,
+        2 * mean(5) - 1,
+        2 * mean(10) - 1,
+        2 * mean(24) - 1,
+        2 * mean(48) - 1,
+        2 * mean(96) - 1,
+        mean(3) - mean(10),
+        mean(5) - mean(24),
+        mean(10) - mean(48),
+        run_score,
+        2 * seq[-1] - 1,
+        (2 * alt - 1) * (2 * seq[-1] - 1),
+        macd,
+        2 * std(10) - 1,
+        2 * std(24) - 1,
+        mean(3) - mean(12),
+        mean(8) - mean(24),
+        mean(12) - mean(48),
+        mean(6) - mean(24),
+    ]
+
+
+def recency_weight(index: int, n: int, half_life: float = 330.0) -> float:
+    age = max(0, n - 1 - index)
+    return 0.5 ** (age / half_life)
+
+
+def parse_history(payload: Any) -> list[dict[str, Any]]:
+    obj = payload
     for _ in range(8):
         if isinstance(obj, list):
             break
@@ -189,313 +263,71 @@ def parse_history(payload: Any) -> list[dict[str, Any]]:
         return []
 
     records: dict[str, dict[str, Any]] = {}
+
     for item in obj:
         if not isinstance(item, dict):
             continue
 
-        issue_value = item.get("issueNumber", item.get("issue"))
-        number_value = item.get("number", item.get("value"))
-        issue = numeric(issue_value)
-        number = numeric(number_value)
+        issue = numeric(item.get("issueNumber", item.get("issue")))
+        number = numeric(item.get("number", item.get("value")))
 
         if issue is None or number is None or not 0 <= number <= 9:
             continue
 
-        issue_key = str(issue)
-        record = {
-            "issue": issue_key,
-            "num": number,
-            "size": int(number >= 5),
-        }
+        key = str(issue)
+        row = {"issue": key, "num": number, "size": int(number >= 5)}
 
-        existing = records.get(issue_key)
+        existing = records.get(key)
         if existing and existing["num"] != number:
-            raise ValueError(f"Conflicting duplicate issue in source: {issue_key}")
-        records[issue_key] = record
+            raise ValueError(f"Conflicting duplicate issue: {key}")
 
-    return sorted(records.values(), key=lambda row: int(row["issue"]))
+        records[key] = row
+
+    return sorted(records.values(), key=lambda x: int(x["issue"]))
 
 
 # ============================================================
-# MODEL
+# PATTERN TRACKER
 # ============================================================
 
-EXPERT_NAMES = (
-    "base",
-    "recent",
-    "markov1",
-    "markov2",
-    "markov3",
-    "run",
-    "regime",
-    "momentum",
-    "reversal",
-)
+class QuantumTracker:
+    def __init__(self, min_len: int = 3, max_len: int = 8, min_support: int = 12):
+        self.min_len = min_len
+        self.max_len = max_len
+        self.min_support = min_support
 
-
-class Engine:
-    def __init__(self, db: "Database"):
-        self.db = db
-
-    def _mine_experts(self, seq: list[int]) -> dict[str, float]:
+    def match_tail_patterns(self, seq: list[int]) -> list[dict[str, Any]]:
         n = len(seq)
-        if not n:
-            return {name: 0.5 for name in EXPERT_NAMES}
+        if n < 18:
+            return []
 
-        experts: dict[str, float] = {}
+        results: list[dict[str, Any]] = []
+        for length in range(self.max_len, self.min_len - 1, -1):
+            suffix = seq[-length:]
+            sig = family_signature(suffix)
+            obs: list[tuple[int, float]] = []
 
-        # Recency-weighted overall baseline.
-        base_obs = [
-            (value, recency_weight(i, n))
-            for i, value in enumerate(seq)
-        ]
-        experts["base"] = weighted_probability(base_obs)[0]
+            for i in range(n - length):
+                if family_signature(seq[i : i + length]) == sig:
+                    w = 0.5 ** ((n - 1 - (i + length)) / 420.0)
+                    obs.append((seq[i + length], w))
 
-        # Shorter-window estimate; modest smoothing prevents extreme probabilities.
-        recent = seq[-100:]
-        experts["recent"] = (
-            4.0 + sum(recent)
-        ) / (8.0 + len(recent))
-
-        # Markov experts: only use contexts observed enough times.
-        for order in (1, 2, 3):
-            if n <= order:
+            if len(obs) < self.min_support:
                 continue
 
-            context = tuple(seq[-order:])
-            observations: list[tuple[int, float]] = []
+            p, eff_n = weighted_probability(obs)
+            score = abs(p - 0.5) * math.sqrt(max(1.0, eff_n))
+            if score > 0.0:
+                results.append({
+                    "sig": sig,
+                    "p": p,
+                    "support": len(obs),
+                    "eff_n": eff_n,
+                    "score": score,
+                })
+            break
 
-            # Exclude the current suffix itself: it has no known next result yet.
-            for i in range(order, n - order + 1):
-                if tuple(seq[i - order:i]) == context:
-                    observations.append((seq[i], recency_weight(i, n)))
-
-            if len(observations) >= CFG.min_support:
-                experts[f"markov{order}"] = weighted_probability(observations)[0]
-
-        # Conditional continuation estimate for the current run length.
-        if n >= 2:
-            last_value = seq[-1]
-            current_run = 1
-            for value in reversed(seq[:-1]):
-                if value != last_value:
-                    break
-                current_run += 1
-
-            run_length_at = [1] * n
-            for i in range(1, n):
-                run_length_at[i] = (
-                    run_length_at[i - 1] + 1
-                    if seq[i] == seq[i - 1] else 1
-                )
-
-            observations = []
-            for i in range(1, n):
-                if (
-                    seq[i - 1] == last_value
-                    and min(run_length_at[i - 1], 8) == min(current_run, 8)
-                ):
-                    observations.append((seq[i], recency_weight(i, n)))
-
-            if len(observations) >= CFG.min_support:
-                experts["run"] = weighted_probability(observations)[0]
-
-        # Historical estimate for the current coarse regime.
-        regime = get_regime(seq)
-        observations = []
-        for i in range(24, n):
-            prior_regime = get_regime(seq[max(0, i - 96):i])
-            if prior_regime == regime:
-                observations.append((seq[i], recency_weight(i, n)))
-
-        if len(observations) >= CFG.min_support:
-            experts["regime"] = weighted_probability(observations)[0]
-
-        # Simple recent momentum and its complementary reversal hypothesis.
-        momentum_tail = seq[-8:]
-        momentum = (4.0 + sum(momentum_tail)) / (8.0 + len(momentum_tail))
-        experts["momentum"] = momentum
-        experts["reversal"] = 1.0 - momentum
-
-        # Do not silently omit experts: use neutral estimates when evidence is thin.
-        for name in EXPERT_NAMES:
-            experts[name] = clip(experts.get(name, 0.5), 0.05, 0.95)
-
-        return experts
-
-    def predict(self, history: list[dict[str, Any]], issue: str) -> dict[str, Any]:
-        seq = [int(row["size"]) for row in history]
-        experts = self._mine_experts(seq)
-        regime = get_regime(seq)
-
-        weighted_sum = 0.0
-        total_weight = 0.0
-        for name, probability in experts.items():
-            adjusted, reliability = self.db.adapt_expert(
-                name=name,
-                regime=regime,
-                probability=probability,
-            )
-            weighted_sum += adjusted * reliability
-            total_weight += reliability
-
-        p = weighted_sum / total_weight if total_weight else 0.5
-        p = clip(p)
-
-        side = "BIG" if p >= 0.5 else "SMALL"
-        allowed_numbers = range(5, 10) if side == "BIG" else range(0, 5)
-
-        number_distribution = exact_number_distribution(history)
-        # This is a display/ranking heuristic, not a calibrated exact-number chance.
-        ranked = sorted(
-            allowed_numbers,
-            key=lambda number: number_distribution[number],
-            reverse=True,
-        )
-        number_prediction = ranked[0]
-
-        return {
-            "issue": issue,
-            "p": p,
-            "side": side,
-            "number": number_prediction,
-            "number_distribution": number_distribution,
-            "regime": regime,
-            "experts": experts,
-            "source": "Adaptive statistical baseline",
-            "created": time.time(),
-        }
-
-    def settle(self, history: list[dict[str, Any]]) -> None:
-        lookup = {row["issue"]: row for row in history}
-        pending = self.db.pending_predictions()
-
-        for row in pending:
-            actual = lookup.get(row["issue"])
-            if actual is None:
-                continue
-
-            try:
-                payload = json.loads(row["payload"])
-            except (TypeError, json.JSONDecodeError):
-                LOG.exception("Invalid prediction payload for issue %s", row["issue"])
-                continue
-
-            actual_size = int(actual["size"])
-            predicted_side = int(float(payload.get("p", 0.5)) >= 0.5)
-            side_won = predicted_side == actual_size
-            number_won = payload.get("number") == actual["num"]
-
-            with self.db.transaction():
-                self.db.c.execute(
-                    """
-                    UPDATE predictions
-                    SET status=?, actual=?, won_number=?
-                    WHERE issue=? AND status='PENDING'
-                    """,
-                    (
-                        "WIN" if side_won else "LOSS",
-                        actual["num"],
-                        int(number_won),
-                        row["issue"],
-                    ),
-                )
-
-                regime = str(payload.get("regime", "MIXED"))
-                saved_experts = payload.get("experts", {})
-                if isinstance(saved_experts, dict):
-                    for name, probability in saved_experts.items():
-                        try:
-                            self.db.learn_expert(
-                                str(name),
-                                regime,
-                                float(probability),
-                                actual_size,
-                            )
-                        except (TypeError, ValueError):
-                            LOG.warning(
-                                "Skipping invalid expert value for issue %s",
-                                row["issue"],
-                            )
-
-                sticker = (
-                    CFG.win_sticker
-                    if side_won
-                    else CFG.loss_sticker
-                )
-                self.db.queue("sticker", row["issue"], sticker)
-
-
-def exact_number_distribution(
-    history: list[dict[str, Any]],
-) -> list[float]:
-    """Smoothed blended frequency/Markov distribution for digits 0–9."""
-    nums = [int(row["num"]) for row in history]
-    if not nums:
-        return [0.1] * 10
-
-    def frequency(window: int) -> list[float]:
-        recent = nums[-window:]
-        counts = Counter(recent)
-        total = len(recent)
-        return [
-            (counts.get(number, 0) + 1.0) / (total + 10.0)
-            for number in range(10)
-        ]
-
-    def markov(order: int) -> list[float]:
-        if len(nums) <= order:
-            return frequency(100)
-
-        context = tuple(nums[-order:])
-        counts = [0.0] * 10
-
-        for i in range(order, len(nums) - order + 1):
-            if tuple(nums[i - order:i]) == context:
-                counts[nums[i]] += 1.0
-
-        total = sum(counts)
-        if total <= 0:
-            return frequency(100)
-
-        return [(count + 1.0) / (total + 10.0) for count in counts]
-
-    components = [
-        (0.45, frequency(80)),
-        (0.30, frequency(200)),
-        (0.15, markov(1)),
-        (0.10, markov(2)),
-    ]
-
-    distribution = [
-        sum(weight * component[number] for weight, component in components)
-        for number in range(10)
-    ]
-    total = sum(distribution)
-    return [value / total for value in distribution]
-
-
-def format_prediction(payload: dict[str, Any]) -> str:
-    probability = float(payload["p"])
-    confidence = max(probability, 1.0 - probability) * 100
-    filled = max(0, min(10, int(confidence // 10)))
-    bar = "█" * filled + "░" * (10 - filled)
-
-    side = escape(payload["side"])
-    marker = "🔴" if payload["side"] == "BIG" else "🔵"
-
-    return (
-        f"⚡ <b>{escape(CFG.name)}</b> ⚡\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"🎯 <b>SIDE:</b> {marker} <b>{side}</b>\n"
-        f"🔢 <b>TOP NUMBER:</b> <code>{int(payload['number'])}</code>\n"
-        f"📅 <b>ISSUE:</b> <code>{escape(payload['issue'])}</code>\n"
-        "━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>MODEL CONFIDENCE:</b> {confidence:.1f}% [{bar}]\n"
-        f"🌊 <b>REGIME:</b> {escape(payload['regime'])}\n"
-        "ℹ️ Experimental estimate; outcomes are not guaranteed.\n"
-        "━━━━━━━━━━━━━━━━━━"
-    )
+        return results
 
 
 # ============================================================
@@ -504,19 +336,13 @@ def format_prediction(payload: dict[str, Any]) -> str:
 
 class Database:
     def __init__(self, path: str):
-        self.c = sqlite3.connect(
-            path,
-            isolation_level=None,
-            timeout=20,
-        )
+        self.c = sqlite3.connect(path, isolation_level=None, timeout=20)
         self.c.row_factory = sqlite3.Row
         self.c.execute("PRAGMA journal_mode=WAL")
         self.c.execute("PRAGMA synchronous=NORMAL")
-        self.c.execute("PRAGMA foreign_keys=ON")
+        self.c.execute("PRAGMA temp_store=MEMORY")
         self.c.execute("PRAGMA busy_timeout=20000")
-
-        self.c.executescript(
-            """
+        self.c.executescript("""
             CREATE TABLE IF NOT EXISTS history(
                 issue TEXT PRIMARY KEY,
                 num INTEGER NOT NULL
@@ -531,12 +357,17 @@ class Database:
                 won_number INTEGER NOT NULL DEFAULT 0
             );
 
-            CREATE TABLE IF NOT EXISTS expert_models(
-                name TEXT NOT NULL,
-                regime TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS models(
+                key TEXT PRIMARY KEY,
                 n REAL NOT NULL,
                 loss REAL NOT NULL,
-                PRIMARY KEY(name, regime)
+                inverse_loss REAL NOT NULL,
+                failures INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS meta(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS outbox(
@@ -548,20 +379,7 @@ class Database:
                 expires REAL,
                 sent INTEGER NOT NULL DEFAULT 0
             );
-            """
-        )
-        self._migrate()
-
-    def _migrate(self) -> None:
-        columns = {
-            row["name"]
-            for row in self.c.execute("PRAGMA table_info(predictions)").fetchall()
-        }
-        if "won_number" not in columns:
-            self.c.execute(
-                "ALTER TABLE predictions "
-                "ADD COLUMN won_number INTEGER NOT NULL DEFAULT 0"
-            )
+        """)
 
     @contextmanager
     def transaction(self):
@@ -576,22 +394,89 @@ class Database:
             if self.c.in_transaction:
                 self.c.execute("COMMIT")
 
+    def get(self, key: str, default: Any = None) -> Any:
+        row = self.c.execute(
+            "SELECT value FROM meta WHERE key=?",
+            (key,),
+        ).fetchone()
+        return json.loads(row["value"]) if row else default
+
+    def set(self, key: str, value: Any) -> None:
+        self.c.execute(
+            "INSERT INTO meta(key,value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, json.dumps(value)),
+        )
+
+    def memory(self, key: str) -> dict[str, Any]:
+        row = self.c.execute(
+            "SELECT * FROM models WHERE key=?",
+            (key,),
+        ).fetchone()
+        return dict(row) if row else {
+            "n": 0.0,
+            "loss": 0.0,
+            "inverse_loss": 0.0,
+            "failures": 0,
+        }
+
+    def learn_model(self, key: str, probability: float, actual: int) -> None:
+        m = self.memory(key)
+        n = CFG.fetch_every * 0.985 * m["n"] + 1.0
+        loss = 0.985 * m["loss"] + (probability - actual) ** 2
+        inv = 0.985 * m["inverse_loss"] + (1.0 - probability - actual) ** 2
+        wrong = int(probability >= 0.5) != actual
+        failures = m["failures"] + 1 if wrong else 0
+        self.c.execute(
+            "INSERT INTO models VALUES (?,?,?,?,?) "
+            "ON CONFLICT(key) DO UPDATE SET "
+            "n=excluded.n, loss=excluded.loss, inverse_loss=excluded.inverse_loss, failures=excluded.failures",
+            (key, n, loss, inv, failures),
+        )
+
+    def adapt_model(self, key: str, probability: float) -> tuple[float, float]:
+        m = self.memory(key)
+        n = m["n"]
+        if n < 1:
+            return probability, 0.7
+
+        brier = m["loss"] / n
+        inv = m["inverse_loss"] / n
+        failures = m["failures"]
+
+        flipped = False
+        if failures >= 2 and (inv + 0.01 < brier):
+            flipped = True
+        elif failures >= 3 and brier > 0.26:
+            flipped = True
+
+        eff_loss = inv if flipped else brier
+        p = (1.0 - probability) if flipped else probability
+
+        reliability = clip((0.25 - eff_loss) / 0.12, 0.0, 1.0)
+        shrink = (1.0 - min(n / 50.0, 1.0)) * 0.8 + min(n / 50.0, 1.0) * reliability
+        p = 0.5 + (p - 0.5) * shrink
+
+        weight = clip(math.exp(-8 * (eff_loss - 0.22)), 0.15, 2.0)
+        if failures >= 2:
+            weight *= 0.30
+        if failures >= 4:
+            weight *= 0.10
+
+        return clip(p), weight
+
     def ingest(self, records: list[dict[str, Any]]) -> None:
         with self.transaction():
-            for record in records:
+            for r in records:
                 old = self.c.execute(
                     "SELECT num FROM history WHERE issue=?",
-                    (record["issue"],),
+                    (r["issue"],),
                 ).fetchone()
-
-                if old and int(old["num"]) != int(record["num"]):
-                    raise ValueError(
-                        f"Source changed settled issue {record['issue']}"
-                    )
-
+                if old and old["num"] != r["num"]:
+                    raise ValueError(f"Source changed settled issue {r['issue']}")
                 self.c.execute(
                     "INSERT OR IGNORE INTO history(issue,num) VALUES (?,?)",
-                    (record["issue"], record["num"]),
+                    (r["issue"], r["num"]),
                 )
 
             self.c.execute(
@@ -611,18 +496,31 @@ class Database:
             """
             SELECT issue,num
             FROM history
-            ORDER BY CAST(issue AS INTEGER) ASC
+            ORDER BY CAST(issue AS INTEGER)
             """
         ).fetchall()
-
         return [
-            {
-                "issue": row["issue"],
-                "num": int(row["num"]),
-                "size": int(int(row["num"]) >= 5),
-            }
+            {"issue": row["issue"], "num": int(row["num"]), "size": int(int(row["num"]) >= 5)}
             for row in rows
         ]
+
+    def get_loss_streak(self) -> int:
+        rows = self.c.execute(
+            """
+            SELECT status
+            FROM predictions
+            WHERE status IN ('WIN','LOSS')
+            ORDER BY created DESC
+            LIMIT 12
+            """
+        ).fetchall()
+        streak = 0
+        for row in rows:
+            if row["status"] == "LOSS":
+                streak += 1
+            else:
+                break
+        return streak
 
     def pending_predictions(self) -> list[sqlite3.Row]:
         return self.c.execute(
@@ -630,128 +528,367 @@ class Database:
             SELECT issue,payload
             FROM predictions
             WHERE status='PENDING'
-            ORDER BY CAST(issue AS INTEGER) ASC
+            ORDER BY CAST(issue AS INTEGER)
             """
         ).fetchall()
 
-    def learn_expert(
-        self,
-        name: str,
-        regime: str,
-        probability: float,
-        actual: int,
-    ) -> None:
-        row = self.c.execute(
-            """
-            SELECT n,loss FROM expert_models
-            WHERE name=? AND regime=?
-            """,
-            (name, regime),
-        ).fetchone()
-
-        old_n = float(row["n"]) if row else 0.0
-        old_loss = float(row["loss"]) if row else 0.0
-
-        decay = 0.985
-        n = decay * old_n + 1.0
-        loss = decay * old_loss + (clip(probability) - actual) ** 2
-
+    def queue(self, kind: str, issue: str | None, text: str, expires: float | None = None) -> None:
         self.c.execute(
-            """
-            INSERT INTO expert_models(name,regime,n,loss)
-            VALUES (?,?,?,?)
-            ON CONFLICT(name,regime) DO UPDATE SET
-                n=excluded.n,
-                loss=excluded.loss
-            """,
-            (name, regime, n, loss),
-        )
-
-    def adapt_expert(
-        self,
-        name: str,
-        regime: str,
-        probability: float,
-    ) -> tuple[float, float]:
-        row = self.c.execute(
-            """
-            SELECT n,loss FROM expert_models
-            WHERE name=? AND regime=?
-            """,
-            (name, regime),
-        ).fetchone()
-
-        if not row or float(row["n"]) < 1.0:
-            # Unknown experts receive neutral shrinkage and ordinary weight.
-            return 0.5 + (probability - 0.5) * 0.5, 1.0
-
-        n = float(row["n"])
-        mean_loss = float(row["loss"]) / n
-
-        # Shrink early estimates toward 0.5; reliability grows with evidence.
-        evidence = min(n / 40.0, 1.0)
-        adjusted = 0.5 + (probability - 0.5) * (0.35 + 0.65 * evidence)
-
-        # Brier loss of 0.25 is the neutral reference for binary outcomes.
-        reliability = math.exp(-3.0 * max(-0.10, mean_loss - 0.25))
-        reliability = max(0.35, min(1.8, reliability))
-
-        return clip(adjusted), reliability
-
-    def queue(
-        self,
-        kind: str,
-        issue: str | None,
-        text: str,
-        expires: float | None = None,
-    ) -> None:
-        self.c.execute(
-            """
-            INSERT INTO outbox(kind,issue,text,created,expires)
-            VALUES (?,?,?,?,?)
-            """,
+            "INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)",
             (kind, issue, text, time.time(), expires),
         )
 
     def health_stats(self) -> dict[str, Any]:
-        settled = int(
-            self.c.execute(
-                """
-                SELECT COUNT(*) FROM predictions
-                WHERE status IN ('WIN','LOSS')
-                """
-            ).fetchone()[0]
-        )
-        wins = int(
-            self.c.execute(
-                "SELECT COUNT(*) FROM predictions WHERE status='WIN'"
-            ).fetchone()[0]
-        )
-        number_wins = int(
-            self.c.execute(
-                """
-                SELECT COUNT(*) FROM predictions
-                WHERE status IN ('WIN','LOSS') AND won_number=1
-                """
-            ).fetchone()[0]
-        )
-        history_count = int(
-            self.c.execute("SELECT COUNT(*) FROM history").fetchone()[0]
-        )
+        settled = self.c.execute("SELECT COUNT(*) FROM predictions WHERE status IN ('WIN','LOSS')").fetchone()[0]
+        wins = self.c.execute("SELECT COUNT(*) FROM predictions WHERE status='WIN'").fetchone()[0]
+        total_history = self.c.execute("SELECT COUNT(*) FROM history").fetchone()[0]
 
         return {
-            "history": history_count,
-            "settled": settled,
-            "side_wins": wins,
-            "side_win_rate": round(100.0 * wins / settled, 2) if settled else None,
-            "number_wins": number_wins,
-            "number_hit_rate": (
-                round(100.0 * number_wins / settled, 2) if settled else None
-            ),
+            "history": total_history,
+            "settled": int(settled),
+            "wins": int(wins),
+            "win_rate": round((wins / settled * 100.0) if settled else 0.0, 2),
         }
 
     def close(self) -> None:
         self.c.close()
+
+
+# ============================================================
+# EXACT NUMBER MODELS
+# ============================================================
+
+def recent_frequency(nums: list[int], window: int = 200) -> list[float]:
+    if not nums:
+        return [0.1] * 10
+    recent = nums[-window:]
+    counts = Counter(recent)
+    total = sum(counts.values())
+    return [counts.get(i, 0) / total if total > 0 else 0.1 for i in range(10)]
+
+
+def markov_predict(nums: list[int], order: int = 2) -> list[float]:
+    if not nums:
+        return [0.1] * 10
+    if len(nums) <= order:
+        return recent_frequency(nums)
+
+    context = tuple(nums[-order:])
+    counts = [0.0] * 10
+    total = 0.0
+    for i in range(order, len(nums)):
+        if tuple(nums[i - order:i]) == context:
+            counts[nums[i]] += 1.0
+            total += 1.0
+    if total <= 0:
+        return recent_frequency(nums)
+    return [counts[k] / total for k in range(10)]
+
+
+def exact_number_model(history: list[dict[str, Any]]) -> list[float]:
+    nums = [int(r["num"]) for r in history]
+    if not nums:
+        return [0.1] * 10
+
+    d1 = recent_frequency(nums, 80)
+    d2 = recent_frequency(nums, 200)
+    d3 = markov_predict(nums, 1)
+    d4 = markov_predict(nums, 2)
+    d5 = markov_predict(nums, 3)
+
+    final = [0.0] * 10
+    for i in range(10):
+        final[i] = 0.30 * d1[i] + 0.25 * d2[i] + 0.20 * d3[i] + 0.15 * d4[i] + 0.10 * d5[i]
+
+    total = sum(final)
+    return [x / total for x in final] if total > 0 else [0.1] * 10
+
+
+# ============================================================
+# WF900 CALIBRATION
+# ============================================================
+
+def walk_forward_900(history: list[dict[str, Any]], p_raw: float) -> tuple[float, float]:
+    if len(history) < 100:
+        return p_raw, 0.0
+
+    window = history[-900:]
+    sizes = [row["size"] for row in window]
+    macro_big = sum(sizes) / len(sizes) if sizes else 0.5
+    mid_big = sum(sizes[-150:]) / len(sizes[-150:]) if sizes else 0.5
+    micro_big = sum(sizes[-30:]) / len(sizes[-30:]) if sizes else 0.5
+
+    entropy = entropy_bits([row["num"] for row in window[-50:]]) / 3.32
+
+    wf = 0.0
+    wf += (micro_big - 0.5) * 0.45
+    wf += (mid_big - 0.5) * 0.35
+    wf += (macro_big - 0.5) * 0.20
+    wf += (entropy - 0.5) * 0.30
+
+    wf = clip(wf, -0.35, 0.35)
+    p_adj = clip(p_raw + wf)
+    return p_adj, wf
+
+
+# ============================================================
+# ENGINE
+# ============================================================
+
+EXPERT_NAMES = [
+    "patterns", "markov1", "markov2", "markov3",
+    "run", "regime", "base", "trend", "momentum",
+    "reversal", "volatility", "entropy"
+]
+
+
+class Engine:
+    def __init__(self, db: Database):
+        self.db = db
+
+    def mine_patterns(self, seq: list[int]) -> list[tuple[float, float, int, float, str]]:
+        if len(seq) < 18:
+            return []
+        tracker = QuantumTracker(min_len=3, max_len=8, min_support=CFG.min_support)
+        pat = tracker.match_tail_patterns(seq)
+        out: list[tuple[float, float, int, float, str]] = []
+
+        for item in pat[:6]:
+            key = "q:" + "-".join(f"{'B' if v else 'S'}{c}" for v, c in item["sig"])
+            mem = self.db.memory(key)
+            if mem["failures"] >= 4 and (mem["loss"] / max(1.0, mem["n"]) > 0.28):
+                continue
+            out.append((item["score"], item["p"], item["support"], item["eff_n"], key))
+
+        return out
+
+    def mine_experts(self, seq: list[int]) -> tuple[dict[str, float], list[tuple[float, float, int, float, str]], list[float], str]:
+        n = len(seq)
+        experts: dict[str, float] = {}
+
+        def weight(idx: int) -> float:
+            return 0.5 ** ((n - 1 - idx) / 330.0)
+
+        patterns = self.mine_patterns(seq)
+        if patterns:
+            candidates: list[tuple[float, float]] = []
+            for _, p, _, eff_n, key in patterns:
+                adjusted_p, w = self.db.adapt_model(key, p)
+                candidates.append((adjusted_p, w * math.sqrt(max(1.0, eff_n))))
+            if candidates:
+                num = sum(p * w for p, w in candidates)
+                den = sum(w for _, w in candidates)
+                if den > 0:
+                    experts["patterns"] = clip(num / den)
+
+        for order in (1, 2, 3):
+            suffix = tuple(seq[-order:])
+            obs: list[tuple[int, float]] = []
+            for i in range(order, n - order):
+                if tuple(seq[i - order:i]) == suffix:
+                    obs.append((seq[i], weight(i)))
+            if len(obs) >= CFG.min_support:
+                experts[f"markov{order}"] = weighted_probability(obs)[0]
+
+        if n:
+            run_at = [1] * n
+            for i in range(1, n):
+                run_at[i] = run_at[i - 1] + 1 if seq[i] == seq[i - 1] else 1
+            cur_run = min(run_at[-1], 8)
+            last_val = seq[-1]
+            run_obs: list[tuple[int, float]] = []
+            for i in range(24, n):
+                if seq[i-1] == last_val and min(run_at[i-1], 8) == cur_run:
+                    run_obs.append((seq[i], weight(i)))
+            if len(run_obs) >= CFG.min_support:
+                experts["run"] = weighted_probability(run_obs)[0]
+
+        regime = get_regime(seq)
+        regime_obs: list[tuple[int, float]] = []
+        for i in range(24, n):
+            if get_regime(seq[max(0, i - 96):i]) == regime:
+                regime_obs.append((seq[i], weight(i)))
+        if len(regime_obs) >= CFG.min_support:
+            experts["regime"] = weighted_probability(regime_obs)[0]
+
+        experts["base"] = weighted_probability([(y, weight(i)) for i, y in enumerate(seq)])[0]
+
+        features = trend_features(seq)
+        trend_weights = self.db.get("trend_weights")
+        if not isinstance(trend_weights, list) or len(trend_weights) != len(features):
+            trend_weights = [0.0] * len(features)
+        experts["trend"] = sigmoid(sum(w * x for w, x in zip(trend_weights, features)))
+
+        tail = seq[-16:]
+        if len(tail) > 1:
+            avg = sum(tail) / len(tail)
+            vol = sum((x - avg) ** 2 for x in tail) / len(tail)
+            experts["volatility"] = clip(0.5 + (0.5 - abs(0.5 - avg)) * 0.85 + vol * 0.1)
+        else:
+            experts["volatility"] = 0.5
+
+        experts["entropy"] = clip(0.5 + (entropy_bits(seq[-12:]) / 3.32 - 0.5) * 0.6)
+
+        momentum = sum(seq[-4:]) / 4.0 if seq else 0.5
+        experts["momentum"] = 0.2 + (momentum * 0.6)
+        experts["reversal"] = 1.0 - experts["momentum"]
+
+        for k, v in list(experts.items()):
+            experts[k] = clip(v, 0.05, 0.95)
+
+        return experts, patterns, features, regime
+
+    def predict(self, history: list[dict[str, Any]], issue: str) -> dict[str, Any]:
+        seq = [int(r["size"]) for r in history]
+        loss_streak = self.db.get_loss_streak()
+
+        experts, patterns, features, regime = self.mine_experts(seq)
+
+        adjusted: list[tuple[float, float]] = []
+        for name, prob in experts.items():
+            corrected, weight = self.db.adapt_model(f"expert:{name}:{regime}", prob)
+            if name == "patterns":
+                weight *= 3.3
+            if name == "reversal" and loss_streak >= 1:
+                weight *= 3.8
+            if name in ("momentum", "run", "trend") and loss_streak >= 1:
+                weight *= 0.25
+            adjusted.append((corrected, weight))
+
+        total_w = sum(w for _, w in adjusted)
+        p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
+        p_raw = clip(p_avg)
+
+        p_raw, wf_bias = walk_forward_900(history, p_raw)
+
+        pred_side = "BIG" if p_raw >= 0.5 else "SMALL"
+        allowed = range(5, 10) if pred_side == "BIG" else range(0, 5)
+
+        exact_dist = exact_number_model(history)
+        side_adjusted = [0.0] * 10
+        for k in range(10):
+            if k in allowed:
+                side_adjusted[k] = exact_dist[k] * 2.0
+            else:
+                side_adjusted[k] = exact_dist[k] * 0.1
+
+        total = sum(side_adjusted)
+        if total <= 0:
+            side_adjusted = [0.1] * 10
+            total = 10.0
+        side_adjusted = [x / total for x in side_adjusted]
+
+        num_pred = max(allowed, key=lambda k: side_adjusted[k])
+        num_conf = side_adjusted[num_pred]
+
+        payload = {
+            "issue": issue,
+            "p": p_raw,
+            "side": pred_side,
+            "num": num_pred,
+            "num_probability": num_conf,
+            "regime": regime,
+            "source": "Adaptive Pattern + Expert",
+            "pattern_str": self._pattern_str(patterns),
+            "experts": experts,
+            "features": features,
+            "wf_bias": wf_bias,
+            "patterns": [
+                {"key": key, "p": p, "support": s}
+                for _, p, s, _, key in patterns
+            ],
+            "exact_distribution": side_adjusted,
+        }
+        return payload
+
+    def _pattern_str(self, patterns: list[tuple[float, float, int, float, str]]) -> str:
+        if not patterns:
+            return "None"
+        _, p, _, _, key = patterns[0]
+        tag = key.split(":")[-1] if ":" in key else key
+        arrow = "⬆️" if p >= 0.5 else "⬇️"
+        return f"<code>{tag}</code> {arrow}"
+
+    def settle(self, history: list[dict[str, Any]]) -> None:
+        lookup = {r["issue"]: r for r in history}
+        pending = self.db.pending_predictions()
+
+        for row in pending:
+            actual = lookup.get(row["issue"])
+            if actual is None:
+                continue
+
+            payload = json.loads(row["payload"])
+            actual_size = int(actual["size"])
+            actual_num = int(actual["num"])
+
+            won_side = int(float(payload["p"]) >= 0.5) == actual_size
+            won_num = payload.get("num") == actual_num
+
+            with self.db.transaction():
+                self.db.c.execute(
+                    """
+                    UPDATE predictions
+                    SET status=?, actual=?, won_number=?
+                    WHERE issue=? AND status='PENDING'
+                    """,
+                    (
+                        "WIN" if won_side else "LOSS",
+                        actual_num,
+                        int(won_num),
+                        row["issue"],
+                    ),
+                )
+
+                for name, val in payload.get("experts", {}).items():
+                    self.db.learn_model(f"expert:{name}:{payload.get('regime', 'MIXED')}", float(val), actual_size)
+
+                for pat in payload.get("patterns", []):
+                    self.db.learn_model(pat["key"], float(pat["p"]), actual_size)
+
+                if payload.get("features") and payload["experts"].get("trend"):
+                    err = actual_size - payload["experts"]["trend"]
+                    tw = self.db.get("trend_weights") or [0.0] * len(payload["features"])
+                    self.db.set("trend_weights", [
+                        clip(w + 0.06 * (err * x - 0.015 * w), -4.0, 4.0)
+                        for w, x in zip(tw, payload["features"])
+                    ])
+
+                sticker = (
+                    "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
+                    if won_side and won_num else
+                    "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
+                    if won_side else
+                    "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
+                )
+                self.db.queue("sticker", row["issue"], sticker)
+
+
+# ============================================================
+# FORMATTING
+# ============================================================
+
+def format_prediction(payload: dict[str, Any]) -> str:
+    prob = float(payload["p"])
+    conf = max(prob, 1.0 - prob) * 100
+    filled = int(conf // 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    side = "BIG" if payload["side"] == "BIG" else "SMALL"
+    marker = "🔴" if payload["side"] == "BIG" else "🔵"
+
+    return (
+        f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 <b>TARGET:</b> {marker} <b>{side}</b> → <code>{payload['num']}</code>\n"
+        f"📅 <b>PERIOD:</b> <code>{escape(payload['issue'])}</code>\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
+        f"🌊 <b>REGIME:</b> {escape(payload.get('regime', 'N/A'))}\n"
+        f"🧩 <b>PATTERN:</b> {payload.get('pattern_str', 'None')}\n"
+        f"📈 <b>WF900:</b> {payload.get('wf_bias', 0):+.3f}\n"
+        "ℹ️ Experimental estimate; not guaranteed.\n"
+        "━━━━━━━━━━━━━━━━━━"
+    )
 
 
 # ============================================================
@@ -762,214 +899,123 @@ class Runtime:
     def __init__(self, db: Database):
         self.db = db
         self.engine = Engine(db)
-        self.stop_event = asyncio.Event()
+        self.stop = asyncio.Event()
         self.last_fetch = 0.0
 
     async def pause(self, seconds: float) -> None:
         try:
-            await asyncio.wait_for(
-                self.stop_event.wait(),
-                timeout=max(0.05, seconds),
-            )
+            await asyncio.wait_for(self.stop.wait(), timeout=max(0.05, seconds))
         except asyncio.TimeoutError:
             pass
 
     async def fetch(self, session: aiohttp.ClientSession) -> list[dict[str, Any]]:
-        async def fetch_one(url: str) -> list[dict[str, Any]]:
+        async def one(url: str) -> list[dict[str, Any]]:
             try:
-                async with session.get(url) as response:
-                    response.raise_for_status()
-                    payload = await response.json(content_type=None)
+                async with session.get(url) as r:
+                    r.raise_for_status()
+                    payload = await r.json(content_type=None)
                     return parse_history(payload)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                LOG.warning("History source failed (%s): %s", url, exc)
+            except Exception:
                 return []
 
-        results = await asyncio.gather(
-            *(fetch_one(url) for url in CFG.urls)
-        )
-        usable_sources = [rows for rows in results if rows]
-
-        if not usable_sources:
-            raise RuntimeError("No history source returned usable records")
+        sources = [x for x in await asyncio.gather(*(one(u) for u in CFG.urls)) if x]
+        if not sources:
+            raise RuntimeError("HistoryUnavailable")
 
         merged: dict[str, dict[str, Any]] = {}
-        for rows in usable_sources:
+        for rows in sources:
             for row in rows:
-                issue = row["issue"]
-                existing = merged.get(issue)
-                if existing and existing["num"] != row["num"]:
-                    raise ValueError(f"History source conflict for issue {issue}")
-                merged[issue] = row
+                if row["issue"] in merged and merged[row["issue"]]["num"] != row["num"]:
+                    raise ValueError("SourceConflict")
+                merged[row["issue"]] = row
 
-        return sorted(
-            merged.values(),
-            key=lambda row: int(row["issue"]),
-        )[-CFG.max_history:]
+        return sorted(merged.values(), key=lambda x: int(x["issue"]))[-CFG.max_history:]
 
     async def worker(self, session: aiohttp.ClientSession) -> None:
         failures = 0
-
-        while not self.stop_event.is_set():
+        while not self.stop.is_set():
             try:
                 records = await self.fetch(session)
                 self.db.ingest(records)
                 history = self.db.history()
-
-                if not history:
-                    raise RuntimeError("History database is empty")
+                self.last_fetch = time.time()
 
                 self.engine.settle(history)
-                self.last_fetch = time.time()
-                failures = 0
 
+                latest = int(history[-1]["issue"])
                 if len(history) >= CFG.min_history:
-                    latest_issue = int(history[-1]["issue"])
-                    next_issue = str(latest_issue + 1)
-
-                    exists = self.db.c.execute(
-                        "SELECT 1 FROM predictions WHERE issue=?",
-                        (next_issue,),
-                    ).fetchone()
-
+                    issue = str(latest + 1)
+                    exists = self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
                     if not exists:
-                        prediction = self.engine.predict(history, next_issue)
-                        message = format_prediction(prediction)
-
+                        pred = self.engine.predict(history, issue)
                         with self.db.transaction():
                             self.db.c.execute(
-                                """
-                                INSERT INTO predictions(
-                                    issue,created,status,payload,actual,won_number
-                                )
-                                VALUES (?,?,?, ?,NULL,0)
-                                """,
-                                (
-                                    next_issue,
-                                    time.time(),
-                                    "PENDING",
-                                    json.dumps(prediction, separators=(",", ":")),
-                                ),
+                                "INSERT INTO predictions VALUES (?,?,?,?,NULL,0)",
+                                (issue, time.time(), "PENDING", json.dumps(pred),)
                             )
-                            self.db.queue(
-                                "prediction",
-                                next_issue,
-                                message,
-                                time.time() + CFG.delivery_ttl,
-                            )
+                            self.db.queue("prediction", issue, format_prediction(pred), time.time() + CFG.delivery_ttl)
+
+                failures = 0
 
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                LOG.exception("Worker failure: %s", exc)
                 failures += 1
-                LOG.exception("Worker iteration failed")
 
-            backoff = min(
-                60.0,
-                CFG.fetch_every * (2 ** min(failures, 4)),
-            )
-            await self.pause(backoff)
+            await self.pause(min(60, CFG.fetch_every * (2 ** min(failures, 4))))
 
     async def sender(self, session: aiohttp.ClientSession) -> None:
-        endpoint_message = (
-            f"https://api.telegram.org/bot{CFG.token}/sendMessage"
-        )
-        endpoint_sticker = (
-            f"https://api.telegram.org/bot{CFG.token}/sendSticker"
-        )
+        endpoint_msg = f"https://api.telegram.org/bot{CFG.token}/sendMessage"
+        endpoint_sticker = f"https://api.telegram.org/bot{CFG.token}/sendSticker"
         backoff = 1.0
 
-        while not self.stop_event.is_set():
-            now = time.time()
-            self.db.c.execute(
-                """
-                UPDATE outbox SET sent=2
-                WHERE sent=0 AND expires IS NOT NULL AND expires <= ?
-                """,
-                (now,),
-            )
-
+        while not self.stop.is_set():
+            self.db.c.execute("UPDATE outbox SET sent=2 WHERE sent=0 AND expires <= ?", (time.time(),))
             row = self.db.c.execute(
-                """
-                SELECT id,kind,text
-                FROM outbox
-                WHERE sent=0
-                ORDER BY id ASC
-                LIMIT 1
-                """
+                "SELECT * FROM outbox WHERE sent=0 ORDER BY id ASC LIMIT 1"
             ).fetchone()
-
             if not row:
                 await self.pause(0.5)
                 continue
 
-            is_sticker = row["kind"] == "sticker"
-            url = endpoint_sticker if is_sticker else endpoint_message
-            payload = (
-                {"chat_id": CFG.chat, "sticker": row["text"]}
-                if is_sticker
-                else {
+            delay = backoff
+            try:
+                url = endpoint_sticker if row["kind"] == "sticker" else endpoint_msg
+                payload = {"chat_id": CFG.chat, "sticker": row["text"]} if row["kind"] == "sticker" else {
                     "chat_id": CFG.chat,
                     "text": row["text"],
                     "parse_mode": "HTML",
                 }
-            )
 
-            delay = backoff
-            try:
                 async with session.post(url, json=payload) as response:
                     data = await response.json(content_type=None)
-
                     if response.status == 200 and data.get("ok"):
-                        self.db.c.execute(
-                            "UPDATE outbox SET sent=1 WHERE id=?",
-                            (row["id"],),
-                        )
+                        self.db.c.execute("UPDATE outbox SET sent=1 WHERE id=?", (row["id"],))
                         backoff = 1.0
                         continue
 
-                    error_code = data.get("error_code", response.status)
-                    if error_code == 429:
-                        retry_after = data.get("parameters", {}).get(
-                            "retry_after", 10
-                        )
-                        delay = max(1.0, float(retry_after))
-                    elif error_code in (400, 401, 403, 404):
-                        LOG.error(
-                            "Telegram rejected outbox item (%s): %s",
-                            error_code,
-                            data.get("description", "no description"),
-                        )
-                        delay = 60.0
-                    else:
-                        LOG.warning(
-                            "Telegram response %s: %s",
-                            response.status,
-                            data,
-                        )
-
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                LOG.exception("Telegram request failed")
-                delay = 10.0
+                    code = data.get("error_code", response.status)
+                    if code == 429:
+                        delay = float(data.get("parameters", {}).get("retry_after", 10))
+                    elif code in (400, 401, 403, 404):
+                        delay = 60
+            except Exception as e:
+                LOG.warning("Telegram network fail: %s", e)
+                delay = 10
 
             await self.pause(delay)
-            backoff = min(60.0, backoff * 2.0)
+            backoff = min(60.0, backoff * 2)
 
     async def health(self, request: web.Request) -> web.Response:
         stats = self.db.health_stats()
-        fresh = self.last_fetch > 0 and time.time() - self.last_fetch < 90
+        status = "ok" if self.last_fetch and time.time() - self.last_fetch < 90 else "degraded"
 
-        return web.json_response(
-            {
-                "status": "ok" if fresh else "degraded",
-                "last_successful_fetch": self.last_fetch or None,
-                **stats,
-            }
-        )
+        return web.json_response({
+            "status": status,
+            "last_fetch": self.last_fetch,
+            **stats
+        })
 
 
 # ============================================================
@@ -978,14 +1024,13 @@ class Runtime:
 
 async def main() -> None:
     CFG.validate()
-
     db = Database(CFG.db_path)
     runtime = Runtime(db)
 
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):
-            loop.add_signal_handler(sig, runtime.stop_event.set)
+            loop.add_signal_handler(sig, runtime.stop.set)
 
     app = web.Application()
     app.router.add_get("/", runtime.health)
@@ -994,72 +1039,40 @@ async def main() -> None:
     tasks: list[asyncio.Task] = []
     stop_task: asyncio.Task | None = None
 
-    timeout = aiohttp.ClientTimeout(total=CFG.timeout)
-    # Default aiohttp connector verifies TLS certificates.
-    connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300)
-
     try:
         await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", CFG.port)
-        await site.start()
+        await web.TCPSite(runner, "0.0.0.0", CFG.port).start()
 
-        async with aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector,
-        ) as session:
+        timeout = aiohttp.ClientTimeout(total=CFG.timeout)
+        connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300)
+
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
             tasks = [
-                asyncio.create_task(
-                    runtime.worker(session),
-                    name="history-worker",
-                ),
-                asyncio.create_task(
-                    runtime.sender(session),
-                    name="telegram-sender",
-                ),
+                asyncio.create_task(runtime.worker(session), name="worker"),
+                asyncio.create_task(runtime.sender(session), name="sender"),
             ]
-            stop_task = asyncio.create_task(
-                runtime.stop_event.wait(),
-                name="shutdown-waiter",
-            )
+            stop_task = asyncio.create_task(runtime.stop.wait())
+            LOG.info("%s started", CFG.name)
+            await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
+            runtime.stop.set()
 
-            LOG.info(
-                "%s started on port %s; %d history source(s)",
-                CFG.name,
-                CFG.port,
-                len(CFG.urls),
-            )
-
-            done, _ = await asyncio.wait(
-                [*tasks, stop_task],
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
-            runtime.stop_event.set()
-
-            for task in done:
-                if task is stop_task or task.cancelled():
-                    continue
-                exc = task.exception()
-                if exc:
-                    raise exc
+            for task in tasks:
+                if task.done() and not task.cancelled():
+                    exc = task.exception()
+                    if exc:
+                        raise exc
 
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
     finally:
-        runtime.stop_event.set()
-
+        runtime.stop.set()
         for task in tasks:
             task.cancel()
         if stop_task:
             stop_task.cancel()
-
-        await asyncio.gather(
-            *tasks,
-            *([stop_task] if stop_task else []),
-            return_exceptions=True,
-        )
+        await asyncio.gather(*tasks, *([stop_task] if stop_task else []), return_exceptions=True)
         await runner.cleanup()
         db.close()
 
