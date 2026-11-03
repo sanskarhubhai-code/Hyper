@@ -1,5 +1,5 @@
 """
-FTW Predictor V34 — Trend-Shift Assassin (Proactive Recovery)
+FTW Predictor V34 — Trend-Shift Assassin (Proactive Recovery) - FIXED
 Python 3.10+
 Deps: aiohttp
 """
@@ -252,7 +252,6 @@ class Database:
         wrong = int(probability >= 0.5) != actual
         
         # 🔥 NEW: INSTANT FLIP ON CONFIDENT MISTAKE
-        # If expert was >65% confident and wrong, count it as 2 failures!
         was_confident = probability >= 0.65 or probability <= 0.35
         if wrong and was_confident:
             failures = m["failures"] + 2
@@ -273,7 +272,6 @@ class Database:
         inv = m["inverse_loss"] / n
         failures = m["failures"]
 
-        # If failures >= 2 (or 1 confident mistake), FLIP IT!
         flipped = False
         if failures >= 2 and (inv + 0.01 < brier):
             flipped = True
@@ -454,7 +452,6 @@ class Engine:
         experts, patterns, features, regime, current_run = self.mine_experts(seq)
 
         # 🔥 PROACTIVE TREND BREAK DETECTOR
-        # If run is 4+, market is overextended. Kill momentum instantly.
         is_trend_breaking = current_run >= 4
 
         adjusted = []
@@ -630,8 +627,10 @@ class Runtime:
 
 async def main() -> None:
     CFG.validate()
-    db, runtime = Database(CFG.db_path), Runtime(Database(CFG.db_path))
-    runner = web.AppRunner(web.Application().router.add_get("/", runtime.health).app) # Hack for quick setup, normally web.Application()
+    
+    # 🔥 FIXED THE APP INITIALIZATION
+    db = Database(CFG.db_path)
+    runtime = Runtime(db)
     
     app = web.Application()
     app.router.add_get("/", runtime.health)
@@ -639,21 +638,45 @@ async def main() -> None:
     
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        with contextlib.suppress(NotImplementedError): loop.add_signal_handler(sig, runtime.stop.set)
+        with contextlib.suppress(NotImplementedError): 
+            loop.add_signal_handler(sig, runtime.stop.set)
 
     try:
         await runner.setup()
         await web.TCPSite(runner, "0.0.0.0", CFG.port).start()
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=CFG.timeout), connector=aiohttp.TCPConnector(limit=8)) as session:
-            tasks = [asyncio.create_task(runtime.worker(session)), asyncio.create_task(runtime.sender(session))]
-            await asyncio.wait(tasks + [asyncio.create_task(runtime.stop.wait())], return_when=asyncio.FIRST_COMPLETED)
+        
+        timeout = aiohttp.ClientTimeout(total=CFG.timeout)
+        connector = aiohttp.TCPConnector(limit=8, ttl_dns_cache=300)
+        
+        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
+            tasks = [
+                asyncio.create_task(runtime.worker(session), name="worker"),
+                asyncio.create_task(runtime.sender(session), name="sender"),
+            ]
+            stop_task = asyncio.create_task(runtime.stop.wait())
+            LOG.info("%s started", CFG.name)
+            
+            await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
+
+            for t in tasks:
+                if t.done() and not t.cancelled():
+                    exc = t.exception()
+                    if exc: raise exc
+
             for t in tasks: t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            
     finally:
+        runtime.stop.set()
+        for t in tasks: t.cancel()
+        if stop_task: stop_task.cancel()
+        await asyncio.gather(*tasks, *([stop_task] if stop_task else []), return_exceptions=True)
         await runner.cleanup()
         db.close()
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    except KeyboardInterrupt: pass
+    try: 
+        asyncio.run(main())
+    except KeyboardInterrupt: 
+        pass
