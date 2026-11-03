@@ -1,16 +1,7 @@
 """
-FTW Predictor V33+ (pattern restored + adaptive model)
+FTW Predictor V33+ (pattern restored + adaptive model) - FIXED
 Python 3.10+
 Deps: aiohttp
-
-Environment variables:
-  TELEGRAM_TOKEN    required, rotated bot token
-  TELEGRAM_CHAT     required
-  HISTORY_URLS      optional, comma-separated URLs
-  DB_PATH           optional, default predictor_v33_plus.db
-  PORT              optional, default 8080
-  FETCH_EVERY       optional, default 3.0
-  MIN_HISTORY       optional, default 180
 """
 
 from __future__ import annotations
@@ -37,7 +28,6 @@ DEFAULT_HISTORY_URL = (
     "https://sky-predictor-1012593186417.asia-southeast1.run.app/"
     "api/wingo-history-1m-1000"
 )
-
 
 # ============================================================
 # CONFIG
@@ -74,7 +64,6 @@ class Config:
         if self.port < 1 or self.port > 65535:
             raise ValueError("PORT must be valid")
 
-
 CFG = Config()
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -90,20 +79,16 @@ LOG = logging.getLogger("predictor_v33_plus")
 def clip(value: float, low: float = 0.02, high: float = 0.98) -> float:
     return max(low, min(high, float(value)))
 
-
 def sigmoid(z: float) -> float:
     z = max(-25.0, min(25.0, float(z)))
     return 1.0 / (1.0 + math.exp(-z))
-
 
 def logit(p: float, eps: float = 0.02) -> float:
     p = max(eps, min(1.0 - eps, float(p)))
     return math.log(p / (1.0 - p))
 
-
 def escape(value: Any) -> str:
     return html.escape(str(value))
-
 
 def numeric(value: Any) -> int | None:
     if isinstance(value, bool):
@@ -116,7 +101,6 @@ def numeric(value: Any) -> int | None:
     except ValueError:
         return None
 
-
 def weighted_probability(obs: list[tuple[int, float]]) -> tuple[float, float]:
     if not obs:
         return 0.5, 0.0
@@ -125,7 +109,6 @@ def weighted_probability(obs: list[tuple[int, float]]) -> tuple[float, float]:
     eff = (sw * sw / sw2) if sw2 else 0.0
     p = (4.0 + sum(y * w for y, w in obs)) / (8.0 + sw)
     return clip(p), eff
-
 
 def family_run(seq: list[int]) -> list[tuple[int, int]]:
     if not seq:
@@ -143,10 +126,8 @@ def family_run(seq: list[int]) -> list[tuple[int, int]]:
     out.append((cur, count))
     return out
 
-
 def family_signature(seq: list[int]) -> tuple[tuple[int, int], ...]:
     return tuple((int(v), cnt) for v, cnt in family_run(seq))
-
 
 def entropy_bits(seq: list[int]) -> float:
     if not seq:
@@ -158,7 +139,6 @@ def entropy_bits(seq: list[int]) -> float:
         p = freq / total
         e -= p * math.log2(p)
     return e
-
 
 def get_regime(seq: list[int]) -> str:
     tail = seq[-24:]
@@ -181,7 +161,6 @@ def get_regime(seq: list[int]) -> str:
     if abs(sum(tail) / len(tail) - 0.5) > 0.20:
         return "IMBAL"
     return "MIXED"
-
 
 def trend_features(seq: list[int]) -> list[float]:
     if not seq:
@@ -235,11 +214,9 @@ def trend_features(seq: list[int]) -> list[float]:
         mean(6) - mean(24),
     ]
 
-
 def recency_weight(index: int, n: int, half_life: float = 330.0) -> float:
     age = max(0, n - 1 - index)
     return 0.5 ** (age / half_life)
-
 
 def parse_history(payload: Any) -> list[dict[str, Any]]:
     obj = payload
@@ -422,7 +399,8 @@ class Database:
 
     def learn_model(self, key: str, probability: float, actual: int) -> None:
         m = self.memory(key)
-        n = CFG.fetch_every * 0.985 * m["n"] + 1.0
+        # 🔥 FIX: Removed CFG.fetch_every from decay calculation
+        n = 0.985 * m["n"] + 1.0
         loss = 0.985 * m["loss"] + (probability - actual) ** 2
         inv = 0.985 * m["inverse_loss"] + (1.0 - probability - actual) ** 2
         wrong = int(probability >= 0.5) != actual
@@ -566,7 +544,6 @@ def recent_frequency(nums: list[int], window: int = 200) -> list[float]:
     total = sum(counts.values())
     return [counts.get(i, 0) / total if total > 0 else 0.1 for i in range(10)]
 
-
 def markov_predict(nums: list[int], order: int = 2) -> list[float]:
     if not nums:
         return [0.1] * 10
@@ -583,7 +560,6 @@ def markov_predict(nums: list[int], order: int = 2) -> list[float]:
     if total <= 0:
         return recent_frequency(nums)
     return [counts[k] / total for k in range(10)]
-
 
 def exact_number_model(history: list[dict[str, Any]]) -> list[float]:
     nums = [int(r["num"]) for r in history]
@@ -681,10 +657,11 @@ class Engine:
                 if den > 0:
                     experts["patterns"] = clip(num / den)
 
+        # 🔥 FIX: Changed range to include the most recent data
         for order in (1, 2, 3):
             suffix = tuple(seq[-order:])
             obs: list[tuple[int, float]] = []
-            for i in range(order, n - order):
+            for i in range(order, n):
                 if tuple(seq[i - order:i]) == suffix:
                     obs.append((seq[i], weight(i)))
             if len(obs) >= CFG.min_support:
