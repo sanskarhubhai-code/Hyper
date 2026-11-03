@@ -1,5 +1,5 @@
 """
-FTW Predictor V34 — Trend-Shift Assassin (Proactive Recovery) - FIXED
+FTW Predictor V34.1 — Trend-Shift Assassin (Neutralized Bias)
 Python 3.10+
 Deps: aiohttp
 """
@@ -38,7 +38,7 @@ class Config:
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
-    db_path: str = os.getenv("DB_PATH", "predictor_v34_assassin.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v34_neutral.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3.0"))
     timeout: float = 18.0
@@ -251,7 +251,6 @@ class Database:
         
         wrong = int(probability >= 0.5) != actual
         
-        # 🔥 NEW: INSTANT FLIP ON CONFIDENT MISTAKE
         was_confident = probability >= 0.65 or probability <= 0.35
         if wrong and was_confident:
             failures = m["failures"] + 2
@@ -362,8 +361,9 @@ def walk_forward_900(history: list[dict[str, Any]], p_raw: float) -> tuple[float
     micro = sum(sizes[-30:]) / len(sizes[-30:]) if sizes else 0.5
     entropy = entropy_bits([row["num"] for row in window[-50:]]) / 3.32
     
-    wf = (micro - 0.5) * 0.45 + (mid - 0.5) * 0.35 + (macro - 0.5) * 0.20 + (entropy - 0.5) * 0.30
-    wf = clip(wf, -0.35, 0.35)
+    # 🔥 BIAS REDUCED: Smaller multiplier and capped at 0.15
+    wf = (micro - 0.5) * 0.30 + (mid - 0.5) * 0.20 + (macro - 0.5) * 0.10 + (entropy - 0.5) * 0.20
+    wf = clip(wf, -0.15, 0.15)
     return clip(p_raw + wf), wf
 
 
@@ -451,7 +451,6 @@ class Engine:
         loss_streak = self.db.get_loss_streak()
         experts, patterns, features, regime, current_run = self.mine_experts(seq)
 
-        # 🔥 PROACTIVE TREND BREAK DETECTOR
         is_trend_breaking = current_run >= 4
 
         adjusted = []
@@ -472,13 +471,22 @@ class Engine:
 
         total_w = sum(w for _, w in adjusted)
         p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
-        p_raw, wf_bias = walk_forward_900(history, clip(p_avg))
+        
+        # 🔥 FIX: If trend is breaking, kill the WF900 macro bias.
+        if is_trend_breaking:
+            p_raw = clip(p_avg)
+            wf_bias = 0.0
+        else:
+            p_raw, wf_bias = walk_forward_900(history, clip(p_avg))
 
         pred_side = "BIG" if p_raw >= 0.5 else "SMALL"
         allowed = range(5, 10) if pred_side == "BIG" else range(0, 5)
 
         exact_dist = exact_number_model(history)
-        side_adjusted = [exact_dist[k] * 2.0 if k in allowed else exact_dist[k] * 0.1 for k in range(10)]
+        
+        # 🔥 FIX: Softened the exact number forcing (1.3 and 0.6 instead of 2.0 and 0.1)
+        side_adjusted = [exact_dist[k] * 1.3 if k in allowed else exact_dist[k] * 0.6 for k in range(10)]
+        
         total = sum(side_adjusted)
         if total <= 0: side_adjusted = [0.1] * 10; total = 10.0
         side_adjusted = [x / total for x in side_adjusted]
@@ -628,7 +636,6 @@ class Runtime:
 async def main() -> None:
     CFG.validate()
     
-    # 🔥 FIXED THE APP INITIALIZATION
     db = Database(CFG.db_path)
     runtime = Runtime(db)
     
