@@ -1,5 +1,5 @@
 """
-FTW Predictor V34 — Hybrid (Pattern + Safe Adaptive)
+FTW Predictor V34 — Hybrid (Pattern + Safe Adaptive) - JACKPOT FIXED
 Python 3.10+
 Dependencies: aiohttp
 """
@@ -43,15 +43,16 @@ class Config:
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 18.0
-    max_history: int = 3500 # Render safe limit
+    max_history: int = 3500 
     min_history: int = int(os.getenv("MIN_HISTORY", "180"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "12"))
     delivery_ttl: float = 600.0
     name: str = "FTW PREDICTOR (HYBRID V34)"
 
-    # 🔥 Stickers
+    # 🔥 Stickers (Jackpot wapas add kar diya)
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
+    jack_sticker: str = "CAACAgUAAxkBAAFW0Ipq4QlLbGgRu5R3TIIiSY_9z1uNuwACSxQAAu1zgVchvQvX59KsHD0E"
 
     @property
     def urls(self) -> tuple[str, ...]:
@@ -219,7 +220,6 @@ class Engine:
             candidates = []
             for item in pats:
                 key = "pattern:" + item["pattern_str"]
-                # Note: adapt_expert takes (name, regime, probability)
                 adjusted, rel = self.db.adapt_expert(key, get_regime(seq), item["p"])
                 candidates.append((adjusted, rel * math.sqrt(max(1.0, item["eff_n"]))))
             if candidates:
@@ -352,7 +352,14 @@ class Engine:
                 if pat_str and pat_str != "—" and "patterns" in saved_experts:
                     self.db.learn_expert("pattern:" + pat_str, regime, float(saved_experts["patterns"]), actual_size)
 
-                sticker = CFG.win_sticker if side_won else CFG.loss_sticker
+                # 🔥 JACKPOT LOGIC WAPAS ADD KAR DIYA
+                if side_won and number_won:
+                    sticker = CFG.jack_sticker
+                elif side_won:
+                    sticker = CFG.win_sticker
+                else:
+                    sticker = CFG.loss_sticker
+                    
                 self.db.queue("sticker", row["issue"], sticker)
 
 
@@ -563,7 +570,11 @@ class Runtime:
 
 async def main() -> None:
     CFG.validate()
-    db, runtime = Database(CFG.db_path), Runtime(Database(CFG.db_path))
+    
+    # 🔥 FIXED: Database double instantiate nahi hoga ab
+    db = Database(CFG.db_path)
+    runtime = Runtime(db)
+    
     app = web.Application()
     app.router.add_get("/", runtime.health)
     runner = web.AppRunner(app)
