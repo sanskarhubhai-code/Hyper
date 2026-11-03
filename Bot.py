@@ -1,7 +1,7 @@
 """
-FTW Predictor V35 — QUANTUM ELITE (Deep Advanced)
+FTW Predictor V34.5 — Enhanced Hybrid (Pattern + Anti-Mistake)
 Python 3.10+
-Deps: aiohttp
+Dependencies: aiohttp
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import os
 import signal
 import sqlite3
 import time
-from collections import Counter, deque
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -38,15 +38,15 @@ class Config:
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
-    db_path: str = os.getenv("DB_PATH", "predictor_elite_v35.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hybrid_v345.db")
     port: int = int(os.getenv("PORT", "8080"))
-    fetch_every: float = float(os.getenv("FETCH_EVERY", "3.0"))
+    fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 18.0
-    max_history: int = 3500
+    max_history: int = 3500 
     min_history: int = int(os.getenv("MIN_HISTORY", "180"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "12"))
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (QUANTUM V35)"
+    name: str = "FTW PREDICTOR (HYBRID V34.5)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -61,20 +61,20 @@ class Config:
         if not self.chat: raise ValueError("TELEGRAM_CHAT is required")
 
 CFG = Config()
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-LOG = logging.getLogger("predictor_elite")
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+LOG = logging.getLogger("predictor_v345")
 
 
 # ============================================================
-# HELPERS & MATH
+# HELPERS & PATTERN MATCHING
 # ============================================================
 
 def clip(value: float, low: float = 0.02, high: float = 0.98) -> float:
     return max(low, min(high, float(value)))
-
-def sigmoid(z: float) -> float:
-    z = max(-25.0, min(25.0, float(z)))
-    return 1.0 / (1.0 + math.exp(-z))
 
 def escape(value: Any) -> str:
     return html.escape(str(value))
@@ -86,16 +86,17 @@ def numeric(value: Any) -> int | None:
     try: return int(text)
     except ValueError: return None
 
-def weighted_probability(obs: list[tuple[int, float]]) -> tuple[float, float]:
-    if not obs: return 0.5, 0.0
-    sw = sum(w for _, w in obs)
-    sw2 = sum(w * w for _, w in obs)
-    eff = (sw * sw / sw2) if sw2 else 0.0
-    p = (4.0 + sum(y * w for y, w in obs)) / (8.0 + sw)
-    return clip(p), eff
+def weighted_probability(observations: list[tuple[int, float]]) -> tuple[float, float]:
+    if not observations: return 0.5, 0.0
+    weight_sum = sum(weight for _, weight in observations)
+    squared_weight_sum = sum(weight * weight for _, weight in observations)
+    effective_n = (weight_sum * weight_sum / squared_weight_sum) if squared_weight_sum > 0 else 0.0
+    probability = (4.0 + sum(value * weight for value, weight in observations)) / (8.0 + weight_sum)
+    return clip(probability), effective_n
 
 def recency_weight(index: int, n: int, half_life: float = 330.0) -> float:
-    return 0.5 ** (max(0, n - 1 - index) / half_life)
+    age = max(0, n - 1 - index)
+    return 0.5 ** (age / half_life)
 
 def get_regime(seq: list[int]) -> str:
     tail = seq[-24:]
@@ -111,18 +112,6 @@ def get_regime(seq: list[int]) -> str:
     if abs(sum(tail) / len(tail) - 0.5) > 0.20: return "IMBAL"
     return "MIXED"
 
-# 🔥 CUSUM (Trend Change Detector)
-def cusum_change(seq: list[int], threshold=2.5) -> int:
-    if len(seq) < 20: return 0
-    mean = sum(seq[-20:]) / 20.0
-    s_pos, s_neg = 0.0, 0.0
-    for val in seq[-20:]:
-        s_pos = max(0, s_pos + (val - mean) - 0.5)
-        s_neg = min(0, s_neg + (val - mean) + 0.5)
-    if s_pos > threshold: return 1  # Shift to BIG
-    if s_neg < -threshold: return -1 # Shift to SMALL
-    return 0
-
 def family_run(seq: list[int]) -> list[tuple[int, int]]:
     if not seq: return []
     out, cur, count = [], seq[0], 1
@@ -136,6 +125,37 @@ def family_run(seq: list[int]) -> list[tuple[int, int]]:
 
 def family_signature(seq: list[int]) -> tuple:
     return tuple((int(v), cnt) for v, cnt in family_run(seq))
+
+class QuantumTracker:
+    def __init__(self, min_len=3, max_len=8, min_support=12):
+        self.min_len = min_len
+        self.max_len = max_len
+        self.min_support = min_support
+
+    def match_tail_patterns(self, seq: list[int]) -> list[dict]:
+        n = len(seq)
+        if n < 18: return []
+        results = []
+        for length in range(self.max_len, self.min_len - 1, -1):
+            suffix = seq[-length:]
+            sig = family_signature(suffix)
+            obs = []
+            for i in range(n - length):
+                if family_signature(seq[i:i + length]) == sig:
+                    w = recency_weight(i + length, n, 420.0)
+                    obs.append((seq[i + length], w))
+            if len(obs) < self.min_support: continue
+            
+            p, eff_n = weighted_probability(obs)
+            score = abs(p - 0.5) * math.sqrt(max(1.0, eff_n))
+            if score > 0.0:
+                pattern_str = "-".join(f"{'B' if v else 'S'}{c}" for v, c in sig)
+                results.append({
+                    "sig": sig, "p": p, "support": len(obs), "eff_n": eff_n, 
+                    "score": score, "pattern_str": pattern_str
+                })
+            break
+        return results
 
 def parse_history(payload: Any) -> list[dict[str, Any]]:
     obj = payload
@@ -165,41 +185,7 @@ def parse_history(payload: Any) -> list[dict[str, Any]]:
 
 
 # ============================================================
-# QUANTUM TRACKER (Pattern Miner)
-# ============================================================
-
-class QuantumTracker:
-    def __init__(self, min_len=3, max_len=10, min_support=12):
-        self.min_len, self.max_len, self.min_support = min_len, max_len, min_support
-
-    def match_tail_patterns(self, seq: list[int]) -> list[dict]:
-        n = len(seq)
-        if n < 18: return []
-        results = []
-        for length in range(self.max_len, self.min_len - 1, -1):
-            suffix = seq[-length:]
-            sig = family_signature(suffix)
-            obs = []
-            for i in range(n - length):
-                if family_signature(seq[i:i + length]) == sig:
-                    w = recency_weight(i + length, n, 420.0)
-                    obs.append((seq[i + length], w))
-            if len(obs) < self.min_support: continue
-            
-            p, eff_n = weighted_probability(obs)
-            score = abs(p - 0.5) * math.sqrt(max(1.0, eff_n))
-            if score > 0.0:
-                pattern_str = "-".join(f"{'B' if v else 'S'}{c}" for v, c in sig)
-                results.append({
-                    "sig": sig, "p": p, "support": len(obs), "eff_n": eff_n, 
-                    "score": score, "pattern_str": pattern_str
-                })
-            break
-        return results
-
-
-# ============================================================
-# DATABASE (Weight Learning & Blacklist)
+# DATABASE (With Failure Tracking & Blacklist)
 # ============================================================
 
 class Database:
@@ -263,18 +249,17 @@ class Database:
         mean_loss = float(row["loss"]) / n
         fails = int(row["failures"])
 
-        # Base reliability from Brier Score
-        reliability = math.exp(-3.5 * max(-0.10, mean_loss - 0.25))
+        reliability = math.exp(-3.0 * max(-0.10, mean_loss - 0.25))
         
-        # 🔥 ADAPTIVE PENALTY: If expert fails 2+ times, cut its weight
+        # 🔥 PUNISH CONSECUTIVE FAILURES
         if fails >= 2: reliability *= 0.3
         if fails >= 4: reliability *= 0.1
 
-        # Flip prediction if it keeps failing
+        # Flip if it keeps making mistakes
         if fails >= 3 and mean_loss > 0.26:
             probability = 1.0 - probability
 
-        return clip(probability), max(0.1, min(1.5, reliability))
+        return clip(probability), max(0.1, min(1.8, reliability))
 
     def is_blacklisted(self, pattern: str) -> bool:
         row = self.c.execute("SELECT fails FROM blacklist WHERE pattern=?", (pattern,)).fetchone()
@@ -298,10 +283,10 @@ class Database:
 
 
 # ============================================================
-# ENGINE (Meta-Learner & CUSUM)
+# ENGINE (Error Prevention & Proactive Breaks)
 # ============================================================
 
-EXPERT_NAMES = ("patterns", "markov1", "markov2", "markov3", "run", "regime", "base", "trend", "momentum", "reversal", "cusum")
+EXPERT_NAMES = ("patterns", "base", "recent", "markov1", "markov2", "markov3", "run", "regime", "momentum", "reversal")
 
 class Engine:
     def __init__(self, db: Database): self.db = db
@@ -313,8 +298,8 @@ class Engine:
         experts = {}
         pattern_display = "—"
 
-        # 1. Patterns (Strict Blacklisting)
-        tracker = QuantumTracker(min_len=3, max_len=10, min_support=CFG.min_support)
+        # 1. Patterns (With Blacklist Check)
+        tracker = QuantumTracker(min_len=3, max_len=8, min_support=CFG.min_support)
         pats = tracker.match_tail_patterns(seq)
         if pats:
             pattern_display = pats[0]["pattern_str"]
@@ -329,17 +314,18 @@ class Engine:
                     den = sum(w for _, w in candidates)
                     if den > 0: experts["patterns"] = clip(num / den)
 
-        # 2. Statistical Baseline
+        # 2. Baseline & Markov
         experts["base"] = weighted_probability([(val, recency_weight(i, n)) for i, val in enumerate(seq)])[0]
+        recent = seq[-100:]
+        experts["recent"] = (4.0 + sum(recent)) / (8.0 + len(recent))
 
-        # 3. Markov Chains
         for order in (1, 2, 3):
             if n <= order: continue
             context = tuple(seq[-order:])
             obs = [(seq[i], recency_weight(i, n)) for i in range(order, n - order + 1) if tuple(seq[i - order:i]) == context]
             if len(obs) >= CFG.min_support: experts[f"markov{order}"] = weighted_probability(obs)[0]
 
-        # 4. Run continuation
+        # 3. Run Continuation
         if n >= 2:
             last_val = seq[-1]
             current_run = 1
@@ -351,19 +337,15 @@ class Engine:
             obs = [(seq[i], recency_weight(i, n)) for i in range(1, n) if seq[i-1] == last_val and min(run_at[i-1], 8) == min(current_run, 8)]
             if len(obs) >= CFG.min_support: experts["run"] = weighted_probability(obs)[0]
 
-        # 5. Regime
+        # 4. Regime
         regime = get_regime(seq)
         obs = [(seq[i], recency_weight(i, n)) for i in range(24, n) if get_regime(seq[max(0, i - 96):i]) == regime]
         if len(obs) >= CFG.min_support: experts["regime"] = weighted_probability(obs)[0]
 
-        # 6. Momentum & Reversal
+        # 5. Momentum & Reversal
         momentum = sum(seq[-4:]) / 4.0 if seq else 0.5
         experts["momentum"] = 0.2 + (momentum * 0.6)
         experts["reversal"] = 1.0 - experts["momentum"]
-
-        # 7. CUSUM (Change Point)
-        change = cusum_change(seq)
-        experts["cusum"] = 0.65 if change == 1 else 0.35 if change == -1 else 0.5
 
         for k in EXPERT_NAMES:
             experts[k] = clip(experts.get(k, 0.5), 0.05, 0.95)
@@ -374,26 +356,32 @@ class Engine:
         seq = [int(row["size"]) for row in history]
         experts, pattern_display = self._mine_experts(seq)
         regime = get_regime(seq)
-        loss_streak = self.db.c.execute("SELECT COUNT(*) FROM predictions WHERE status='LOSS' ORDER BY created DESC LIMIT 1").fetchone()[0] # dummy streak check
         
+        # 🔥 PROACTIVE TREND BREAK DETECTOR
+        current_run = 1
+        if len(seq) >= 2:
+            last_val = seq[-1]
+            for v in reversed(seq[:-1]):
+                if v != last_val: break
+                current_run += 1
+        is_trend_breaking = current_run >= 4
+
         weighted_sum = 0.0
         total_weight = 0.0
 
         for name, probability in experts.items():
             if name == "patterns":
                 adjusted, reliability = self.db.adapt_expert("patterns", regime, probability)
-                reliability *= 3.0 # Boost pattern weight
-            elif name == "cusum":
-                adjusted, reliability = probability, 2.0 # High weight for change detection
+                reliability *= 3.0 
             else:
                 adjusted, reliability = self.db.adapt_expert(name, regime, probability)
             
-            # 🔥 ANTI-STUBBORN GUARD
-            if loss_streak >= 1 and name in ("momentum", "run", "trend"):
-                reliability *= 0.2 # Kill trend followers after loss
-            if loss_streak >= 1 and name == "reversal":
-                reliability *= 2.5 # Boost contrarian after loss
-            
+            # 🔥 KILL TREND EXPERTS IF TREND IS BREAKING
+            if is_trend_breaking and name in ("momentum", "run", "recent", "base"):
+                reliability *= 0.10
+            if is_trend_breaking and name == "reversal":
+                reliability *= 3.50
+
             weighted_sum += adjusted * reliability
             total_weight += reliability
 
@@ -403,7 +391,6 @@ class Engine:
         side = "BIG" if p >= 0.5 else "SMALL"
         allowed_nums = range(5, 10) if side == "BIG" else range(0, 5)
         
-        # Exact Number blending
         num_dist = exact_number_distribution(history)
         side_adj = [num_dist[k] * 1.5 if k in allowed_nums else num_dist[k] * 0.5 for k in range(10)]
         total = sum(side_adj)
@@ -419,7 +406,7 @@ class Engine:
             "regime": regime,
             "pattern": pattern_display,
             "experts": experts,
-            "source": "Quantum V35 Elite",
+            "source": "Hybrid V34.5 (Anti-Mistake)",
             "created": time.time(),
         }
 
@@ -447,8 +434,16 @@ class Engine:
                     if "patterns" in payload.get("experts", {}):
                         self.db.learn_expert("pattern:" + pat_str, regime, float(payload["experts"]["patterns"]), actual_size)
 
-                sticker = CFG.jack_sticker if (won_side and won_num) else CFG.win_sticker if won_side else CFG.loss_sticker
+                # Jackpot logic
+                if won_side and won_num:
+                    sticker = CFG.jack_sticker
+                elif won_side:
+                    sticker = CFG.win_sticker
+                else:
+                    sticker = CFG.loss_sticker
+                    
                 self.db.queue("sticker", row["issue"], sticker)
+
 
 def exact_number_distribution(history: list[dict[str, Any]]) -> list[float]:
     nums = [int(row["num"]) for row in history]
