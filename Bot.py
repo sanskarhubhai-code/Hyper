@@ -1,5 +1,5 @@
 """
-FTW Predictor V36 — HYBRID X (Super Advanced + Trend + Seed Patterns)
+FTW Predictor V36 — HYBRID X (Super Advanced + Trend + Seed Patterns) - FIXED
 Python 3.10+
 Deps: aiohttp
 """
@@ -284,12 +284,21 @@ class Database:
 
     def adapt_expert(self, name: str, regime: str, probability: float) -> tuple[float, float]:
         row = self.c.execute("SELECT n, loss, failures FROM expert_models WHERE name=? AND regime=?", (name, regime)).fetchone()
-        if not row or float(row["n"]) < 1.0: return probability, 1.0
-        n, mean_loss, fails = float(row["n"]), float(row["loss"]) / float(row["n"]), int(row["failures"])
+        if not row or float(row["n"]) < 1.0: 
+            return probability, 1.0
+        
+        n = float(row["n"])
+        mean_loss = float(row["loss"]) / n
+        fails = int(row["failures"])
+
         reliability = math.exp(-3.0 * max(-0.10, mean_loss - 0.25))
+        
         if fails >= 2: reliability *= 0.3
         if fails >= 4: reliability *= 0.1
-        if fails >= 3 and mean_loss > 0.26: probability = 1.0 - probability
+
+        if fails >= 3 and mean_loss > 0.26:
+            probability = 1.0 - probability
+
         return clip(probability), max(0.1, min(1.8, reliability))
 
     def is_blacklisted(self, pattern: str) -> bool:
@@ -335,7 +344,7 @@ class Engine:
         
         # 2. Exact Seed Patterns
         seed_pats = []
-        for length in range(4, 13): # seed length from 4 to 12
+        for length in range(4, 13): 
             suffix = tuple(seq[-length:])
             obs = []
             for i in range(n - length):
@@ -358,17 +367,18 @@ class Engine:
 
         experts = {}
         pattern_display = "—"
+        regime = get_regime(seq)
 
         # 1. Patterns & Seed
         fam_pats, seed_pats = self.mine_patterns(seq)
         
         if fam_pats:
             pattern_display = fam_pats[0][4].split(":")[-1]
-            candidates = [(self.db.adapt_expert(k, get_regime(seq), p)[0], self.db.adapt_expert(k, get_regime(seq), p)[1] * math.sqrt(max(1.0, eff))) for _, p, _, eff, k in fam_pats]
+            candidates = [(self.db.adapt_expert(k, regime, p)[0], self.db.adapt_expert(k, regime, p)[1] * math.sqrt(max(1.0, eff))) for _, p, _, eff, k in fam_pats]
             if candidates: experts["patterns"] = clip(sum(p * w for p, w in candidates) / sum(w for _, w in candidates))
 
         if seed_pats:
-            candidates = [(self.db.adapt_expert(k, get_regime(seq), p)[0], self.db.adapt_expert(k, get_regime(seq), p)[1] * math.sqrt(max(1.0, eff))) for _, p, _, eff, k in seed_pats]
+            candidates = [(self.db.adapt_expert(k, regime, p)[0], self.db.adapt_expert(k, regime, p)[1] * math.sqrt(max(1.0, eff))) for _, p, _, eff, k in seed_pats]
             if candidates: experts["seed"] = clip(sum(p * w for p, w in candidates) / sum(w for _, w in candidates))
 
         # 2. Baseline & Markov
@@ -393,7 +403,6 @@ class Engine:
             if len(obs) >= CFG.min_support: experts["run"] = weighted_probability(obs)[0]
 
         # 4. Regime
-        regime = get_regime(seq)
         obs = [(seq[i], recency_weight(i, n)) for i in range(24, n) if get_regime(seq[max(0, i - 96):i]) == regime]
         if len(obs) >= CFG.min_support: experts["regime"] = weighted_probability(obs)[0]
 
@@ -426,7 +435,8 @@ class Engine:
 
         adjusted = []
         for name, prob in experts.items():
-            corrected, weight = self.db.adapt_expert(f"expert:{name}:{regime}", prob)
+            # 🔥 FIXED: Added regime argument here
+            corrected, weight = self.db.adapt_expert(f"expert:{name}", regime, prob)
             if name in ("patterns", "seed"): weight *= 2.5
             if is_trend_breaking and name in ("momentum", "run", "recent", "base"): weight *= 0.10
             if is_trend_breaking and name == "reversal": weight *= 3.50
@@ -482,12 +492,17 @@ class Engine:
                 self.db.c.execute("UPDATE predictions SET status=?, actual=?, won_number=? WHERE issue=? AND status='PENDING'", ("WIN" if won_side else "LOSS", actual["num"], int(won_num), row["issue"]))
                 
                 regime = payload.get("regime", "MIXED")
-                for name, prob in payload.get("experts", {}).items():
-                    self.db.learn_expert(f"expert:{name}:{regime}", regime, float(prob), actual_size)
                 
+                # 🔥 FIXED: Learn expert state
+                for name, prob in payload.get("experts", {}).items():
+                    self.db.learn_expert(f"expert:{name}", regime, float(prob), actual_size)
+                
+                # 🔥 FIXED: Learn pattern state
                 pat_str = payload.get("pattern")
                 if pat_str and pat_str != "—":
                     self.db.add_blacklist("q:" + pat_str, wrong=not won_side)
+                    if "patterns" in payload.get("experts", {}):
+                        self.db.learn_expert("q:" + pat_str, regime, float(payload["experts"]["patterns"]), actual_size)
 
                 # 🔥 Learn Trend Weights
                 if payload.get("features") and payload["experts"].get("trend"):
