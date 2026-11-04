@@ -1,5 +1,5 @@
 """
-FTW Predictor V36 — HYBRID X (Super Advanced + Trend + Seed Patterns) - FIXED
+FTW Predictor V38 — HYPER-SMART (Smart Sub-Patterns + Deep Recovery)
 Python 3.10+
 Deps: aiohttp
 """
@@ -38,15 +38,15 @@ class Config:
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
-    db_path: str = os.getenv("DB_PATH", "predictor_hybrid_v36.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_hyper_v38.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 18.0
     max_history: int = 3500 
     min_history: int = int(os.getenv("MIN_HISTORY", "180"))
-    min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "12"))
+    min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (HYBRID V36 X)"
+    name: str = "FTW PREDICTOR (HYPER V38)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -66,7 +66,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-LOG = logging.getLogger("predictor_v36")
+LOG = logging.getLogger("predictor_v38")
 
 
 # ============================================================
@@ -120,50 +120,6 @@ def get_regime(seq: list[int]) -> str:
     if abs(sum(tail) / len(tail) - 0.5) > 0.20: return "IMBAL"
     return "MIXED"
 
-def trend_features(seq: list[int]) -> list[float]:
-    if not seq: return [0.0] * 20
-    def mean(k: int) -> float:
-        arr = seq[-k:]
-        return sum(arr) / len(arr) if arr else 0.5
-    def ema(k: int) -> float:
-        if not seq: return 0.5
-        alpha = 2.0 / (k + 1)
-        v = float(seq[0])
-        for x in seq[1:]: v = alpha * x + (1.0 - alpha) * v
-        return v
-    def std(k: int) -> float:
-        arr = seq[-k:]
-        if len(arr) < 2: return 0.0
-        m = sum(arr) / len(arr)
-        return math.sqrt(sum((x - m) ** 2 for x in arr) / len(arr))
-    
-    tail = seq[-24:]
-    alt = sum(a != b for a, b in zip(tail, tail[1:])) / max(1, len(tail) - 1)
-    run_score = (2 * seq[-1] - 1) * min(len(list(filter(lambda x: x == seq[-1], seq[-12:]))), 12) / 12.0
-    macd = (ema(12) - ema(26)) * 2.0
-    
-    return [1.0, 2*mean(3)-1, 2*mean(5)-1, 2*mean(10)-1, 2*mean(24)-1, 2*mean(48)-1, 
-            2*mean(96)-1, mean(3)-mean(10), mean(5)-mean(24), mean(10)-mean(48), 
-            run_score, 2*seq[-1]-1, (2*alt-1)*(2*seq[-1]-1), macd, 2*std(10)-1, 
-            2*std(24)-1, mean(3)-mean(12), mean(8)-mean(24), mean(12)-mean(48), mean(6)-mean(24)]
-
-def logistic(weights: list[float], features: list[float]) -> float:
-    return sigmoid(sum(w * x for w, x in zip(weights, features)))
-
-def family_run(seq: list[int]) -> list[tuple[int, int]]:
-    if not seq: return []
-    out, cur, count = [], seq[0], 1
-    for x in seq[1:]:
-        if x == cur: count += 1
-        else:
-            out.append((cur, count))
-            cur, count = x, 1
-    out.append((cur, count))
-    return out
-
-def family_signature(seq: list[int]) -> tuple:
-    return tuple((int(v), cnt) for v, cnt in family_run(seq))
-
 def parse_history(payload: Any) -> list[dict[str, Any]]:
     obj = payload
     for _ in range(8):
@@ -192,36 +148,95 @@ def parse_history(payload: Any) -> list[dict[str, Any]]:
 
 
 # ============================================================
-# PATTERN TRACKER (Family + Seed)
+# SMART PATTERN MINER (Sub-Patterns + Number + Flip)
 # ============================================================
 
-class QuantumTracker:
-    def __init__(self, min_len=3, max_len=8, min_support=12):
-        self.min_len, self.max_len, self.min_support = min_len, max_len, min_support
+class SmartPatternMiner:
+    def __init__(self, db: "Database"):
+        self.db = db
 
-    def match_tail_patterns(self, seq: list[int]) -> list[dict]:
+    def find_best_size_pattern(self, seq: list[int], regime: str) -> tuple[float, str]:
+        """Starts from length 10, falls back to shorter if unreliable. Flips if failing."""
         n = len(seq)
-        if n < 18: return []
-        results = []
-        for length in range(self.max_len, self.min_len - 1, -1):
-            suffix = seq[-length:]
-            sig = family_signature(suffix)
+        if n < 15: return 0.5, "—"
+        
+        best_p = 0.5
+        best_name = "—"
+        best_weight = 0.0
+
+        # Try lengths from 10 down to 5
+        for length in range(10, 4, -1):
+            if n < length * 2: continue
+            
+            suffix = tuple(seq[-length:])
             obs = []
             for i in range(n - length):
-                if family_signature(seq[i:i + length]) == sig:
-                    obs.append((seq[i + length], 0.5 ** ((n - 1 - (i + length)) / 420.0)))
-            if len(obs) < self.min_support: continue
-            p, eff_n = weighted_probability(obs)
-            score = abs(p - 0.5) * math.sqrt(max(1.0, eff_n))
-            if score > 0.0:
-                pattern_str = "-".join(f"{'B' if v else 'S'}{c}" for v, c in sig)
-                results.append({"sig": sig, "p": p, "support": len(obs), "eff_n": eff_n, "score": score, "pattern_str": pattern_str})
-            break
-        return results
+                if tuple(seq[i:i + length]) == suffix:
+                    obs.append((seq[i + length], recency_weight(i + length, n, 420.0)))
+            
+            if len(obs) >= CFG.min_support:
+                p, eff = weighted_probability(obs)
+                key = "size:" + "".join("B" if x else "S" for x in suffix)
+                
+                # Check DB for this pattern's historical performance
+                adjusted_p, rel = self.db.adapt_pattern(key, regime, p, is_number=False)
+                
+                # If this pattern has good historical reliability, use it as the strongest
+                score = rel * math.sqrt(max(1.0, eff))
+                if score > best_weight:
+                    best_weight = score
+                    best_p = adjusted_p
+                    best_name = "".join("B" if x else "S" for x in suffix)
+                
+                # If we found a highly reliable pattern (rel > 1.0), we can stop going shorter
+                if rel > 1.0:
+                    break
+
+        return best_p, best_name
+
+    def find_best_number_pattern(self, nums: list[int], regime: str) -> tuple[list[float], str]:
+        """Finds n-gram patterns for exact numbers (0-9)."""
+        n = len(nums)
+        if n < 15: return [0.1] * 10, "—"
+        
+        best_dist = [0.1] * 10
+        best_name = "—"
+        best_weight = 0.0
+
+        for length in range(5, 1, -1):
+            if n < length * 2: continue
+            
+            suffix = tuple(nums[-length:])
+            obs = {}
+            total = 0
+            
+            for i in range(n - length):
+                if tuple(nums[i:i + length]) == suffix:
+                    nxt = nums[i + length]
+                    obs[nxt] = obs.get(nxt, 0) + 1
+                    total += 1
+            
+            if total >= CFG.min_support:
+                key = "num:" + ",".join(str(x) for x in suffix)
+                dist = [(obs.get(k, 0) + 1.0) / (total + 10.0) for k in range(10)]
+                
+                # Adjust via DB
+                adjusted_dist, rel = self.db.adapt_number_pattern(key, regime, dist)
+                
+                score = rel * math.sqrt(total)
+                if score > best_weight:
+                    best_weight = score
+                    best_dist = adjusted_dist
+                    best_name = ",".join(str(x) for x in suffix)
+                
+                if rel > 1.0:
+                    break
+                    
+        return best_dist, best_name
 
 
 # ============================================================
-# DATABASE (Advanced Learning & Blacklist)
+# DATABASE (Pattern Tracking & Learning)
 # ============================================================
 
 class Database:
@@ -235,7 +250,7 @@ class Database:
             CREATE TABLE IF NOT EXISTS history(issue TEXT PRIMARY KEY, num INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS predictions(issue TEXT PRIMARY KEY, created REAL NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, actual INTEGER, won_number INTEGER NOT NULL DEFAULT 0);
             CREATE TABLE IF NOT EXISTS expert_models(name TEXT NOT NULL, regime TEXT NOT NULL, n REAL NOT NULL, loss REAL NOT NULL, failures INTEGER NOT NULL, PRIMARY KEY(name, regime));
-            CREATE TABLE IF NOT EXISTS blacklist(pattern TEXT PRIMARY KEY, fails INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS pattern_models(name TEXT PRIMARY KEY, n REAL NOT NULL, loss REAL NOT NULL, failures INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, issue TEXT, text TEXT NOT NULL, created REAL NOT NULL, expires REAL, sent INTEGER NOT NULL DEFAULT 0);
         """)
@@ -270,6 +285,14 @@ class Database:
     def pending_predictions(self) -> list[sqlite3.Row]:
         return self.c.execute("SELECT issue,payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER) ASC").fetchall()
 
+    def get_loss_streak(self) -> int:
+        rows = self.c.execute("SELECT status FROM predictions WHERE status IN ('WIN','LOSS') ORDER BY created DESC LIMIT 5").fetchall()
+        streak = 0
+        for r in rows:
+            if r["status"] == "LOSS": streak += 1
+            else: break
+        return streak
+
     def learn_expert(self, name: str, regime: str, probability: float, actual: int) -> None:
         row = self.c.execute("SELECT n, loss, failures FROM expert_models WHERE name=? AND regime=?", (name, regime)).fetchone()
         old_n, old_loss, old_fails = (float(row["n"]), float(row["loss"]), int(row["failures"])) if row else (0.0, 0.0, 0)
@@ -284,31 +307,51 @@ class Database:
 
     def adapt_expert(self, name: str, regime: str, probability: float) -> tuple[float, float]:
         row = self.c.execute("SELECT n, loss, failures FROM expert_models WHERE name=? AND regime=?", (name, regime)).fetchone()
-        if not row or float(row["n"]) < 1.0: 
-            return probability, 1.0
+        if not row or float(row["n"]) < 1.0: return probability, 1.0
+        n, mean_loss, fails = float(row["n"]), float(row["loss"]) / float(row["n"]), int(row["failures"])
+        reliability = math.exp(-3.0 * max(-0.10, mean_loss - 0.25))
+        if fails >= 2: reliability *= 0.3
+        if fails >= 4: reliability *= 0.1
+        if fails >= 3 and mean_loss > 0.26: probability = 1.0 - probability
+        return clip(probability), max(0.1, min(1.8, reliability))
+
+    # 🔥 SMART PATTERN LEARNING (Flips if wrong)
+    def learn_pattern(self, key: str, probability: float, actual: int, is_number: bool = False) -> None:
+        row = self.c.execute("SELECT n, loss, failures FROM pattern_models WHERE name=?", (key,)).fetchone()
+        old_n, old_loss, old_fails = (float(row["n"]), float(row["loss"]), int(row["failures"])) if row else (0.0, 0.0, 0)
+        
+        n = 0.985 * old_n + 1.0
+        if is_number:
+            # For numbers, loss is binary (did it predict the exact number?)
+            loss = 0.985 * old_loss + (1.0 if probability < 0.5 else 0.0) 
+        else:
+            loss = 0.985 * old_loss + (clip(probability) - actual) ** 2
+            
+        wrong = int(probability >= 0.5) != actual
+        fails = old_fails + 1 if wrong else 0
+
+        self.c.execute(
+            "INSERT INTO pattern_models(name,n,loss,failures) VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET n=excluded.n, loss=excluded.loss, failures=excluded.failures",
+            (key, n, loss, fails)
+        )
+
+    def adapt_pattern(self, key: str, regime: str, probability: float, is_number: bool = False) -> tuple[float, float]:
+        row = self.c.execute("SELECT n, loss, failures FROM pattern_models WHERE name=?", (key,)).fetchone()
+        if not row or float(row["n"]) < 2.0: return probability, 1.0
         
         n = float(row["n"])
         mean_loss = float(row["loss"]) / n
         fails = int(row["failures"])
 
-        reliability = math.exp(-3.0 * max(-0.10, mean_loss - 0.25))
-        
-        if fails >= 2: reliability *= 0.3
-        if fails >= 4: reliability *= 0.1
+        reliability = math.exp(-4.0 * max(-0.10, mean_loss - 0.25))
+        if fails >= 2: reliability *= 0.2
+        if fails >= 4: reliability *= 0.05
 
-        if fails >= 3 and mean_loss > 0.26:
+        # 🔥 FLIP LOGIC: If it fails 2+ times, invert its prediction
+        if fails >= 2 and mean_loss > 0.27:
             probability = 1.0 - probability
-
-        return clip(probability), max(0.1, min(1.8, reliability))
-
-    def is_blacklisted(self, pattern: str) -> bool:
-        row = self.c.execute("SELECT fails FROM blacklist WHERE pattern=?", (pattern,)).fetchone()
-        return bool(row and row["fails"] >= 3)
-
-    def add_blacklist(self, pattern: str, wrong: bool):
-        row = self.c.execute("SELECT fails FROM blacklist WHERE pattern=?", (pattern,)).fetchone()
-        fails = (row["fails"] if row else 0) + (1 if wrong else 0)
-        self.c.execute("INSERT INTO blacklist(pattern,fails) VALUES (?,?) ON CONFLICT(pattern) DO UPDATE SET fails=excluded.fails", (pattern, fails))
+            
+        return clip(probability), max(0.05, min(2.0, reliability))
 
     def queue(self, kind: str, issue: str | None, text: str, expires: float | None = None) -> None:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
@@ -322,68 +365,32 @@ class Database:
 
 
 # ============================================================
-# ENGINE (META-LEARNER + SEED PATTERNS + TREND)
+# ENGINE (META-LEARNER + STRONG RECOVERY)
 # ============================================================
 
-EXPERT_NAMES = ["patterns", "seed", "base", "recent", "markov1", "markov2", "markov3", "run", "regime", "momentum", "reversal", "trend"]
+EXPERT_NAMES = ["pattern", "markov1", "markov2", "markov3", "run", "regime", "base", "trend", "momentum", "reversal"]
 
 class Engine:
-    def __init__(self, db: Database): self.db = db
+    def __init__(self, db: Database):
+        self.db = db
+        self.miner = SmartPatternMiner(db)
 
-    def mine_patterns(self, seq: list[int]) -> tuple[list[tuple], list[tuple]]:
-        if len(seq) < 18: return [], []
-        n = len(seq)
-        
-        # 1. Family Patterns (QuantumTracker)
-        tracker = QuantumTracker(min_len=3, max_len=10, min_support=CFG.min_support)
-        family_pats = []
-        for item in tracker.match_tail_patterns(seq)[:4]:
-            key = "q:" + item["pattern_str"]
-            if not self.db.is_blacklisted(key):
-                family_pats.append((item["score"], item["p"], item["support"], item["eff_n"], key))
-        
-        # 2. Exact Seed Patterns
-        seed_pats = []
-        for length in range(4, 13): 
-            suffix = tuple(seq[-length:])
-            obs = []
-            for i in range(n - length):
-                if tuple(seq[i:i + length]) == suffix:
-                    obs.append((seq[i + length], 0.5 ** ((n - 1 - (i + length)) / 420.0)))
-            if len(obs) >= CFG.min_support:
-                p, eff_n = weighted_probability(obs)
-                score = abs(p - 0.5) * math.sqrt(max(1.0, eff_n))
-                if score > 0.0:
-                    bits = "".join("B" if x else "S" for x in suffix)
-                    key = f"seed:{bits}"
-                    if not self.db.is_blacklisted(key):
-                        seed_pats.append((score, p, len(obs), eff_n, key))
-                        
-        return family_pats, seed_pats
-
-    def _mine_experts(self, seq: list[int]) -> tuple[dict[str, float], str]:
-        n = len(seq)
-        if not n: return {name: 0.5 for name in EXPERT_NAMES}, "—"
-
-        experts = {}
-        pattern_display = "—"
+    def predict(self, history: list[dict[str, Any]], issue: str) -> dict[str, Any]:
+        seq = [int(row["size"]) for row in history]
+        nums = [int(row["num"]) for row in history]
         regime = get_regime(seq)
+        n = len(seq)
+        loss_streak = self.db.get_loss_streak()
 
-        # 1. Patterns & Seed
-        fam_pats, seed_pats = self.mine_patterns(seq)
+        # 1. Smart Patterns
+        pat_p, pat_name = self.miner.find_best_size_pattern(seq, regime)
+        num_dist, num_pat_name = self.miner.find_best_number_pattern(nums, regime)
         
-        if fam_pats:
-            pattern_display = fam_pats[0][4].split(":")[-1]
-            candidates = [(self.db.adapt_expert(k, regime, p)[0], self.db.adapt_expert(k, regime, p)[1] * math.sqrt(max(1.0, eff))) for _, p, _, eff, k in fam_pats]
-            if candidates: experts["patterns"] = clip(sum(p * w for p, w in candidates) / sum(w for _, w in candidates))
+        experts = {}
+        experts["pattern"] = pat_p
 
-        if seed_pats:
-            candidates = [(self.db.adapt_expert(k, regime, p)[0], self.db.adapt_expert(k, regime, p)[1] * math.sqrt(max(1.0, eff))) for _, p, _, eff, k in seed_pats]
-            if candidates: experts["seed"] = clip(sum(p * w for p, w in candidates) / sum(w for _, w in candidates))
-
-        # 2. Baseline & Markov
+        # 2. Statistical Experts
         experts["base"] = weighted_probability([(val, recency_weight(i, n)) for i, val in enumerate(seq)])[0]
-        experts["recent"] = (4.0 + sum(seq[-100:])) / (8.0 + len(seq[-100:]))
 
         for order in (1, 2, 3):
             if n <= order: continue
@@ -391,7 +398,6 @@ class Engine:
             obs = [(seq[i], recency_weight(i, n)) for i in range(order, n) if tuple(seq[i - order:i]) == context]
             if len(obs) >= CFG.min_support: experts[f"markov{order}"] = weighted_probability(obs)[0]
 
-        # 3. Run Continuation
         if n >= 2:
             last_val, current_run = seq[-1], 1
             for v in reversed(seq[:-1]):
@@ -402,50 +408,38 @@ class Engine:
             obs = [(seq[i], recency_weight(i, n)) for i in range(1, n) if seq[i-1] == last_val and min(run_at[i-1], 8) == min(current_run, 8)]
             if len(obs) >= CFG.min_support: experts["run"] = weighted_probability(obs)[0]
 
-        # 4. Regime
         obs = [(seq[i], recency_weight(i, n)) for i in range(24, n) if get_regime(seq[max(0, i - 96):i]) == regime]
         if len(obs) >= CFG.min_support: experts["regime"] = weighted_probability(obs)[0]
 
-        # 5. Trend (MACD & RSI)
-        features = trend_features(seq)
-        tw = self.db.get("trend_weights")
-        if not isinstance(tw, list) or len(tw) != len(features): tw = [0.0] * len(features)
-        experts["trend"] = logistic(tw, features)
-
-        # 6. Momentum & Reversal
+        # 3. Trend & Momentum
+        features = self.db.get("trend_features_cache", [0.0]*20) # Simplified trend for V38
+        experts["trend"] = 0.5 # Neutral
         momentum = sum(seq[-4:]) / 4.0 if seq else 0.5
         experts["momentum"] = 0.2 + (momentum * 0.6)
         experts["reversal"] = 1.0 - experts["momentum"]
 
         for k in EXPERT_NAMES: experts[k] = clip(experts.get(k, 0.5), 0.05, 0.95)
-        return experts, pattern_display
 
-    def predict(self, history: list[dict[str, Any]], issue: str) -> dict[str, Any]:
-        seq = [int(row["size"]) for row in history]
-        experts, pattern_display = self._mine_experts(seq)
-        regime = get_regime(seq)
-        
-        current_run = 1
-        if len(seq) >= 2:
-            last_val = seq[-1]
-            for v in reversed(seq[:-1]):
-                if v != last_val: break
-                current_run += 1
-        is_trend_breaking = current_run >= 4
-
+        # 4. Weight Adjustment & Recovery
         adjusted = []
         for name, prob in experts.items():
-            # 🔥 FIXED: Added regime argument here
             corrected, weight = self.db.adapt_expert(f"expert:{name}", regime, prob)
-            if name in ("patterns", "seed"): weight *= 2.5
-            if is_trend_breaking and name in ("momentum", "run", "recent", "base"): weight *= 0.10
-            if is_trend_breaking and name == "reversal": weight *= 3.50
+            
+            # Pattern gets high priority if reliable
+            if name == "pattern": weight *= 2.0
+
+            # 🔥 HYPER RECOVERY: 1 loss = Kill momentum, boost reversal
+            if loss_streak >= 1:
+                if name in ("momentum", "run", "trend"): weight *= 0.1
+                if name == "reversal": weight *= 3.5
+                if name == "pattern": weight *= 2.5 # Trust pattern flip during recovery
+
             adjusted.append((corrected, weight))
 
         total_w = sum(w for _, w in adjusted)
         p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
 
-        # 🔥 Meta-Learner
+        # 5. Strong Decider (Meta-Learner)
         m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES] + [1.0]
         mw = self.db.get("meta_weights")
         if not isinstance(mw, list) or len(mw) != len(m_feats): mw = [1.0 / len(EXPERT_NAMES)] * len(EXPERT_NAMES) + [0.0]
@@ -454,14 +448,18 @@ class Engine:
         alpha = min(self.db.get("meta_n", 0) / 80.0, 1.0)
         p = clip(alpha * p_meta + (1.0 - alpha) * p_avg)
 
+        # Force flip if loss streak is high and probability is weak
+        if loss_streak >= 2 and 0.45 < p < 0.55:
+            p = 1.0 - p
+
         side = "BIG" if p >= 0.5 else "SMALL"
         allowed_nums = range(5, 10) if side == "BIG" else range(0, 5)
         
-        num_dist = exact_number_distribution(history)
-        side_adj = [num_dist[k] * 1.5 if k in allowed_nums else num_dist[k] * 0.5 for k in range(10)]
-        total = sum(side_adj)
-        side_adj = [x / total for x in side_adj]
-        num_pred = max(allowed_nums, key=lambda k: side_adj[k])
+        # Exact Number blending
+        num_dist_blended = [num_dist[k] * 1.5 if k in allowed_nums else num_dist[k] * 0.5 for k in range(10)]
+        total_num = sum(num_dist_blended)
+        num_dist_blended = [x / total_num for x in num_dist_blended]
+        num_pred = max(allowed_nums, key=lambda k: num_dist_blended[k])
 
         return {
             "issue": issue,
@@ -469,11 +467,11 @@ class Engine:
             "side": side,
             "number": num_pred,
             "regime": regime,
-            "pattern": pattern_display,
+            "pattern": pat_name,
+            "num_pattern": num_pat_name,
             "experts": experts,
-            "features": trend_features(seq),
             "meta_feats": m_feats,
-            "source": "Hybrid V36 X (Super)",
+            "source": "Hyper-Smart V38",
             "created": time.time(),
         }
 
@@ -485,32 +483,30 @@ class Engine:
 
             payload = json.loads(row["payload"])
             actual_size = int(actual["size"])
+            actual_num = int(actual["num"])
             won_side = int(float(payload["p"]) >= 0.5) == actual_size
-            won_num = payload.get("number") == actual["num"]
+            won_num = payload.get("number") == actual_num
 
             with self.db.transaction():
-                self.db.c.execute("UPDATE predictions SET status=?, actual=?, won_number=? WHERE issue=? AND status='PENDING'", ("WIN" if won_side else "LOSS", actual["num"], int(won_num), row["issue"]))
+                self.db.c.execute("UPDATE predictions SET status=?, actual=?, won_number=? WHERE issue=? AND status='PENDING'", ("WIN" if won_side else "LOSS", actual_num, int(won_num), row["issue"]))
                 
                 regime = payload.get("regime", "MIXED")
                 
-                # 🔥 FIXED: Learn expert state
                 for name, prob in payload.get("experts", {}).items():
                     self.db.learn_expert(f"expert:{name}", regime, float(prob), actual_size)
                 
-                # 🔥 FIXED: Learn pattern state
-                pat_str = payload.get("pattern")
-                if pat_str and pat_str != "—":
-                    self.db.add_blacklist("q:" + pat_str, wrong=not won_side)
-                    if "patterns" in payload.get("experts", {}):
-                        self.db.learn_expert("q:" + pat_str, regime, float(payload["experts"]["patterns"]), actual_size)
+                # Learn Size Pattern
+                pat_name = payload.get("pattern")
+                if pat_name and pat_name != "—":
+                    self.db.learn_pattern("size:" + pat_name, float(payload["experts"]["pattern"]), actual_size)
+                
+                # Learn Number Pattern (We check if the top predicted number was correct)
+                num_pat = payload.get("num_pattern")
+                if num_pat and num_pat != "—":
+                    pred_num = payload.get("number")
+                    prob_num = 1.0 if pred_num == actual_num else 0.0
+                    self.db.learn_pattern("num:" + num_pat, prob_num, actual_num, is_number=True)
 
-                # 🔥 Learn Trend Weights
-                if payload.get("features") and payload["experts"].get("trend"):
-                    err = actual_size - payload["experts"]["trend"]
-                    tw = self.db.get("trend_weights") or [0.0] * len(payload["features"])
-                    self.db.set("trend_weights", [clip(w + 0.05 * (err * x - 0.015 * w), -4.0, 4.0) for w, x in zip(tw, payload["features"])])
-
-                # 🔥 Learn Meta Weights
                 if payload.get("meta_feats"):
                     feats = payload["meta_feats"]
                     if len(feats) == len(EXPERT_NAMES) + 1:
@@ -524,23 +520,6 @@ class Engine:
                 self.db.queue("sticker", row["issue"], sticker)
 
 
-def exact_number_distribution(history: list[dict[str, Any]]) -> list[float]:
-    nums = [int(row["num"]) for row in history]
-    if not nums: return [0.1] * 10
-    counts = Counter(nums[-200:])
-    total = sum(counts.values())
-    base = [counts.get(n, 0) / total if total > 0 else 0.1 for n in range(10)]
-    for order in (1, 2):
-        if len(nums) <= order: continue
-        ctx = tuple(nums[-order:])
-        trans = Counter(nums[i] for i in range(order, len(nums)) if tuple(nums[i-order:i]) == ctx)
-        tot = sum(trans.values())
-        if tot > 5:
-            for n in range(10): base[n] = base[n] * 0.6 + (trans.get(n, 0) / tot) * 0.4
-    total = sum(base)
-    return [x / total for x in base]
-
-
 def format_prediction(payload: dict[str, Any]) -> str:
     prob = float(payload["p"])
     conf = max(prob, 1.0 - prob) * 100
@@ -548,8 +527,11 @@ def format_prediction(payload: dict[str, Any]) -> str:
     bar = "█" * filled + "░" * (10 - filled)
     side = "BIG" if payload["side"] == "BIG" else "SMALL"
     marker = "🔴" if side == "BIG" else "🔵"
+    
     pat = payload.get("pattern", "—")
-    pat_line = f"\n🧩 <b>PATTERN:</b> <code>{escape(pat)}</code>" if pat != "—" else ""
+    pat_line = f"\n🧩 <b>SIZE PATTERN:</b> <code>{escape(pat)}</code>" if pat != "—" else ""
+    num_pat = payload.get("num_pattern", "—")
+    num_pat_line = f"\n🔢 <b>NUM PATTERN:</b> <code>{escape(num_pat)}</code>" if num_pat != "—" else ""
 
     return (
         f"⚡ <b>{escape(CFG.name)}</b> ⚡\n"
@@ -559,7 +541,7 @@ def format_prediction(payload: dict[str, Any]) -> str:
         f"📅 <b>ISSUE:</b> <code>{escape(payload['issue'])}</code>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
-        f"🌊 <b>REGIME:</b> {escape(payload['regime'])}{pat_line}\n"
+        f"🌊 <b>REGIME:</b> {escape(payload['regime'])}{pat_line}{num_pat_line}\n"
         "━━━━━━━━━━━━━━━━━━"
     )
 
