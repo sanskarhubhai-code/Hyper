@@ -1,5 +1,5 @@
 """
-FTW Predictor V46.1 — ULTIMATE QUANT (Fixed Settlement Bug)
+FTW Predictor V47 — HYPER-CONSENSUS (Pattern Agreement + Deep Number Match)
 Python 3.10+
 Deps: aiohttp
 """
@@ -38,7 +38,7 @@ class Config:
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
-    db_path: str = os.getenv("DB_PATH", "predictor_v46_fixed.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v47.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 18.0
@@ -46,7 +46,7 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "180"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (V46 ULTIMATE)"
+    name: str = "FTW PREDICTOR (V47 CONSENSUS)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -66,7 +66,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-LOG = logging.getLogger("predictor_v46")
+LOG = logging.getLogger("predictor_v47")
 
 
 # ============================================================
@@ -165,18 +165,20 @@ def parse_history(payload: Any) -> list[dict[str, Any]]:
 
 
 # ============================================================
-# SMART PATTERN MINER
+# SMART PATTERN MINER (Consensus Voting)
 # ============================================================
 
 class SmartPatternMiner:
     def __init__(self, db: "Database"):
         self.db = db
 
-    def find_best_size_pattern(self, seq: list[int], regime: str) -> tuple[float, str, int, int]:
+    def find_best_size_pattern(self, seq: list[int], regime: str) -> tuple[str, str, int, int]:
+        """Returns: (side, pattern_name, big_count, small_count)"""
         n = len(seq)
-        if n < 15: return 0.5, "—", 0, 0
+        if n < 15: return "BIG", "—", 0, 0
         
         candidates = []
+        lengths_checked = 0
         
         for length in range(8, 4, -1):
             if n < length * 2: continue
@@ -190,6 +192,7 @@ class SmartPatternMiner:
                     obs.append((seq[i + length], recency_weight(i + length, n, 420.0)))
             
             if len(obs) >= CFG.min_support:
+                lengths_checked += 1
                 p, eff = weighted_probability(obs)
                 big_c = sum(1 for val, _ in obs if val == 1)
                 small_c = len(obs) - big_c
@@ -201,25 +204,33 @@ class SmartPatternMiner:
                 
                 if rel < 0.15: continue
                 
+                # Store both the side it suggests and its reliability score
+                side = "BIG" if adjusted_p >= 0.5 else "SMALL"
                 score = rel * math.sqrt(max(1.0, eff))
-                candidates.append((score, adjusted_p, pattern_str, big_c, small_c))
+                candidates.append((score, side, pattern_str, big_c, small_c))
 
         if not candidates:
-            return 0.5, "—", 0, 0
+            return "BIG", "—", 0, 0
             
-        candidates.sort(key=lambda x: x[0], reverse=True)
+        # 🔥 CONSENSUS VOTING
+        # Count how many independent lengths vote for BIG vs SMALL
+        big_votes = sum(1 for c in candidates if c[1] == "BIG")
+        small_votes = sum(1 for c in candidates if c[1] == "SMALL")
         
-        best_score, best_p, best_name, best_big, best_small = candidates[0]
-        
-        if len(candidates) > 1:
-            score2, p2, name2, big2, small2 = candidates[1]
-            if score2 > best_score * 0.8: 
-                best_p = (best_p * 0.6) + (p2 * 0.4)
-                best_big += big2
-                best_small += small2
-                best_name += f" & {name2}"
+        if big_votes > small_votes:
+            final_side = "BIG"
+        elif small_votes > big_votes:
+            final_side = "SMALL"
+        else:
+            # Tie-breaker: Use the highest scoring pattern
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            final_side = candidates[0][1]
+            
+        # Return the top pattern of the winning side
+        best_for_side = max((c for c in candidates if c[1] == final_side), key=lambda x: x[0])
+        _, _, best_name, best_big, best_small = best_for_side
 
-        return best_p, best_name, best_big, best_small
+        return final_side, best_name, best_big, best_small
 
 
 # ============================================================
@@ -374,27 +385,28 @@ class Engine:
         nums = [int(row["num"]) for row in history]
         regime = get_regime(seq)
 
-        pat_p, pat_name, pat_big, pat_small = self.miner.find_best_size_pattern(seq, regime)
+        side, pat_name, pat_big, pat_small = self.miner.find_best_size_pattern(seq, regime)
         num_dist, num_info = track_numbers(nums)
         
         cusum_dir = cusum_change(seq)
+        reason = ""
         
         if pat_name != "—":
-            side = "BIG" if pat_big >= pat_small else "SMALL"
             p = 0.5 + abs(pat_big - pat_small) / max(1, pat_big + pat_small) * 0.5
             
             if cusum_dir == 1 and side == "SMALL":
                 side = "BIG"
                 p = 0.55
-                pat_name += " (CUSUM Reversal)"
+                reason = "CUSUM Trend Shift overruled to BIG"
             elif cusum_dir == -1 and side == "BIG":
                 side = "SMALL"
                 p = 0.55
-                pat_name += " (CUSUM Reversal)"
+                reason = "CUSUM Trend Shift overruled to SMALL"
         else:
             recent_big = sum(seq[-20:]) / 20.0
             side = "BIG" if recent_big >= 0.5 else "SMALL"
             p = 0.5 + abs(recent_big - 0.5) * 0.4
+            reason = "No Pattern Found, used Recent Trend"
 
         allowed_nums = range(5, 10) if side == "BIG" else range(0, 5)
         
@@ -424,7 +436,8 @@ class Engine:
             "pat_big": pat_big,
             "pat_small": pat_small,
             "num_tracking": num_info,
-            "source": "V46 Ultimate",
+            "override_reason": reason,
+            "source": "V47 Consensus",
             "created": time.time(),
         }
 
@@ -438,8 +451,8 @@ class Engine:
             actual_size = int(actual["size"])
             actual_num = int(actual["num"])
             
-            # 🔥 FIXED: Use the explicit side from the payload, NOT the p-value.
-            predicted_side = payload.get("side", "BIG" if float(payload["p"]) >= 0.5 else "SMALL")
+            # 🔥 FIXED: Use the explicit side from the payload
+            predicted_side = payload.get("side", "BIG")
             actual_side = "BIG" if actual_size == 1 else "SMALL"
             
             won_side = predicted_side == actual_side
@@ -451,8 +464,7 @@ class Engine:
                 
                 pat_name = payload.get("pattern")
                 if pat_name and pat_name != "—":
-                    clean_pat = pat_name.replace(" (CUSUM Reversal)", "")
-                    self.db.learn_pattern("size_family:" + clean_pat, float(payload["p"]), actual_size)
+                    self.db.learn_pattern("size_family:" + pat_name, float(payload["p"]), actual_size)
 
                 sticker = CFG.jack_sticker if (won_side and won_num) else CFG.win_sticker if won_side else CFG.loss_sticker
                 self.db.queue("sticker", row["issue"], sticker)
@@ -479,6 +491,9 @@ def format_prediction(payload: dict[str, Any]) -> str:
     
     n1 = int(payload["number"])
     nconf = payload.get("num_conf", 0) * 100
+    
+    override = payload.get("override_reason", "")
+    override_line = f"\n⚠️ <b>OVERRIDE:</b> <i>{escape(override)}</i>" if override else ""
 
     return (
         f"⚡ <b>{escape(CFG.name)}</b> ⚡\n"
@@ -488,7 +503,7 @@ def format_prediction(payload: dict[str, Any]) -> str:
         f"📅 <b>ISSUE:</b> <code>{escape(payload['issue'])}</code>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
-        f"🌊 <b>REGIME:</b> {escape(payload['regime'])}{pat_line}{num_line}\n"
+        f"🌊 <b>REGIME:</b> {escape(payload['regime'])}{pat_line}{num_line}{override_line}\n"
         "━━━━━━━━━━━━━━━━━━"
     )
 
