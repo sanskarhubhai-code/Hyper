@@ -1,5 +1,5 @@
 """
-FTW Predictor V38 — HYPER-SMART (Smart Sub-Patterns + Deep Recovery)
+FTW Predictor V38 — HYPER-SMART (Smart Sub-Patterns + Deep Recovery) - FIXED
 Python 3.10+
 Deps: aiohttp
 """
@@ -156,7 +156,6 @@ class SmartPatternMiner:
         self.db = db
 
     def find_best_size_pattern(self, seq: list[int], regime: str) -> tuple[float, str]:
-        """Starts from length 10, falls back to shorter if unreliable. Flips if failing."""
         n = len(seq)
         if n < 15: return 0.5, "—"
         
@@ -178,24 +177,20 @@ class SmartPatternMiner:
                 p, eff = weighted_probability(obs)
                 key = "size:" + "".join("B" if x else "S" for x in suffix)
                 
-                # Check DB for this pattern's historical performance
                 adjusted_p, rel = self.db.adapt_pattern(key, regime, p, is_number=False)
                 
-                # If this pattern has good historical reliability, use it as the strongest
                 score = rel * math.sqrt(max(1.0, eff))
                 if score > best_weight:
                     best_weight = score
                     best_p = adjusted_p
                     best_name = "".join("B" if x else "S" for x in suffix)
                 
-                # If we found a highly reliable pattern (rel > 1.0), we can stop going shorter
                 if rel > 1.0:
                     break
 
         return best_p, best_name
 
     def find_best_number_pattern(self, nums: list[int], regime: str) -> tuple[list[float], str]:
-        """Finds n-gram patterns for exact numbers (0-9)."""
         n = len(nums)
         if n < 15: return [0.1] * 10, "—"
         
@@ -220,13 +215,24 @@ class SmartPatternMiner:
                 key = "num:" + ",".join(str(x) for x in suffix)
                 dist = [(obs.get(k, 0) + 1.0) / (total + 10.0) for k in range(10)]
                 
-                # Adjust via DB
-                adjusted_dist, rel = self.db.adapt_number_pattern(key, regime, dist)
+                top_num = max(range(10), key=lambda k: dist[k])
+                mem_key = f"{key}_top{top_num}"
+                
+                # 🔥 FIXED: Inline DB lookup for number pattern reliability
+                row = self.db.c.execute("SELECT n, loss, failures FROM pattern_models WHERE name=?", (mem_key,)).fetchone()
+                rel = 1.0
+                if row and float(row["n"]) >= 2.0:
+                    n_val = float(row["n"])
+                    mean_loss = float(row["loss"]) / n_val
+                    fails = int(row["failures"])
+                    rel = math.exp(-4.0 * max(-0.10, mean_loss - 0.25))
+                    if fails >= 2: rel *= 0.2
+                    if fails >= 4: rel *= 0.05
                 
                 score = rel * math.sqrt(total)
                 if score > best_weight:
                     best_weight = score
-                    best_dist = adjusted_dist
+                    best_dist = dist
                     best_name = ",".join(str(x) for x in suffix)
                 
                 if rel > 1.0:
@@ -321,13 +327,15 @@ class Database:
         old_n, old_loss, old_fails = (float(row["n"]), float(row["loss"]), int(row["failures"])) if row else (0.0, 0.0, 0)
         
         n = 0.985 * old_n + 1.0
+        
         if is_number:
-            # For numbers, loss is binary (did it predict the exact number?)
-            loss = 0.985 * old_loss + (1.0 if probability < 0.5 else 0.0) 
+            # For numbers, probability is 1.0 if correct, 0.0 if wrong
+            loss = 0.985 * old_loss + (1.0 - probability)
+            wrong = probability < 0.5
         else:
             loss = 0.985 * old_loss + (clip(probability) - actual) ** 2
+            wrong = int(probability >= 0.5) != actual
             
-        wrong = int(probability >= 0.5) != actual
         fails = old_fails + 1 if wrong else 0
 
         self.c.execute(
@@ -412,8 +420,7 @@ class Engine:
         if len(obs) >= CFG.min_support: experts["regime"] = weighted_probability(obs)[0]
 
         # 3. Trend & Momentum
-        features = self.db.get("trend_features_cache", [0.0]*20) # Simplified trend for V38
-        experts["trend"] = 0.5 # Neutral
+        experts["trend"] = 0.5 
         momentum = sum(seq[-4:]) / 4.0 if seq else 0.5
         experts["momentum"] = 0.2 + (momentum * 0.6)
         experts["reversal"] = 1.0 - experts["momentum"]
@@ -425,14 +432,13 @@ class Engine:
         for name, prob in experts.items():
             corrected, weight = self.db.adapt_expert(f"expert:{name}", regime, prob)
             
-            # Pattern gets high priority if reliable
             if name == "pattern": weight *= 2.0
 
             # 🔥 HYPER RECOVERY: 1 loss = Kill momentum, boost reversal
             if loss_streak >= 1:
                 if name in ("momentum", "run", "trend"): weight *= 0.1
                 if name == "reversal": weight *= 3.5
-                if name == "pattern": weight *= 2.5 # Trust pattern flip during recovery
+                if name == "pattern": weight *= 2.5
 
             adjusted.append((corrected, weight))
 
@@ -497,15 +503,16 @@ class Engine:
                 
                 # Learn Size Pattern
                 pat_name = payload.get("pattern")
-                if pat_name and pat_name != "—":
-                    self.db.learn_pattern("size:" + pat_name, float(payload["experts"]["pattern"]), actual_size)
+                if pat_name and pat_name != "—" and "pattern" in payload.get("experts", {}):
+                    self.db.learn_pattern("size:" + pat_name, float(payload["experts"]["pattern"]), actual_size, is_number=False)
                 
-                # Learn Number Pattern (We check if the top predicted number was correct)
+                # Learn Number Pattern
                 num_pat = payload.get("num_pattern")
                 if num_pat and num_pat != "—":
                     pred_num = payload.get("number")
+                    key = f"num:{num_pat}_top{pred_num}"
                     prob_num = 1.0 if pred_num == actual_num else 0.0
-                    self.db.learn_pattern("num:" + num_pat, prob_num, actual_num, is_number=True)
+                    self.db.learn_pattern(key, prob_num, actual_num, is_number=True)
 
                 if payload.get("meta_feats"):
                     feats = payload["meta_feats"]
