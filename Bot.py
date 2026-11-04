@@ -1,5 +1,5 @@
 """
-FTW Predictor V44 — NUMBER TRACKER PRO (No Fallback, Full Tracking) - FIXED
+FTW Predictor V46 — ULTIMATE QUANT (Sub-Pattern Voting + CUSUM Override)
 Python 3.10+
 Deps: aiohttp
 """
@@ -38,7 +38,7 @@ class Config:
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
-    db_path: str = os.getenv("DB_PATH", "predictor_v44.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v46.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 18.0
@@ -46,7 +46,7 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "180"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (V44 TRACKER)"
+    name: str = "FTW PREDICTOR (V46 ULTIMATE)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -66,7 +66,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-LOG = logging.getLogger("predictor_v44")
+LOG = logging.getLogger("predictor_v46")
 
 
 # ============================================================
@@ -75,14 +75,6 @@ LOG = logging.getLogger("predictor_v44")
 
 def clip(value: float, low: float = 0.02, high: float = 0.98) -> float:
     return max(low, min(high, float(value)))
-
-def sigmoid(z: float) -> float:
-    z = max(-25.0, min(25.0, float(z)))
-    return 1.0 / (1.0 + math.exp(-z))
-
-def logit(p: float, eps: float = 0.02) -> float:
-    p = max(eps, min(1.0 - eps, float(p)))
-    return math.log(p / (1.0 - p))
 
 def escape(value: Any) -> str:
     return html.escape(str(value))
@@ -173,86 +165,7 @@ def parse_history(payload: Any) -> list[dict[str, Any]]:
 
 
 # ============================================================
-# NUMBER TRACKER (No Fallback - Always Tracks)
-# ============================================================
-
-def track_numbers(nums: list[int]) -> tuple[list[float], str]:
-    if not nums:
-        return [0.1] * 10, "No Data"
-    
-    n = len(nums)
-    
-    def freq(window: int) -> list[float]:
-        recent = nums[-window:]
-        counts = Counter(recent)
-        total = len(recent)
-        return [(counts.get(k, 0) + 1.0) / (total + 10.0) for k in range(10)]
-
-    f30 = freq(30)
-    f100 = freq(100)
-    f300 = freq(300)
-    
-    trans_2 = [0.1] * 10
-    trans_3 = [0.1] * 10
-    trans_4 = [0.1] * 10
-    
-    for order, trans in [(2, trans_2), (3, trans_3), (4, trans_4)]:
-        if n <= order: continue
-        ctx = tuple(nums[-order:])
-        obs = {}
-        total = 0
-        for i in range(order, n):
-            if tuple(nums[i-order:i]) == ctx:
-                nxt = nums[i]
-                obs[nxt] = obs.get(nxt, 0) + 1
-                total += 1
-        if total >= 3:
-            trans[:] = [(obs.get(k, 0) + 1.0) / (total + 10.0) for k in range(10)]
-    
-    exact_dist = [0.1] * 10
-    exact_name = "—"
-    for length in range(7, 4, -1):
-        if n <= length * 2: continue
-        suffix = tuple(nums[-length:])
-        obs = {}
-        total = 0
-        for i in range(n - length):
-            if tuple(nums[i:i + length]) == suffix:
-                nxt = nums[i + length]
-                obs[nxt] = obs.get(nxt, 0) + 1
-                total += 1
-        if total >= 2:
-            exact_dist = [(obs.get(k, 0) + 1.0) / (total + 10.0) for k in range(10)]
-            exact_name = ",".join(str(x) for x in suffix)
-            break
-    
-    final = [0.0] * 10
-    for k in range(10):
-        final[k] = (
-            0.15 * f30[k] + 
-            0.15 * f100[k] + 
-            0.10 * f300[k] + 
-            0.15 * trans_2[k] + 
-            0.15 * trans_3[k] + 
-            0.10 * trans_4[k] + 
-            0.20 * exact_dist[k]
-        )
-    
-    total = sum(final)
-    if total > 0:
-        final = [x / total for x in final]
-    
-    info_parts = []
-    if exact_name != "—":
-        info_parts.append(f"Exact: {exact_name}")
-    else:
-        info_parts.append("Freq: 30/100/300")
-    
-    return final, " | ".join(info_parts)
-
-
-# ============================================================
-# SMART PATTERN MINER
+# SMART PATTERN MINER (Bayesian Sub-pattern Voting)
 # ============================================================
 
 class SmartPatternMiner:
@@ -263,12 +176,9 @@ class SmartPatternMiner:
         n = len(seq)
         if n < 15: return 0.5, "—", 0, 0
         
-        best_p = 0.5
-        best_name = "—"
-        best_big = 0
-        best_small = 0
-        best_weight = 0.0
-
+        # 🔥 We collect all patterns from 8 down to 5, then vote
+        candidates = []
+        
         for length in range(8, 4, -1):
             if n < length * 2: continue
             
@@ -290,20 +200,86 @@ class SmartPatternMiner:
                 
                 adjusted_p, rel = self.db.adapt_pattern(key, regime, p, is_number=False)
                 
-                if rel < 0.2: continue
+                if rel < 0.15: continue # Skip terrible patterns
                 
+                # Score based on reliability and sample size
                 score = rel * math.sqrt(max(1.0, eff))
-                if score > best_weight:
-                    best_weight = score
-                    best_p = adjusted_p
-                    best_name = pattern_str
-                    best_big = big_c
-                    best_small = small_c
-                
-                if rel > 1.0:
-                    break
+                candidates.append((score, adjusted_p, pattern_str, big_c, small_c))
+
+        if not candidates:
+            return 0.5, "—", 0, 0
+            
+        # Sort by highest score (most reliable)
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        
+        # 🔥 Bayesian Voting: If the top pattern is really strong, use it. 
+        # Otherwise, blend the top 2-3 patterns.
+        best_score, best_p, best_name, best_big, best_small = candidates[0]
+        
+        # Blend the next best if it has a similar score
+        if len(candidates) > 1:
+            score2, p2, name2, big2, small2 = candidates[1]
+            if score2 > best_score * 0.8: # If second pattern is close in reliability
+                best_p = (best_p * 0.6) + (p2 * 0.4)
+                best_big += big2
+                best_small += small2
+                best_name += f" & {name2}"
 
         return best_p, best_name, best_big, best_small
+
+
+# ============================================================
+# NUMBER TRACKER
+# ============================================================
+
+def track_numbers(nums: list[int]) -> tuple[list[float], str]:
+    if not nums: return [0.1] * 10, "No Data"
+    
+    n = len(nums)
+    
+    def freq(window: int) -> list[float]:
+        recent = nums[-window:]
+        counts = Counter(recent)
+        total = len(recent)
+        return [(counts.get(k, 0) + 1.0) / (total + 10.0) for k in range(10)]
+
+    f30 = freq(30)
+    f100 = freq(100)
+    
+    trans = [0.1] * 10
+    if n >= 3:
+        ctx = tuple(nums[-3:])
+        obs = {}
+        total = 0
+        for i in range(3, n):
+            if tuple(nums[i-3:i]) == ctx:
+                nxt = nums[i]
+                obs[nxt] = obs.get(nxt, 0) + 1
+                total += 1
+        if total >= 3:
+            trans = [(obs.get(k, 0) + 1.0) / (total + 10.0) for k in range(10)]
+    
+    exact = [0.1] * 10
+    if n >= 10:
+        ctx = tuple(nums[-5:])
+        obs = {}
+        total = 0
+        for i in range(5, n):
+            if tuple(nums[i-5:i]) == ctx:
+                nxt = nums[i]
+                obs[nxt] = obs.get(nxt, 0) + 1
+                total += 1
+        if total >= 2:
+            exact = [(obs.get(k, 0) + 1.0) / (total + 10.0) for k in range(10)]
+    
+    final = [0.0] * 10
+    for k in range(10):
+        final[k] = 0.15 * f30[k] + 0.25 * f100[k] + 0.30 * trans[k] + 0.30 * exact[k]
+    
+    total = sum(final)
+    if total > 0: final = [x / total for x in final]
+    
+    return final, "Freq+Markov+Exact"
 
 
 # ============================================================
@@ -320,7 +296,6 @@ class Database:
         self.c.executescript("""
             CREATE TABLE IF NOT EXISTS history(issue TEXT PRIMARY KEY, num INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS predictions(issue TEXT PRIMARY KEY, created REAL NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, actual INTEGER, won_number INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS expert_models(name TEXT NOT NULL, regime TEXT NOT NULL, n REAL NOT NULL, loss REAL NOT NULL, failures INTEGER NOT NULL, PRIMARY KEY(name, regime));
             CREATE TABLE IF NOT EXISTS pattern_models(name TEXT PRIMARY KEY, n REAL NOT NULL, loss REAL NOT NULL, failures INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, issue TEXT, text TEXT NOT NULL, created REAL NOT NULL, expires REAL, sent INTEGER NOT NULL DEFAULT 0);
@@ -356,37 +331,18 @@ class Database:
     def pending_predictions(self) -> list[sqlite3.Row]:
         return self.c.execute("SELECT issue,payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER) ASC").fetchall()
 
-    def get_loss_streak(self) -> int:
-        rows = self.c.execute("SELECT status FROM predictions WHERE status IN ('WIN','LOSS') ORDER BY created DESC LIMIT 5").fetchall()
-        streak = 0
-        for r in rows:
-            if r["status"] == "LOSS": streak += 1
-            else: break
-        return streak
-
-    def learn_expert(self, name: str, regime: str, probability: float, actual: int) -> None:
-        row = self.c.execute("SELECT n, loss, failures FROM expert_models WHERE name=? AND regime=?", (name, regime)).fetchone()
+    def learn_pattern(self, key: str, probability: float, actual: int) -> None:
+        row = self.c.execute("SELECT n, loss, failures FROM pattern_models WHERE name=?", (key,)).fetchone()
         old_n, old_loss, old_fails = (float(row["n"]), float(row["loss"]), int(row["failures"])) if row else (0.0, 0.0, 0)
         n = 0.985 * old_n + 1.0
         loss = 0.985 * old_loss + (clip(probability) - actual) ** 2
         wrong = int(probability >= 0.5) != actual
         fails = old_fails + 1 if wrong else 0
         self.c.execute(
-            "INSERT INTO expert_models(name,regime,n,loss,failures) VALUES (?,?,?,?,?) ON CONFLICT(name,regime) DO UPDATE SET n=excluded.n, loss=excluded.loss, failures=excluded.failures",
-            (name, regime, n, loss, fails)
+            "INSERT INTO pattern_models(name,n,loss,failures) VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET n=excluded.n, loss=excluded.loss, failures=excluded.failures",
+            (key, n, loss, fails)
         )
 
-    def adapt_expert(self, name: str, regime: str, probability: float) -> tuple[float, float]:
-        row = self.c.execute("SELECT n, loss, failures FROM expert_models WHERE name=? AND regime=?", (name, regime)).fetchone()
-        if not row or float(row["n"]) < 1.0: return probability, 1.0
-        n, mean_loss, fails = float(row["n"]), float(row["loss"]) / float(row["n"]), int(row["failures"])
-        reliability = math.exp(-3.0 * max(-0.10, mean_loss - 0.25))
-        if fails >= 2: reliability *= 0.3
-        if fails >= 4: reliability *= 0.1
-        if fails >= 3 and mean_loss > 0.26: reliability *= 0.01
-        return clip(probability), max(0.05, min(1.8, reliability))
-
-    # 🔥 FIXED: adapt_pattern is now defined here
     def adapt_pattern(self, key: str, regime: str, probability: float, is_number: bool = False) -> tuple[float, float]:
         row = self.c.execute("SELECT n, loss, failures FROM pattern_models WHERE name=?", (key,)).fetchone()
         if not row or float(row["n"]) < 2.0: return probability, 1.0
@@ -398,22 +354,6 @@ class Database:
         if fails >= 4: reliability *= 0.05
         if fails >= 3 and mean_loss > 0.26: reliability *= 0.01
         return clip(probability), max(0.05, min(2.0, reliability))
-
-    def learn_pattern(self, key: str, probability: float, actual: int, is_number: bool = False) -> None:
-        row = self.c.execute("SELECT n, loss, failures FROM pattern_models WHERE name=?", (key,)).fetchone()
-        old_n, old_loss, old_fails = (float(row["n"]), float(row["loss"]), int(row["failures"])) if row else (0.0, 0.0, 0)
-        n = 0.985 * old_n + 1.0
-        if is_number:
-            loss = 0.985 * old_loss + (1.0 - probability)
-            wrong = probability < 0.5
-        else:
-            loss = 0.985 * old_loss + (clip(probability) - actual) ** 2
-            wrong = int(probability >= 0.5) != actual
-        fails = old_fails + 1 if wrong else 0
-        self.c.execute(
-            "INSERT INTO pattern_models(name,n,loss,failures) VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET n=excluded.n, loss=excluded.loss, failures=excluded.failures",
-            (key, n, loss, fails)
-        )
 
     def queue(self, kind: str, issue: str | None, text: str, expires: float | None = None) -> None:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
@@ -427,10 +367,8 @@ class Database:
 
 
 # ============================================================
-# ENGINE (Meta-Learner + Transparency)
+# ENGINE
 # ============================================================
-
-EXPERT_NAMES = ["pattern", "markov1", "markov2", "markov3", "run", "regime", "base", "trend", "momentum", "reversal", "cusum"]
 
 class Engine:
     def __init__(self, db: Database):
@@ -441,73 +379,31 @@ class Engine:
         seq = [int(row["size"]) for row in history]
         nums = [int(row["num"]) for row in history]
         regime = get_regime(seq)
-        n = len(seq)
-        loss_streak = self.db.get_loss_streak()
 
         pat_p, pat_name, pat_big, pat_small = self.miner.find_best_size_pattern(seq, regime)
         num_dist, num_info = track_numbers(nums)
-
-        experts = {}
-        experts["pattern"] = pat_p
-        experts["base"] = weighted_probability([(val, recency_weight(i, n)) for i, val in enumerate(seq)])[0]
-
-        for order in (1, 2, 3):
-            if n <= order: continue
-            context = tuple(seq[-order:])
-            obs = [(seq[i], recency_weight(i, n)) for i in range(order, n) if tuple(seq[i - order:i]) == context]
-            if len(obs) >= CFG.min_support: experts[f"markov{order}"] = weighted_probability(obs)[0]
-
-        if n >= 2:
-            last_val, current_run = seq[-1], 1
-            for v in reversed(seq[:-1]):
-                if v != last_val: break
-                current_run += 1
-            run_at = [1] * n
-            for i in range(1, n): run_at[i] = run_at[i-1] + 1 if seq[i] == seq[i-1] else 1
-            obs = [(seq[i], recency_weight(i, n)) for i in range(1, n) if seq[i-1] == last_val and min(run_at[i-1], 8) == min(current_run, 8)]
-            if len(obs) >= CFG.min_support: experts["run"] = weighted_probability(obs)[0]
-
-        obs = [(seq[i], recency_weight(i, n)) for i in range(24, n) if get_regime(seq[max(0, i - 96):i]) == regime]
-        if len(obs) >= CFG.min_support: experts["regime"] = weighted_probability(obs)[0]
-
-        experts["trend"] = 0.5 
-        momentum = sum(seq[-4:]) / 4.0 if seq else 0.5
-        experts["momentum"] = 0.2 + (momentum * 0.6)
-        experts["reversal"] = 1.0 - experts["momentum"]
         
-        change = cusum_change(seq)
-        experts["cusum"] = 0.65 if change == 1 else 0.35 if change == -1 else 0.5
-
-        for k in EXPERT_NAMES: experts[k] = clip(experts.get(k, 0.5), 0.05, 0.95)
-
-        adjusted = []
-        for name, prob in experts.items():
-            corrected, weight = self.db.adapt_expert(f"expert:{name}", regime, prob)
+        # 🔥 CUSUM TREND OVERRIDE
+        cusum_dir = cusum_change(seq)
+        
+        if pat_name != "—":
+            side = "BIG" if pat_big >= pat_small else "SMALL"
+            p = 0.5 + abs(pat_big - pat_small) / max(1, pat_big + pat_small) * 0.5
             
-            if name == "pattern": weight *= 2.5
-            if loss_streak >= 1:
-                if name in ("momentum", "run", "trend"): weight *= 0.1
-                if name == "reversal": weight *= 4.0
-                if name == "pattern": weight *= 2.0
-                if name == "cusum": weight *= 2.0
+            # If CUSUM says trend has switched, and pattern is betting on the old trend, override
+            if cusum_dir == 1 and side == "SMALL":
+                side = "BIG"
+                p = 0.55
+                pat_name += " (CUSUM Reversal)"
+            elif cusum_dir == -1 and side == "BIG":
+                side = "SMALL"
+                p = 0.55
+                pat_name += " (CUSUM Reversal)"
+        else:
+            recent_big = sum(seq[-20:]) / 20.0
+            side = "BIG" if recent_big >= 0.5 else "SMALL"
+            p = 0.5 + abs(recent_big - 0.5) * 0.4
 
-            adjusted.append((corrected, weight))
-
-        total_w = sum(w for _, w in adjusted)
-        p_avg = sum(p * w for p, w in adjusted) / total_w if total_w > 0 else 0.5
-
-        m_feats = [logit(clip(experts.get(n, 0.5), 0.05, 0.95)) for n in EXPERT_NAMES] + [1.0]
-        mw = self.db.get("meta_weights")
-        if not isinstance(mw, list) or len(mw) != len(m_feats): mw = [1.0 / len(EXPERT_NAMES)] * len(EXPERT_NAMES) + [0.0]
-        p_meta = sigmoid(sum(w * f for w, f in zip(mw, m_feats)))
-        
-        alpha = min(self.db.get("meta_n", 0) / 80.0, 1.0)
-        p = clip(alpha * p_meta + (1.0 - alpha) * p_avg)
-
-        if loss_streak >= 2 and 0.45 < p < 0.55:
-            p = 1.0 - p
-
-        side = "BIG" if p >= 0.5 else "SMALL"
         allowed_nums = range(5, 10) if side == "BIG" else range(0, 5)
         
         num_dist_final = [0.0] * 10
@@ -525,15 +421,9 @@ class Engine:
         num_pred = max(allowed_nums, key=lambda k: (num_dist_final[k], recent_counts.get(k, 0)))
         num_conf = num_dist_final[num_pred]
 
-        reason = ""
-        if pat_name != "—":
-            pat_side = "BIG" if pat_p >= 0.5 else "SMALL"
-            if pat_side != side:
-                reason = f"Pattern was {pat_side}, but Markov/Reversal overruled to {side}."
-
         return {
             "issue": issue,
-            "p": p,
+            "p": clip(p),
             "side": side,
             "number": num_pred,
             "num_conf": num_conf,
@@ -542,10 +432,7 @@ class Engine:
             "pat_big": pat_big,
             "pat_small": pat_small,
             "num_tracking": num_info,
-            "override_reason": reason,
-            "experts": experts,
-            "meta_feats": m_feats,
-            "source": "V44 Tracker",
+            "source": "V46 Ultimate",
             "created": time.time(),
         }
 
@@ -566,19 +453,11 @@ class Engine:
             with self.db.transaction():
                 self.db.c.execute("UPDATE predictions SET status=?, actual=?, won_number=? WHERE issue=? AND status='PENDING'", ("WIN" if won_side else "LOSS", actual_num, int(won_num), row["issue"]))
                 
-                regime = payload.get("regime", "MIXED")
-                
-                for name, prob in payload.get("experts", {}).items():
-                    self.db.learn_expert(f"expert:{name}", regime, float(prob), actual_size)
-
-                if payload.get("meta_feats"):
-                    feats = payload["meta_feats"]
-                    if len(feats) == len(EXPERT_NAMES) + 1:
-                        mw = self.db.get("meta_weights") or [1.0 / len(EXPERT_NAMES)] * len(EXPERT_NAMES) + [0.0]
-                        mp = sigmoid(sum(w * f for w, f in zip(mw, feats)))
-                        grad = 2.0 * (actual_size - mp) * mp * (1.0 - mp)
-                        self.db.set("meta_weights", [clip(w * 0.999 + 0.06 * grad * f, -4.0, 4.0) for w, f in zip(mw, feats)])
-                        self.db.set("meta_n", self.db.get("meta_n", 0) + 1)
+                pat_name = payload.get("pattern")
+                if pat_name and pat_name != "—":
+                    # We clean the "CUSUM" tag to learn the base pattern
+                    clean_pat = pat_name.replace(" (CUSUM Reversal)", "")
+                    self.db.learn_pattern("size_family:" + clean_pat, float(payload["p"]), actual_size)
 
                 sticker = CFG.jack_sticker if (won_side and won_num) else CFG.win_sticker if won_side else CFG.loss_sticker
                 self.db.queue("sticker", row["issue"], sticker)
@@ -605,9 +484,6 @@ def format_prediction(payload: dict[str, Any]) -> str:
     
     n1 = int(payload["number"])
     nconf = payload.get("num_conf", 0) * 100
-    
-    override = payload.get("override_reason", "")
-    override_line = f"\n⚠️ <b>OVERRIDE:</b> <i>{escape(override)}</i>" if override else ""
 
     return (
         f"⚡ <b>{escape(CFG.name)}</b> ⚡\n"
@@ -617,13 +493,13 @@ def format_prediction(payload: dict[str, Any]) -> str:
         f"📅 <b>ISSUE:</b> <code>{escape(payload['issue'])}</code>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
-        f"🌊 <b>REGIME:</b> {escape(payload['regime'])}{pat_line}{num_line}{override_line}\n"
+        f"🌊 <b>REGIME:</b> {escape(payload['regime'])}{pat_line}{num_line}\n"
         "━━━━━━━━━━━━━━━━━━"
     )
 
 
 # ============================================================
-# RUNTIME & MAIN
+# RUNTIME
 # ============================================================
 
 class Runtime:
