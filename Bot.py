@@ -1,5 +1,5 @@
 """
-FTW Predictor V42 — TRANSPARENT QUANT (Pattern Stats + Override Reason)
+FTW Predictor V43 — NUMBER HUNTER PRO (Smart Fallback + Real Number Stats)
 Python 3.10+
 Deps: aiohttp
 """
@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import os
+import random
 import signal
 import sqlite3
 import time
@@ -38,7 +39,7 @@ class Config:
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
-    db_path: str = os.getenv("DB_PATH", "predictor_v42.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v43.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 18.0
@@ -46,7 +47,7 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "180"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (V42 TRANSPARENT)"
+    name: str = "FTW PREDICTOR (NUMBER HUNTER V43)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -66,7 +67,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-LOG = logging.getLogger("predictor_v42")
+LOG = logging.getLogger("predictor_v43")
 
 
 # ============================================================
@@ -173,7 +174,7 @@ def parse_history(payload: Any) -> list[dict[str, Any]]:
 
 
 # ============================================================
-# SMART PATTERN MINER (Returns Stats)
+# SMART PATTERN MINER & NUMBER FALLBACK
 # ============================================================
 
 class SmartPatternMiner:
@@ -181,7 +182,6 @@ class SmartPatternMiner:
         self.db = db
 
     def find_best_size_pattern(self, seq: list[int], regime: str) -> tuple[float, str, int, int]:
-        """Returns: (adjusted_p, pattern_str, big_count, small_count)"""
         n = len(seq)
         if n < 15: return 0.5, "—", 0, 0
         
@@ -235,7 +235,8 @@ class SmartPatternMiner:
         best_name = "—"
         best_weight = 0.0
 
-        for length in range(6, 2, -1):
+        # 8 down to 3 length for numbers (10^8 combos, so low req_support)
+        for length in range(8, 2, -1):
             if n < length * 2: continue
             
             suffix = tuple(nums[-length:])
@@ -248,7 +249,8 @@ class SmartPatternMiner:
                     obs[nxt] = obs.get(nxt, 0) + 1
                     total += 1
             
-            req_support = 4 if length >= 5 else 8
+            # Lower threshold for long patterns
+            req_support = 2 if length >= 5 else 3
             
             if total >= req_support:
                 key = "num:" + ",".join(str(x) for x in suffix)
@@ -278,6 +280,27 @@ class SmartPatternMiner:
                     break
                     
         return best_dist, best_name
+
+    def get_fallback_number_dist(self, nums: list[int]) -> list[float]:
+        """🔥 Fallback if no pattern: Use Markov & Recent Frequency"""
+        if not nums: return [0.1] * 10
+        
+        # Recent Frequency (Last 200)
+        counts = Counter(nums[-200:])
+        total = sum(counts.values())
+        base = [counts.get(k, 1.0) / (total + 10) for k in range(10)]
+        
+        # Markov Chains (Order 1, 2, 3)
+        for order in (1, 2, 3):
+            if len(nums) <= order: continue
+            ctx = tuple(nums[-order:])
+            trans = Counter(nums[i] for i in range(order, len(nums)) if tuple(nums[i-order:i]) == ctx)
+            tot = sum(trans.values())
+            if tot >= 3:
+                for k in range(10):
+                    base[k] = base[k] * 0.6 + (trans.get(k, 0) / tot) * 0.4
+        
+        return base
 
 
 # ============================================================
@@ -418,8 +441,13 @@ class Engine:
         loss_streak = self.db.get_loss_streak()
 
         pat_p, pat_name, pat_big, pat_small = self.miner.find_best_size_pattern(seq, regime)
-        num_dist, num_pat_name = self.miner.find_best_number_pattern(nums, regime)
+        num_dist_pattern, num_pat_name = self.miner.find_best_number_pattern(nums, regime)
         
+        # 🔥 FIX: If pattern failed, use Markov fallback
+        if num_pat_name == "—":
+            num_dist_pattern = self.miner.get_fallback_number_dist(nums)
+            num_pat_name = "Markov/Freq Fallback"
+
         experts = {}
         experts["pattern"] = pat_p
         experts["base"] = weighted_probability([(val, recency_weight(i, n)) for i, val in enumerate(seq)])[0]
@@ -483,13 +511,15 @@ class Engine:
         side = "BIG" if p >= 0.5 else "SMALL"
         allowed_nums = range(5, 10) if side == "BIG" else range(0, 5)
         
-        num_dist_blended = [num_dist[k] * 1.5 if k in allowed_nums else num_dist[k] * 0.5 for k in range(10)]
+        # 🔥 FIX: Solid Blending
+        num_dist_blended = [num_dist_pattern[k] * 1.5 if k in allowed_nums else num_dist_pattern[k] * 0.1 for k in range(10)]
         total_num = sum(num_dist_blended)
         num_dist_blended = [x / total_num for x in num_dist_blended]
         
-        num_pred = max(allowed_nums, key=lambda k: num_dist_blended[k])
+        # 🔥 SMART TIE-BREAKING: If values are equal, pick the most frequent recent number
+        recent_counts = Counter(nums[-50:])
+        num_pred = max(allowed_nums, key=lambda k: (num_dist_blended[k], recent_counts.get(k, 0)))
 
-        # 🔥 OVERRIDE REASON LOGIC
         reason = ""
         if pat_name != "—":
             pat_side = "BIG" if pat_p >= 0.5 else "SMALL"
@@ -505,12 +535,11 @@ class Engine:
             "pattern": pat_name,
             "pat_big": pat_big,
             "pat_small": pat_small,
-            "pat_p": pat_p,
             "num_pattern": num_pat_name,
             "override_reason": reason,
             "experts": experts,
             "meta_feats": m_feats,
-            "source": "V42 Transparent",
+            "source": "V43 Number Pro",
             "created": time.time(),
         }
 
@@ -541,7 +570,7 @@ class Engine:
                     self.db.learn_pattern("size_family:" + pat_name, float(payload["experts"]["pattern"]), actual_size, is_number=False)
                 
                 num_pat = payload.get("num_pattern")
-                if num_pat and num_pat != "—":
+                if num_pat and num_pat != "—" and num_pat != "Markov/Freq Fallback":
                     key = f"num:{num_pat}_t{num1}"
                     prob_num = 1.0 if won_num else 0.0
                     self.db.learn_pattern(key, prob_num, actual_num, is_number=True)
@@ -576,7 +605,10 @@ def format_prediction(payload: dict[str, Any]) -> str:
         pat_line += f"\n📊 <b>PATTERN STATS:</b> BIG[{big_c}] | SMALL[{small_c}]"
 
     num_pat = payload.get("num_pattern", "—")
-    num_pat_line = f"\n🔢 <b>NUM PATTERN:</b> <code>{escape(num_pat)}</code>" if num_pat != "—" else "\n🔢 <b>NUM PATTERN:</b> <i>No Match</i>"
+    if num_pat == "Markov/Freq Fallback":
+        num_pat_line = "\n🔢 <b>NUM PATTERN:</b> <i>Markov Fallback</i>"
+    else:
+        num_pat_line = f"\n🔢 <b>NUM PATTERN:</b> <code>{escape(num_pat)}</code>" if num_pat != "—" else "\n🔢 <b>NUM PATTERN:</b> <i>No Match</i>"
     
     n1 = int(payload["number"])
     
@@ -597,7 +629,7 @@ def format_prediction(payload: dict[str, Any]) -> str:
 
 
 # ============================================================
-# RUNTIME
+# RUNTIME & MAIN
 # ============================================================
 
 class Runtime:
