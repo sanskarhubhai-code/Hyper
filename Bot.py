@@ -1,5 +1,5 @@
 """
-FTW Predictor V41 — STRICT QUANT (No Overfitting + High Confidence)
+FTW Predictor V42 — TRANSPARENT QUANT (Pattern Stats + Override Reason)
 Python 3.10+
 Deps: aiohttp
 """
@@ -38,7 +38,7 @@ class Config:
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
-    db_path: str = os.getenv("DB_PATH", "predictor_v41.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v42.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 18.0
@@ -46,7 +46,7 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "180"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (V41 STRICT)"
+    name: str = "FTW PREDICTOR (V42 TRANSPARENT)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -66,7 +66,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-LOG = logging.getLogger("predictor_v41")
+LOG = logging.getLogger("predictor_v42")
 
 
 # ============================================================
@@ -173,22 +173,24 @@ def parse_history(payload: Any) -> list[dict[str, Any]]:
 
 
 # ============================================================
-# SMART PATTERN MINER (Strict 5-8 Length)
+# SMART PATTERN MINER (Returns Stats)
 # ============================================================
 
 class SmartPatternMiner:
     def __init__(self, db: "Database"):
         self.db = db
 
-    def find_best_size_pattern(self, seq: list[int], regime: str) -> tuple[float, str]:
+    def find_best_size_pattern(self, seq: list[int], regime: str) -> tuple[float, str, int, int]:
+        """Returns: (adjusted_p, pattern_str, big_count, small_count)"""
         n = len(seq)
-        if n < 15: return 0.5, "—"
+        if n < 15: return 0.5, "—", 0, 0
         
         best_p = 0.5
         best_name = "—"
+        best_big = 0
+        best_small = 0
         best_weight = 0.0
 
-        # 🔥 STRICT: Only check length 8 down to 5
         for length in range(8, 4, -1):
             if n < length * 2: continue
             
@@ -202,23 +204,28 @@ class SmartPatternMiner:
             
             if len(obs) >= CFG.min_support:
                 p, eff = weighted_probability(obs)
+                big_c = sum(1 for val, _ in obs if val == 1)
+                small_c = len(obs) - big_c
+                
                 pattern_str = "-".join(f"{'B' if v else 'S'}{c}" for v, c in sig)
                 key = "size_family:" + pattern_str
                 
                 adjusted_p, rel = self.db.adapt_pattern(key, regime, p, is_number=False)
                 
-                if rel < 0.2: continue # Skip if bad
+                if rel < 0.2: continue
                 
                 score = rel * math.sqrt(max(1.0, eff))
                 if score > best_weight:
                     best_weight = score
                     best_p = adjusted_p
                     best_name = pattern_str
+                    best_big = big_c
+                    best_small = small_c
                 
                 if rel > 1.0:
                     break
 
-        return best_p, best_name
+        return best_p, best_name, best_big, best_small
 
     def find_best_number_pattern(self, nums: list[int], regime: str) -> tuple[list[float], str]:
         n = len(nums)
@@ -228,7 +235,6 @@ class SmartPatternMiner:
         best_name = "—"
         best_weight = 0.0
 
-        # 🔥 STRICT: Min 3 length, Max 6 length (No 12)
         for length in range(6, 2, -1):
             if n < length * 2: continue
             
@@ -394,7 +400,7 @@ class Database:
 
 
 # ============================================================
-# ENGINE (Strict & Strong)
+# ENGINE (Meta-Learner + Transparency)
 # ============================================================
 
 EXPERT_NAMES = ["pattern", "markov1", "markov2", "markov3", "run", "regime", "base", "trend", "momentum", "reversal", "cusum"]
@@ -411,7 +417,7 @@ class Engine:
         n = len(seq)
         loss_streak = self.db.get_loss_streak()
 
-        pat_p, pat_name = self.miner.find_best_size_pattern(seq, regime)
+        pat_p, pat_name, pat_big, pat_small = self.miner.find_best_size_pattern(seq, regime)
         num_dist, num_pat_name = self.miner.find_best_number_pattern(nums, regime)
         
         experts = {}
@@ -452,8 +458,6 @@ class Engine:
             corrected, weight = self.db.adapt_expert(f"expert:{name}", regime, prob)
             
             if name == "pattern": weight *= 2.5
-            
-            # Loss Recovery
             if loss_streak >= 1:
                 if name in ("momentum", "run", "trend"): weight *= 0.1
                 if name == "reversal": weight *= 4.0
@@ -485,6 +489,13 @@ class Engine:
         
         num_pred = max(allowed_nums, key=lambda k: num_dist_blended[k])
 
+        # 🔥 OVERRIDE REASON LOGIC
+        reason = ""
+        if pat_name != "—":
+            pat_side = "BIG" if pat_p >= 0.5 else "SMALL"
+            if pat_side != side:
+                reason = f"Pattern was {pat_side}, but Markov/Reversal overruled to {side}."
+
         return {
             "issue": issue,
             "p": p,
@@ -492,10 +503,14 @@ class Engine:
             "number": num_pred,
             "regime": regime,
             "pattern": pat_name,
+            "pat_big": pat_big,
+            "pat_small": pat_small,
+            "pat_p": pat_p,
             "num_pattern": num_pat_name,
+            "override_reason": reason,
             "experts": experts,
             "meta_feats": m_feats,
-            "source": "Strict Quant V41",
+            "source": "V42 Transparent",
             "created": time.time(),
         }
 
@@ -553,12 +568,20 @@ def format_prediction(payload: dict[str, Any]) -> str:
     marker = "🔴" if side == "BIG" else "🔵"
     
     pat = payload.get("pattern", "—")
-    pat_line = f"\n🧩 <b>SIZE PATTERN:</b> <code>{escape(pat)}</code>" if pat != "—" else ""
-    
+    pat_line = ""
+    if pat != "—":
+        big_c = payload.get("pat_big", 0)
+        small_c = payload.get("pat_small", 0)
+        pat_line = f"\n🧩 <b>SIZE PATTERN:</b> <code>{escape(pat)}</code>"
+        pat_line += f"\n📊 <b>PATTERN STATS:</b> BIG[{big_c}] | SMALL[{small_c}]"
+
     num_pat = payload.get("num_pattern", "—")
     num_pat_line = f"\n🔢 <b>NUM PATTERN:</b> <code>{escape(num_pat)}</code>" if num_pat != "—" else "\n🔢 <b>NUM PATTERN:</b> <i>No Match</i>"
     
     n1 = int(payload["number"])
+    
+    override = payload.get("override_reason", "")
+    override_line = f"\n⚠️ <b>OVERRIDE:</b> <i>{escape(override)}</i>" if override else ""
 
     return (
         f"⚡ <b>{escape(CFG.name)}</b> ⚡\n"
@@ -568,7 +591,7 @@ def format_prediction(payload: dict[str, Any]) -> str:
         f"📅 <b>ISSUE:</b> <code>{escape(payload['issue'])}</code>\n"
         "━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>CONFIDENCE:</b> {conf:.1f}% [{bar}]\n"
-        f"🌊 <b>REGIME:</b> {escape(payload['regime'])}{pat_line}{num_pat_line}\n"
+        f"🌊 <b>REGIME:</b> {escape(payload['regime'])}{pat_line}{num_pat_line}{override_line}\n"
         "━━━━━━━━━━━━━━━━━━"
     )
 
