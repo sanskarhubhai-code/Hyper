@@ -1,5 +1,5 @@
 """
-FTW Predictor V39.2 — NUMBER HUNTER (Deep 12-Length + Min 3-Length Numbers)
+FTW Predictor V39.3 — NUMBER HUNTER (Family Size + Deep Numbers)
 Python 3.10+
 Deps: aiohttp
 """
@@ -38,7 +38,7 @@ class Config:
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
-    db_path: str = os.getenv("DB_PATH", "predictor_v39_2.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v39_3.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 18.0
@@ -120,6 +120,21 @@ def get_regime(seq: list[int]) -> str:
     if abs(sum(tail) / len(tail) - 0.5) > 0.20: return "IMBAL"
     return "MIXED"
 
+# 🔥 FAMILY PATTERN HELPERS
+def family_run(seq: list[int]) -> list[tuple[int, int]]:
+    if not seq: return []
+    out, cur, count = [], seq[0], 1
+    for x in seq[1:]:
+        if x == cur: count += 1
+        else:
+            out.append((cur, count))
+            cur, count = x, 1
+    out.append((cur, count))
+    return out
+
+def family_signature(seq: list[int]) -> tuple:
+    return tuple((int(v), cnt) for v, cnt in family_run(seq))
+
 def parse_history(payload: Any) -> list[dict[str, Any]]:
     obj = payload
     for _ in range(8):
@@ -156,6 +171,7 @@ class SmartPatternMiner:
         self.db = db
 
     def find_best_size_pattern(self, seq: list[int], regime: str) -> tuple[float, str]:
+        """Uses Family Signatures (e.g. B2-S3) instead of exact bits."""
         n = len(seq)
         if n < 15: return 0.5, "—"
         
@@ -166,15 +182,19 @@ class SmartPatternMiner:
         for length in range(10, 4, -1):
             if n < length * 2: continue
             
-            suffix = tuple(seq[-length:])
+            suffix = seq[-length:]
+            sig = family_signature(suffix)
             obs = []
+            
             for i in range(n - length):
-                if tuple(seq[i:i + length]) == suffix:
+                if family_signature(seq[i:i + length]) == sig:
                     obs.append((seq[i + length], recency_weight(i + length, n, 420.0)))
             
             if len(obs) >= CFG.min_support:
                 p, eff = weighted_probability(obs)
-                key = "size:" + "".join("B" if x else "S" for x in suffix)
+                # Format as B2-S1-B3
+                pattern_str = "-".join(f"{'B' if v else 'S'}{c}" for v, c in sig)
+                key = "size_family:" + pattern_str
                 
                 adjusted_p, rel = self.db.adapt_pattern(key, regime, p, is_number=False)
                 
@@ -182,7 +202,7 @@ class SmartPatternMiner:
                 if score > best_weight:
                     best_weight = score
                     best_p = adjusted_p
-                    best_name = "".join("B" if x else "S" for x in suffix)
+                    best_name = pattern_str
                 
                 if rel > 1.0:
                     break
@@ -198,7 +218,6 @@ class SmartPatternMiner:
         best_name = "—"
         best_weight = 0.0
 
-        # 🔥 FIX: Loop from 12 down to 3 (range end is exclusive, so 2 means stop at 3)
         for length in range(12, 2, -1):
             if n < length * 2: continue
             
@@ -212,7 +231,6 @@ class SmartPatternMiner:
                     obs[nxt] = obs.get(nxt, 0) + 1
                     total += 1
             
-            # Dynamic Support: Long patterns need fewer matches, short patterns need more
             req_support = 3 if length >= 6 else 8
             
             if total >= req_support:
@@ -491,7 +509,8 @@ class Engine:
                 
                 pat_name = payload.get("pattern")
                 if pat_name and pat_name != "—" and "pattern" in payload.get("experts", {}):
-                    self.db.learn_pattern("size:" + pat_name, float(payload["experts"]["pattern"]), actual_size, is_number=False)
+                    # 🔥 Uses size_family prefix now
+                    self.db.learn_pattern("size_family:" + pat_name, float(payload["experts"]["pattern"]), actual_size, is_number=False)
                 
                 num_pat = payload.get("num_pattern")
                 if num_pat and num_pat != "—":
