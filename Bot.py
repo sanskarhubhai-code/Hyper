@@ -1,5 +1,5 @@
 """
-FTW Predictor V46 — ULTIMATE QUANT (Sub-Pattern Voting + CUSUM Override)
+FTW Predictor V46.1 — ULTIMATE QUANT (Fixed Settlement Bug)
 Python 3.10+
 Deps: aiohttp
 """
@@ -38,7 +38,7 @@ class Config:
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
-    db_path: str = os.getenv("DB_PATH", "predictor_v46.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v46_fixed.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 18.0
@@ -165,7 +165,7 @@ def parse_history(payload: Any) -> list[dict[str, Any]]:
 
 
 # ============================================================
-# SMART PATTERN MINER (Bayesian Sub-pattern Voting)
+# SMART PATTERN MINER
 # ============================================================
 
 class SmartPatternMiner:
@@ -176,7 +176,6 @@ class SmartPatternMiner:
         n = len(seq)
         if n < 15: return 0.5, "—", 0, 0
         
-        # 🔥 We collect all patterns from 8 down to 5, then vote
         candidates = []
         
         for length in range(8, 4, -1):
@@ -200,26 +199,21 @@ class SmartPatternMiner:
                 
                 adjusted_p, rel = self.db.adapt_pattern(key, regime, p, is_number=False)
                 
-                if rel < 0.15: continue # Skip terrible patterns
+                if rel < 0.15: continue
                 
-                # Score based on reliability and sample size
                 score = rel * math.sqrt(max(1.0, eff))
                 candidates.append((score, adjusted_p, pattern_str, big_c, small_c))
 
         if not candidates:
             return 0.5, "—", 0, 0
             
-        # Sort by highest score (most reliable)
         candidates.sort(key=lambda x: x[0], reverse=True)
         
-        # 🔥 Bayesian Voting: If the top pattern is really strong, use it. 
-        # Otherwise, blend the top 2-3 patterns.
         best_score, best_p, best_name, best_big, best_small = candidates[0]
         
-        # Blend the next best if it has a similar score
         if len(candidates) > 1:
             score2, p2, name2, big2, small2 = candidates[1]
-            if score2 > best_score * 0.8: # If second pattern is close in reliability
+            if score2 > best_score * 0.8: 
                 best_p = (best_p * 0.6) + (p2 * 0.4)
                 best_big += big2
                 best_small += small2
@@ -383,14 +377,12 @@ class Engine:
         pat_p, pat_name, pat_big, pat_small = self.miner.find_best_size_pattern(seq, regime)
         num_dist, num_info = track_numbers(nums)
         
-        # 🔥 CUSUM TREND OVERRIDE
         cusum_dir = cusum_change(seq)
         
         if pat_name != "—":
             side = "BIG" if pat_big >= pat_small else "SMALL"
             p = 0.5 + abs(pat_big - pat_small) / max(1, pat_big + pat_small) * 0.5
             
-            # If CUSUM says trend has switched, and pattern is betting on the old trend, override
             if cusum_dir == 1 and side == "SMALL":
                 side = "BIG"
                 p = 0.55
@@ -445,8 +437,12 @@ class Engine:
             payload = json.loads(row["payload"])
             actual_size = int(actual["size"])
             actual_num = int(actual["num"])
-            won_side = int(float(payload["p"]) >= 0.5) == actual_size
             
+            # 🔥 FIXED: Use the explicit side from the payload, NOT the p-value.
+            predicted_side = payload.get("side", "BIG" if float(payload["p"]) >= 0.5 else "SMALL")
+            actual_side = "BIG" if actual_size == 1 else "SMALL"
+            
+            won_side = predicted_side == actual_side
             num1 = payload.get("number")
             won_num = actual_num == num1
 
@@ -455,7 +451,6 @@ class Engine:
                 
                 pat_name = payload.get("pattern")
                 if pat_name and pat_name != "—":
-                    # We clean the "CUSUM" tag to learn the base pattern
                     clean_pat = pat_name.replace(" (CUSUM Reversal)", "")
                     self.db.learn_pattern("size_family:" + clean_pat, float(payload["p"]), actual_size)
 
