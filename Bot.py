@@ -1,5 +1,5 @@
 """
-FTW Predictor V47 — HYPER-CONSENSUS (Pattern Agreement + Deep Number Match)
+FTW Predictor V48 — APEX INTELLIGENCE (Bayesian + Entropy + Adaptive Meta-Learner)
 Python 3.10+
 Deps: aiohttp
 """
@@ -38,7 +38,7 @@ class Config:
     token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
-    db_path: str = os.getenv("DB_PATH", "predictor_v47.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_v48_apex.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 18.0
@@ -46,7 +46,7 @@ class Config:
     min_history: int = int(os.getenv("MIN_HISTORY", "180"))
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "8"))
     delivery_ttl: float = 600.0
-    name: str = "FTW PREDICTOR (V47 CONSENSUS)"
+    name: str = "FTW PREDICTOR (V48 APEX)"
 
     win_sticker: str = "CAACAgUAAxkBAAFW0Ixq4QlioiYyx39xRe3akLzGvqXoSgACjg8AAg_PgFc259YBd5tjBj0E"
     loss_sticker: str = "CAACAgUAAxkBAAFW0JZq4Qr4QPStqiQjySoP1DQMvsFZawACVx0AAptrIVX6uzts6bbocD0E"
@@ -66,7 +66,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
-LOG = logging.getLogger("predictor_v47")
+LOG = logging.getLogger("predictor_v48")
 
 
 # ============================================================
@@ -75,6 +75,14 @@ LOG = logging.getLogger("predictor_v47")
 
 def clip(value: float, low: float = 0.02, high: float = 0.98) -> float:
     return max(low, min(high, float(value)))
+
+def sigmoid(z: float) -> float:
+    z = max(-25.0, min(25.0, float(z)))
+    return 1.0 / (1.0 + math.exp(-z))
+
+def logit(p: float, eps: float = 0.02) -> float:
+    p = max(eps, min(1.0 - eps, float(p)))
+    return math.log(p / (1.0 - p))
 
 def escape(value: Any) -> str:
     return html.escape(str(value))
@@ -111,6 +119,12 @@ def get_regime(seq: list[int]) -> str:
     if flip_rate >= 0.72: return "ALT"
     if abs(sum(tail) / len(tail) - 0.5) > 0.20: return "IMBAL"
     return "MIXED"
+
+def entropy_bits(seq: list[int]) -> float:
+    if not seq: return 0.0
+    counts = Counter(seq)
+    total = len(seq)
+    return -sum((f/total) * math.log2(f/total) for f in counts.values())
 
 def cusum_change(seq: list[int], threshold=2.5) -> int:
     if len(seq) < 20: return 0
@@ -165,22 +179,20 @@ def parse_history(payload: Any) -> list[dict[str, Any]]:
 
 
 # ============================================================
-# SMART PATTERN MINER (Consensus Voting)
+# SMART PATTERN MINER (Deep Consensus)
 # ============================================================
 
 class SmartPatternMiner:
     def __init__(self, db: "Database"):
         self.db = db
 
-    def find_best_size_pattern(self, seq: list[int], regime: str) -> tuple[str, str, int, int]:
-        """Returns: (side, pattern_name, big_count, small_count)"""
+    def find_best_size_pattern(self, seq: list[int], regime: str) -> tuple[str, str, int, int, float]:
         n = len(seq)
-        if n < 15: return "BIG", "—", 0, 0
+        if n < 15: return "BIG", "—", 0, 0, 0.5
         
         candidates = []
-        lengths_checked = 0
         
-        for length in range(8, 4, -1):
+        for length in range(9, 4, -1):
             if n < length * 2: continue
             
             suffix = seq[-length:]
@@ -192,7 +204,6 @@ class SmartPatternMiner:
                     obs.append((seq[i + length], recency_weight(i + length, n, 420.0)))
             
             if len(obs) >= CFG.min_support:
-                lengths_checked += 1
                 p, eff = weighted_probability(obs)
                 big_c = sum(1 for val, _ in obs if val == 1)
                 small_c = len(obs) - big_c
@@ -204,16 +215,14 @@ class SmartPatternMiner:
                 
                 if rel < 0.15: continue
                 
-                # Store both the side it suggests and its reliability score
                 side = "BIG" if adjusted_p >= 0.5 else "SMALL"
                 score = rel * math.sqrt(max(1.0, eff))
-                candidates.append((score, side, pattern_str, big_c, small_c))
+                candidates.append((score, side, pattern_str, big_c, small_c, adjusted_p))
 
         if not candidates:
-            return "BIG", "—", 0, 0
+            return "BIG", "—", 0, 0, 0.5
             
-        # 🔥 CONSENSUS VOTING
-        # Count how many independent lengths vote for BIG vs SMALL
+        # Consensus Voting
         big_votes = sum(1 for c in candidates if c[1] == "BIG")
         small_votes = sum(1 for c in candidates if c[1] == "SMALL")
         
@@ -222,69 +231,52 @@ class SmartPatternMiner:
         elif small_votes > big_votes:
             final_side = "SMALL"
         else:
-            # Tie-breaker: Use the highest scoring pattern
             candidates.sort(key=lambda x: x[0], reverse=True)
             final_side = candidates[0][1]
             
-        # Return the top pattern of the winning side
-        best_for_side = max((c for c in candidates if c[1] == final_side), key=lambda x: x[0])
-        _, _, best_name, best_big, best_small = best_for_side
+        best = max((c for c in candidates if c[1] == final_side), key=lambda x: x[0])
+        _, _, best_name, best_big, best_small, best_p = best
 
-        return final_side, best_name, best_big, best_small
+        return final_side, best_name, best_big, best_small, best_p
 
 
 # ============================================================
-# NUMBER TRACKER
+# DEEP NUMBER TRACKER (Bayesian + N-Gram)
 # ============================================================
 
 def track_numbers(nums: list[int]) -> tuple[list[float], str]:
     if not nums: return [0.1] * 10, "No Data"
-    
     n = len(nums)
     
-    def freq(window: int) -> list[float]:
+    # Base Prior (Dirichlet)
+    base = [1.0] * 10
+    
+    # Recent Frequency (30 & 100)
+    for window in (30, 100):
         recent = nums[-window:]
         counts = Counter(recent)
-        total = len(recent)
-        return [(counts.get(k, 0) + 1.0) / (total + 10.0) for k in range(10)]
-
-    f30 = freq(30)
-    f100 = freq(100)
-    
-    trans = [0.1] * 10
-    if n >= 3:
-        ctx = tuple(nums[-3:])
-        obs = {}
+        for k in range(10):
+            base[k] += counts.get(k, 0) * (1.0 if window == 30 else 0.5)
+            
+    # N-Gram (Markov 2,3,4)
+    for order in (2, 3, 4):
+        if n <= order: continue
+        ctx = tuple(nums[-order:])
+        obs = Counter()
         total = 0
-        for i in range(3, n):
-            if tuple(nums[i-3:i]) == ctx:
-                nxt = nums[i]
-                obs[nxt] = obs.get(nxt, 0) + 1
-                total += 1
-        if total >= 3:
-            trans = [(obs.get(k, 0) + 1.0) / (total + 10.0) for k in range(10)]
-    
-    exact = [0.1] * 10
-    if n >= 10:
-        ctx = tuple(nums[-5:])
-        obs = {}
-        total = 0
-        for i in range(5, n):
-            if tuple(nums[i-5:i]) == ctx:
-                nxt = nums[i]
-                obs[nxt] = obs.get(nxt, 0) + 1
+        for i in range(order, n):
+            if tuple(nums[i-order:i]) == ctx:
+                obs[nums[i]] += 1
                 total += 1
         if total >= 2:
-            exact = [(obs.get(k, 0) + 1.0) / (total + 10.0) for k in range(10)]
+            for k in range(10):
+                base[k] += (obs.get(k, 0) / total) * 5.0 # Weight for Markov
+                
+    # Normalize
+    total_w = sum(base)
+    dist = [x / total_w for x in base]
     
-    final = [0.0] * 10
-    for k in range(10):
-        final[k] = 0.15 * f30[k] + 0.25 * f100[k] + 0.30 * trans[k] + 0.30 * exact[k]
-    
-    total = sum(final)
-    if total > 0: final = [x / total for x in final]
-    
-    return final, "Freq+Markov+Exact"
+    return dist, "Bayesian N-Gram"
 
 
 # ============================================================
@@ -384,29 +376,37 @@ class Engine:
         seq = [int(row["size"]) for row in history]
         nums = [int(row["num"]) for row in history]
         regime = get_regime(seq)
+        entropy = entropy_bits(seq[-24:]) / 3.32 # Normalized 0-1
 
-        side, pat_name, pat_big, pat_small = self.miner.find_best_size_pattern(seq, regime)
+        side, pat_name, pat_big, pat_small, pat_p = self.miner.find_best_size_pattern(seq, regime)
         num_dist, num_info = track_numbers(nums)
         
         cusum_dir = cusum_change(seq)
         reason = ""
         
+        # 1. Base Confidence from Pattern
         if pat_name != "—":
-            p = 0.5 + abs(pat_big - pat_small) / max(1, pat_big + pat_small) * 0.5
-            
-            if cusum_dir == 1 and side == "SMALL":
-                side = "BIG"
-                p = 0.55
-                reason = "CUSUM Trend Shift overruled to BIG"
-            elif cusum_dir == -1 and side == "BIG":
-                side = "SMALL"
-                p = 0.55
-                reason = "CUSUM Trend Shift overruled to SMALL"
+            p = pat_p
+            reason = f"Pattern Consensus"
         else:
             recent_big = sum(seq[-20:]) / 20.0
-            side = "BIG" if recent_big >= 0.5 else "SMALL"
             p = 0.5 + abs(recent_big - 0.5) * 0.4
-            reason = "No Pattern Found, used Recent Trend"
+            reason = "Recent Trend"
+            
+        # 2. Entropy Adjustment (If market is too random, flatten confidence)
+        if entropy > 0.85:
+            p = 0.5 + (p - 0.5) * 0.5
+            reason += " (High Entropy)"
+            
+        # 3. CUSUM Trend Break
+        if cusum_dir == 1 and side == "SMALL":
+            side = "BIG"
+            p = 0.55
+            reason = "CUSUM Override (Trend Break)"
+        elif cusum_dir == -1 and side == "BIG":
+            side = "SMALL"
+            p = 0.55
+            reason = "CUSUM Override (Trend Break)"
 
         allowed_nums = range(5, 10) if side == "BIG" else range(0, 5)
         
@@ -437,7 +437,7 @@ class Engine:
             "pat_small": pat_small,
             "num_tracking": num_info,
             "override_reason": reason,
-            "source": "V47 Consensus",
+            "source": "V48 Apex",
             "created": time.time(),
         }
 
@@ -451,7 +451,6 @@ class Engine:
             actual_size = int(actual["size"])
             actual_num = int(actual["num"])
             
-            # 🔥 FIXED: Use the explicit side from the payload
             predicted_side = payload.get("side", "BIG")
             actual_side = "BIG" if actual_size == 1 else "SMALL"
             
