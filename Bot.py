@@ -1,5 +1,5 @@
 """
-FTW Predictor V44 — NUMBER TRACKER PRO (No Fallback, Full Tracking)
+FTW Predictor V44 — NUMBER TRACKER PRO (No Fallback, Full Tracking) - FIXED
 Python 3.10+
 Deps: aiohttp
 """
@@ -177,16 +177,11 @@ def parse_history(payload: Any) -> list[dict[str, Any]]:
 # ============================================================
 
 def track_numbers(nums: list[int]) -> tuple[list[float], str]:
-    """
-    Tracks recent frequency + transitions. Always returns a valid distribution.
-    Returns (distribution, pattern_info_string)
-    """
     if not nums:
         return [0.1] * 10, "No Data"
     
     n = len(nums)
     
-    # 1. Recent Frequency (30, 100, 300)
     def freq(window: int) -> list[float]:
         recent = nums[-window:]
         counts = Counter(recent)
@@ -197,19 +192,11 @@ def track_numbers(nums: list[int]) -> tuple[list[float], str]:
     f100 = freq(100)
     f300 = freq(300)
     
-    # 2. Transition Tracking (What came after last 2, 3, 4 numbers?)
     trans_2 = [0.1] * 10
     trans_3 = [0.1] * 10
     trans_4 = [0.1] * 10
-    trans_2_name = "—"
-    trans_3_name = "—"
-    trans_4_name = "—"
     
-    for order, trans, name_holder in [
-        (2, trans_2, "trans_2_name"),
-        (3, trans_3, "trans_3_name"),
-        (4, trans_4, "trans_4_name")
-    ]:
+    for order, trans in [(2, trans_2), (3, trans_3), (4, trans_4)]:
         if n <= order: continue
         ctx = tuple(nums[-order:])
         obs = {}
@@ -222,7 +209,6 @@ def track_numbers(nums: list[int]) -> tuple[list[float], str]:
         if total >= 3:
             trans[:] = [(obs.get(k, 0) + 1.0) / (total + 10.0) for k in range(10)]
     
-    # 3. Exact Pattern (Last 5, 6, 7 numbers exact match)
     exact_dist = [0.1] * 10
     exact_name = "—"
     for length in range(7, 4, -1):
@@ -240,7 +226,6 @@ def track_numbers(nums: list[int]) -> tuple[list[float], str]:
             exact_name = ",".join(str(x) for x in suffix)
             break
     
-    # 4. Blend (Freq 40%, Trans 40%, Exact 20%)
     final = [0.0] * 10
     for k in range(10):
         final[k] = (
@@ -257,20 +242,17 @@ def track_numbers(nums: list[int]) -> tuple[list[float], str]:
     if total > 0:
         final = [x / total for x in final]
     
-    # Build info string
     info_parts = []
     if exact_name != "—":
         info_parts.append(f"Exact: {exact_name}")
     else:
-        if trans_3_name != "—" or tuple(nums[-3:]) != ():
-            info_parts.append(f"Trans3: {','.join(str(x) for x in nums[-3:])}")
         info_parts.append("Freq: 30/100/300")
     
-    return final, " | ".join(info_parts) if info_parts else "Freq Blend"
+    return final, " | ".join(info_parts)
 
 
 # ============================================================
-# SMART PATTERN MINER (Size Patterns)
+# SMART PATTERN MINER
 # ============================================================
 
 class SmartPatternMiner:
@@ -404,6 +386,35 @@ class Database:
         if fails >= 3 and mean_loss > 0.26: reliability *= 0.01
         return clip(probability), max(0.05, min(1.8, reliability))
 
+    # 🔥 FIXED: adapt_pattern is now defined here
+    def adapt_pattern(self, key: str, regime: str, probability: float, is_number: bool = False) -> tuple[float, float]:
+        row = self.c.execute("SELECT n, loss, failures FROM pattern_models WHERE name=?", (key,)).fetchone()
+        if not row or float(row["n"]) < 2.0: return probability, 1.0
+        n = float(row["n"])
+        mean_loss = float(row["loss"]) / n
+        fails = int(row["failures"])
+        reliability = math.exp(-4.0 * max(-0.10, mean_loss - 0.25))
+        if fails >= 2: reliability *= 0.2
+        if fails >= 4: reliability *= 0.05
+        if fails >= 3 and mean_loss > 0.26: reliability *= 0.01
+        return clip(probability), max(0.05, min(2.0, reliability))
+
+    def learn_pattern(self, key: str, probability: float, actual: int, is_number: bool = False) -> None:
+        row = self.c.execute("SELECT n, loss, failures FROM pattern_models WHERE name=?", (key,)).fetchone()
+        old_n, old_loss, old_fails = (float(row["n"]), float(row["loss"]), int(row["failures"])) if row else (0.0, 0.0, 0)
+        n = 0.985 * old_n + 1.0
+        if is_number:
+            loss = 0.985 * old_loss + (1.0 - probability)
+            wrong = probability < 0.5
+        else:
+            loss = 0.985 * old_loss + (clip(probability) - actual) ** 2
+            wrong = int(probability >= 0.5) != actual
+        fails = old_fails + 1 if wrong else 0
+        self.c.execute(
+            "INSERT INTO pattern_models(name,n,loss,failures) VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET n=excluded.n, loss=excluded.loss, failures=excluded.failures",
+            (key, n, loss, fails)
+        )
+
     def queue(self, kind: str, issue: str | None, text: str, expires: float | None = None) -> None:
         self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
@@ -433,10 +444,7 @@ class Engine:
         n = len(seq)
         loss_streak = self.db.get_loss_streak()
 
-        # Size pattern
         pat_p, pat_name, pat_big, pat_small = self.miner.find_best_size_pattern(seq, regime)
-        
-        # 🔥 Number Tracker - Always returns a distribution
         num_dist, num_info = track_numbers(nums)
 
         experts = {}
@@ -502,7 +510,6 @@ class Engine:
         side = "BIG" if p >= 0.5 else "SMALL"
         allowed_nums = range(5, 10) if side == "BIG" else range(0, 5)
         
-        # Filter num_dist to allowed side
         num_dist_final = [0.0] * 10
         for k in range(10):
             if k in allowed_nums:
@@ -514,7 +521,6 @@ class Engine:
         if total_num > 0:
             num_dist_final = [x / total_num for x in num_dist_final]
         
-        # 🔥 Smart tie-breaking
         recent_counts = Counter(nums[-50:])
         num_pred = max(allowed_nums, key=lambda k: (num_dist_final[k], recent_counts.get(k, 0)))
         num_conf = num_dist_final[num_pred]
