@@ -46,7 +46,7 @@ N_FEATURES = 20
 
 @dataclass(frozen=True)
 class Config:
-    token: str = os.getenv("TELEGRAM_TOKEN", "")
+    token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c")
     chat: str = os.getenv("TELEGRAM_CHAT", "-1004485961768")
     urls_raw: str = os.getenv("HISTORY_URLS", DEFAULT_HISTORY_URL)
     db_path: str = os.getenv("DB_PATH", "predictor_v50.db")
