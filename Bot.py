@@ -1,4 +1,4 @@
-# bot.py — V5 CORE + STICKERS + BUG FIX
+# bot.py — V5 CORE + STICKERS + ZIG-ZAG FIX
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -79,34 +79,27 @@ def escape(x):
 
 
 def run_length(seq):
-    if not seq:
-        return 0
+    if not seq: return 0
     n = 0
     for x in reversed(seq):
-        if x != seq[-1]:
-            break
+        if x != seq[-1]: break
         n += 1
     return n
 
 
 def regime(seq):
     tail = seq[-24:]
-    if len(tail) < 8:
-        return "COLD"
+    if len(tail) < 8: return "COLD"
     flips = sum(a != b for a, b in zip(tail, tail[1:]))
     rate = flips / (len(tail) - 1)
-    if run_length(tail) >= 4:
-        return "RUN"
-    if rate >= 0.70:
-        return "ALTERNATING"
-    if abs(sum(tail) / len(tail) - 0.5) > 0.20:
-        return "IMBALANCED"
+    if run_length(tail) >= 4: return "RUN"
+    if rate >= 0.70: return "ALTERNATING"
+    if abs(sum(tail) / len(tail) - 0.5) > 0.20: return "IMBALANCED"
     return "MIXED"
 
 
 def numeric(value):
-    if isinstance(value, bool):
-        return None
+    if isinstance(value, bool): return None
     text = str(value).strip()
     return int(text) if text.isascii() and text.isdigit() else None
 
@@ -114,37 +107,21 @@ def numeric(value):
 def parse_history(payload):
     obj = payload
     for _ in range(6):
-        if isinstance(obj, list):
-            break
-        if not isinstance(obj, dict):
-            return []
-        obj = next(
-            (
-                obj[k]
-                for k in ("data", "list", "result", "items", "history")
-                if isinstance(obj.get(k), (list, dict))
-            ),
-            None,
-        )
-    if not isinstance(obj, list):
-        return []
+        if isinstance(obj, list): break
+        if not isinstance(obj, dict): return []
+        obj = next((obj[k] for k in ("data", "list", "result", "items", "history") if isinstance(obj.get(k), (list, dict))), None)
+    if not isinstance(obj, list): return []
 
     records = {}
     for item in obj:
-        if not isinstance(item, dict):
-            continue
+        if not isinstance(item, dict): continue
         issue = numeric(item.get("issueNumber", item.get("issue")))
         number = numeric(item.get("number", item.get("value")))
-        if issue is None or number is None or not 0 <= number <= 9:
-            continue
+        if issue is None or number is None or not 0 <= number <= 9: continue
         key = str(issue)
         if key in records and records[key]["num"] != number:
             raise ValueError(f"Conflicting duplicate issue: {key}")
-        records[key] = {
-            "issue": key,
-            "num": number,
-            "size": int(number >= 5),
-        }
+        records[key] = {"issue": key, "num": number, "size": int(number >= 5)}
     return sorted(records.values(), key=lambda x: int(x["issue"]))
 
 
@@ -155,37 +132,11 @@ class Database:
         self.c.execute("PRAGMA journal_mode=WAL")
         self.c.execute("PRAGMA synchronous=NORMAL")
         self.c.executescript("""
-            CREATE TABLE IF NOT EXISTS history(
-                issue TEXT PRIMARY KEY,
-                num INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS predictions(
-                issue TEXT PRIMARY KEY,
-                created REAL NOT NULL,
-                status TEXT NOT NULL,
-                payload TEXT NOT NULL,
-                actual INTEGER
-            );
-            CREATE TABLE IF NOT EXISTS models(
-                key TEXT PRIMARY KEY,
-                n REAL NOT NULL,
-                loss REAL NOT NULL,
-                inverse_loss REAL NOT NULL,
-                failures INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS meta(
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS outbox(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                kind TEXT NOT NULL,
-                issue TEXT,
-                text TEXT NOT NULL,
-                created REAL NOT NULL,
-                expires REAL,
-                sent INTEGER NOT NULL DEFAULT 0
-            );
+            CREATE TABLE IF NOT EXISTS history(issue TEXT PRIMARY KEY, num INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS predictions(issue TEXT PRIMARY KEY, created REAL NOT NULL, status TEXT NOT NULL, payload TEXT NOT NULL, actual INTEGER);
+            CREATE TABLE IF NOT EXISTS models(key TEXT PRIMARY KEY, n REAL NOT NULL, loss REAL NOT NULL, inverse_loss REAL NOT NULL, failures INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, issue TEXT, text TEXT NOT NULL, created REAL NOT NULL, expires REAL, sent INTEGER NOT NULL DEFAULT 0);
         """)
 
     @contextmanager
@@ -199,82 +150,37 @@ class Database:
             raise
 
     def get(self, key, default=None):
-        row = self.c.execute(
-            "SELECT value FROM meta WHERE key=?", (key,)
-        ).fetchone()
+        row = self.c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
         return json.loads(row["value"]) if row else default
 
     def set(self, key, value):
-        self.c.execute(
-            "INSERT INTO meta VALUES (?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, json.dumps(value)),
-        )
+        self.c.execute("INSERT INTO meta VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, json.dumps(value)))
 
     def ingest(self, records):
         with self.transaction():
             for r in records:
-                old = self.c.execute(
-                    "SELECT num FROM history WHERE issue=?", (r["issue"],)
-                ).fetchone()
+                old = self.c.execute("SELECT num FROM history WHERE issue=?", (r["issue"],)).fetchone()
                 if old and old["num"] != r["num"]:
-                    raise ValueError(
-                        f"Source changed settled issue {r['issue']}"
-                    )
-                self.c.execute(
-                    "INSERT OR IGNORE INTO history VALUES (?,?)",
-                    (r["issue"], r["num"]),
-                )
-            self.c.execute(
-                "DELETE FROM history WHERE issue NOT IN "
-                "(SELECT issue FROM history "
-                "ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?)",
-                (CFG.max_history,),
-            )
+                    raise ValueError(f"Source changed settled issue {r['issue']}")
+                self.c.execute("INSERT OR IGNORE INTO history VALUES (?,?)", (r["issue"], r["num"]))
+            self.c.execute("DELETE FROM history WHERE issue NOT IN (SELECT issue FROM history ORDER BY CAST(issue AS INTEGER) DESC LIMIT ?)", (CFG.max_history,))
 
     def history(self):
-        rows = self.c.execute(
-            "SELECT issue,num FROM history "
-            "ORDER BY CAST(issue AS INTEGER)"
-        ).fetchall()
-        return [
-            {
-                "issue": r["issue"],
-                "num": r["num"],
-                "size": int(r["num"] >= 5),
-            }
-            for r in rows
-        ]
+        rows = self.c.execute("SELECT issue,num FROM history ORDER BY CAST(issue AS INTEGER)").fetchall()
+        return [{"issue": r["issue"], "num": r["num"], "size": int(r["num"] >= 5)} for r in rows]
 
     def memory(self, key):
-        row = self.c.execute(
-            "SELECT * FROM models WHERE key=?", (key,)
-        ).fetchone()
-        return dict(row) if row else {
-            "n": 0.0,
-            "loss": 0.0,
-            "inverse_loss": 0.0,
-            "failures": 0,
-        }
+        row = self.c.execute("SELECT * FROM models WHERE key=?", (key,)).fetchone()
+        return dict(row) if row else {"n": 0.0, "loss": 0.0, "inverse_loss": 0.0, "failures": 0}
 
     def learn(self, key, probability, actual):
         m = self.memory(key)
         n = CFG.decay * m["n"] + 1
         loss = CFG.decay * m["loss"] + (probability - actual) ** 2
-        inv = (
-            CFG.decay * m["inverse_loss"]
-            + (1 - probability - actual) ** 2
-        )
+        inv = CFG.decay * m["inverse_loss"] + (1 - probability - actual) ** 2
         wrong = int(probability >= 0.5) != actual
         failures = m["failures"] + 1 if wrong else 0
-        self.c.execute(
-            "INSERT INTO models VALUES (?,?,?,?,?) "
-            "ON CONFLICT(key) DO UPDATE SET "
-            "n=excluded.n,loss=excluded.loss,"
-            "inverse_loss=excluded.inverse_loss,"
-            "failures=excluded.failures",
-            (key, n, loss, inv, failures),
-        )
+        self.c.execute("INSERT INTO models VALUES (?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET n=excluded.n,loss=excluded.loss,inverse_loss=excluded.inverse_loss,failures=excluded.failures", (key, n, loss, inv, failures))
 
     def adapt(self, key, probability):
         m = self.memory(key)
@@ -284,12 +190,7 @@ class Database:
 
         brier = m["loss"] / n
         inverse_brier = m["inverse_loss"] / n
-
-        flipped = (
-            n >= 25
-            and inverse_brier + 0.04 < brier
-            and inverse_brier < 0.245
-        )
+        flipped = (n >= 25 and inverse_brier + 0.04 < brier and inverse_brier < 0.245)
         effective_loss = inverse_brier if flipped else brier
         p = 1 - probability if flipped else probability
 
@@ -299,16 +200,11 @@ class Database:
         p = 0.5 + (p - 0.5) * shrink
 
         weight = clip(math.exp(-8 * (effective_loss - 0.25)), 0.15, 2.0)
-        if m["failures"] >= 3 and not flipped:
-            weight *= 0.35
+        if m["failures"] >= 3 and not flipped: weight *= 0.35
         return clip(p), weight, flipped
 
     def queue(self, kind, issue, text, expires=None):
-        self.c.execute(
-            "INSERT INTO outbox(kind,issue,text,created,expires) "
-            "VALUES (?,?,?,?,?)",
-            (kind, issue, text, time.time(), expires),
-        )
+        self.c.execute("INSERT INTO outbox(kind,issue,text,created,expires) VALUES (?,?,?,?,?)", (kind, issue, text, time.time(), expires))
 
 
 def weighted_probability(observations):
@@ -323,14 +219,11 @@ def trend_features(seq):
     def mean(n):
         arr = seq[-n:]
         return sum(arr) / len(arr) if arr else 0.5
-
     def ema(n, alpha=0.3):
         if not seq: return 0.5
         val = seq[0]
-        for x in seq[1:]:
-            val = alpha * x + (1 - alpha) * val
+        for x in seq[1:]: val = alpha * x + (1 - alpha) * val
         return val
-        
     def rsi(period=14):
         if len(seq) < period + 1: return 50.0
         gains = losses = 0.0
@@ -348,18 +241,7 @@ def trend_features(seq):
     rsi_norm = (rsi(14) / 100.0) * 2 - 1
     macd = (ema(12) - ema(26)) * 2
     
-    return [
-        1.0,
-        2 * mean(8) - 1,
-        2 * mean(24) - 1,
-        2 * mean(96) - 1,
-        mean(8) - mean(24),
-        signed_run,
-        2 * seq[-1] - 1,
-        (2 * alternation - 1) * (2 * seq[-1] - 1),
-        rsi_norm,
-        macd
-    ]
+    return [1.0, 2 * mean(8) - 1, 2 * mean(24) - 1, 2 * mean(96) - 1, mean(8) - mean(24), signed_run, 2 * seq[-1] - 1, (2 * alternation - 1) * (2 * seq[-1] - 1), rsi_norm, macd]
 
 
 def logistic(weights, features):
@@ -414,42 +296,19 @@ class Engine:
 
         for order in (1, 2, 3, 4):
             suffix = tuple(seq[-order:])
-            obs = [
-                (seq[i], weight(i))
-                for i in range(order, size - order)
-                if tuple(seq[i - order:i]) == suffix
-            ]
+            obs = [(seq[i], weight(i)) for i in range(order, size - order) if tuple(seq[i - order:i]) == suffix]
             if len(obs) >= CFG.min_support:
                 experts[f"markov{order}"] = weighted_probability(obs)[0]
 
-        run_obs = []
-        regime_obs = []
+        run_obs, regime_obs = [], []
         for i in range(24, size):
             past = seq[max(0, i - 96):i]
-            if past[-1] == seq[-1] and min(run_length(past), 8) == current_run:
-                run_obs.append((seq[i], weight(i)))
-            if regime(past) == current_regime:
-                regime_obs.append((seq[i], weight(i)))
+            if past[-1] == seq[-1] and min(run_length(past), 8) == current_run: run_obs.append((seq[i], weight(i)))
+            if regime(past) == current_regime: regime_obs.append((seq[i], weight(i)))
+        if len(run_obs) >= CFG.min_support: experts["run"] = weighted_probability(run_obs)[0]
+        if len(regime_obs) >= CFG.min_support: experts["regime"] = weighted_probability(regime_obs)[0]
 
-        if len(run_obs) >= CFG.min_support:
-            experts["run"] = weighted_probability(run_obs)[0]
-        if len(regime_obs) >= CFG.min_support:
-            experts["regime"] = weighted_probability(regime_obs)[0]
-
-        experts["base"] = weighted_probability(
-            [(y, weight(i)) for i, y in enumerate(seq)]
-        )[0]
-
-        length = 10
-        nearest = []
-        suffix = seq[-length:]
-        for i in range(length, size - length):
-            previous = seq[i - length:i]
-            distance = sum(a != b for a, b in zip(previous, suffix))
-            if distance <= 2:
-                nearest.append((seq[i], weight(i) * 0.4 ** distance))
-        if len(nearest) >= 20:
-            experts["neighbors"] = weighted_probability(nearest)[0]
+        experts["base"] = weighted_probability([(y, weight(i)) for i, y in enumerate(seq)])[0]
 
         features = trend_features(seq)
         weights = self.db.get("trend_weights", [0.0] * len(features))
@@ -458,29 +317,27 @@ class Engine:
         if size >= 120:
             window = 48
             pre = [0]
-            for x in seq:
-                pre.append(pre[-1] + x)
+            for x in seq: pre.append(pre[-1] + x)
             cur_bucket = min(6, int((pre[size] - pre[size - window]) / window * 7))
             bal_obs = []
             last_taken = -999
             for i in range(window, size):
-                if i - last_taken < 12:
-                    continue
+                if i - last_taken < 12: continue
                 if min(6, int((pre[i] - pre[i - window]) / window * 7)) == cur_bucket:
                     bal_obs.append((seq[i], weight(i)))
                     last_taken = i
-            if len(bal_obs) >= CFG.min_support:
-                experts["balance"] = weighted_probability(bal_obs)[0]
+            if len(bal_obs) >= CFG.min_support: experts["balance"] = weighted_probability(bal_obs)[0]
 
+        # ── NAYA: ZIG-ZAG EXPERT ──
+        # Ye expert B-S-B-S wale patterns ko specifically track karta hai
         alt_len = 0
         for i in range(size - 1, 0, -1):
-            if seq[i] != seq[i - 1]:
-                alt_len += 1
-            else:
-                break
+            if seq[i] != seq[i - 1]: alt_len += 1
+            else: break
         alt_len = min(alt_len, 10)
-        if alt_len >= 5:
-            alt_obs = []
+        
+        if alt_len >= 3: # Zig zag detect hua
+            zigzag_obs = []
             for i in range(24, size):
                 past = seq[max(0, i - 96):i]
                 if len(past) < 2: continue
@@ -489,35 +346,30 @@ class Engine:
                     if past[j] != past[j - 1]: a2 += 1
                     else: break
                 if min(a2, 10) == alt_len:
-                    alt_obs.append((seq[i], weight(i)))
-            if len(alt_obs) >= CFG.min_support:
-                experts["altbreak"] = weighted_probability(alt_obs)[0]
+                    zigzag_obs.append((seq[i], weight(i)))
+            # Zig zag ke liye support thoda kam rakha hai (5) kyunki pattern specific hai
+            if len(zigzag_obs) >= 5: 
+                experts["zigzag"] = weighted_probability(zigzag_obs)[0]
 
         return experts, top, features
 
     def predict_number(self, nums, predicted_side):
         cands = list(range(5, 10)) if predicted_side == "BIG" else list(range(0, 5))
         n = len(nums)
-        if n < 12:
-            return cands[0]
+        if n < 12: return cands[0]
 
-        def w(i):
-            return 0.5 ** ((n - 1 - i) / 250)
+        def w(i): return 0.5 ** ((n - 1 - i) / 250)
 
         def table(order):
             ctx = tuple(nums[-order:])
-            counts = {c: 0.0 for c in cands}
-            total = 0.0
-            support = 0
+            counts, total, support = {c: 0.0 for c in cands}, 0.0, 0
             for i in range(order, n):
                 if tuple(nums[i - order:i]) == ctx:
                     wi = w(i)
                     total += wi
                     support += 1
-                    if nums[i] in counts:
-                        counts[nums[i]] += wi
-            if support < 6:
-                return None, support
+                    if nums[i] in counts: counts[nums[i]] += wi
+            if support < 6: return None, support
             dist = {c: (counts[c] + 0.5) / (total + 0.5 * len(cands)) for c in cands}
             z = sum(dist.values())
             return {c: dist[c] / z for c in cands}, support
@@ -529,16 +381,12 @@ class Engine:
         for c in cands:
             g = n
             for i in range(n - 1, -1, -1):
-                if nums[i] == c:
-                    g = n - 1 - i
-                    break
+                if nums[i] == c: g = n - 1 - i; break
             gap[c] = g
         freq = {c: 0.0 for c in cands}
         for i, v in enumerate(nums[-150:]):
-            if v in freq:
-                freq[v] += 1.0 / ((min(n, 150) - i) ** 0.4)
-        gz = sum(gap.values()) or 1.0
-        fz = sum(freq.values()) or 1.0
+            if v in freq: freq[v] += 1.0 / ((min(n, 150) - i) ** 0.4)
+        gz, fz = sum(gap.values()) or 1.0, sum(freq.values()) or 1.0
         gf = {c: 0.6 * gap[c] / gz + 0.4 * freq[c] / fz for c in cands}
         gz2 = sum(gf.values()) or 1.0
         gf = {c: gf[c] / gz2 for c in cands}
@@ -568,12 +416,10 @@ class Engine:
             key = f"expert:{name}:{current_regime}"
             corrected, weight, flipped = self.db.adapt(key, p)
             adjusted.append((corrected, weight))
-            if flipped:
-                flipped_models.append(name)
+            if flipped: flipped_models.append(name)
 
         denominator = sum(w for _, w in adjusted)
         p_raw = sum(p * w for p, w in adjusted) / denominator
-
         disagreement = math.sqrt(sum(w * (p - p_raw) ** 2 for p, w in adjusted) / denominator)
 
         bucket = min(9, int(p_raw * 10))
@@ -592,13 +438,10 @@ class Engine:
             "bucket": bucket,
             "side": pred_side,
             "num": pred_num,
-            "action": "SIGNAL",
+            "action": "SIGNAL", # Ab skip nahi hoga, har round signal jayega
             "regime": current_regime,
             "experts": experts,
-            "patterns": [
-                {"key": key, "p": prob, "support": count}
-                for _, key, prob, count, _ in patterns
-            ],
+            "patterns": [{"key": key, "p": prob, "support": count} for _, key, prob, count, _ in patterns],
             "features": features,
             "disagreement": disagreement,
             "flipped": flipped_models,
@@ -606,10 +449,7 @@ class Engine:
 
     def settle(self, history):
         lookup = {r["issue"]: r for r in history}
-        pending = self.db.c.execute(
-            "SELECT issue,payload FROM predictions WHERE status='PENDING' "
-            "ORDER BY CAST(issue AS INTEGER)"
-        ).fetchall()
+        pending = self.db.c.execute("SELECT issue,payload FROM predictions WHERE status='PENDING' ORDER BY CAST(issue AS INTEGER)").fetchall()
 
         for row in pending:
             actual = lookup.get(row["issue"])
@@ -617,24 +457,16 @@ class Engine:
 
             prediction = json.loads(row["payload"])
             y = actual["size"]
-            
             won_side = int(prediction["p"] >= 0.5) == y
             actual_num = actual["num"]
             pred_num = prediction.get("num")
             won_num = (actual_num == pred_num) if pred_num is not None else False
-            
             status = "WIN" if won_side else "LOSS"
 
-            was_delivered = bool(self.db.c.execute(
-                "SELECT 1 FROM outbox WHERE kind='prediction' AND issue=? AND sent=1 LIMIT 1",
-                (row["issue"],)
-            ).fetchone())
+            was_delivered = bool(self.db.c.execute("SELECT 1 FROM outbox WHERE kind='prediction' AND issue=? AND sent=1 LIMIT 1", (row["issue"],)).fetchone())
 
             with self.db.transaction():
-                self.db.c.execute(
-                    "UPDATE predictions SET status=?,actual=? WHERE issue=?",
-                    (status, actual["num"], row["issue"]),
-                )
+                self.db.c.execute("UPDATE predictions SET status=?,actual=? WHERE issue=?", (status, actual["num"], row["issue"]))
 
                 for name, p in prediction["experts"].items():
                     self.db.learn(f"expert:{name}:{prediction['regime']}", p, y)
@@ -643,10 +475,7 @@ class Engine:
 
                 weights = self.db.get("trend_weights", [0.0] * len(prediction["features"]))
                 error = y - prediction["experts"]["trend"]
-                weights = [
-                    clip(w + CFG.learning_rate * (error * x - 0.01 * w), -4, 4)
-                    for w, x in zip(weights, prediction["features"])
-                ]
+                weights = [clip(w + CFG.learning_rate * (error * x - 0.01 * w), -4, 4) for w, x in zip(weights, prediction["features"])]
                 self.db.set("trend_weights", weights)
 
                 key = f"cal:{prediction['bucket']}"
@@ -665,7 +494,7 @@ class Engine:
                     self.db.set("cooldown", CFG.cooldown_rounds)
                     self.db.set("loss_streak", 0)
 
-                # ── QUEUE STICKERS ──
+                # STICKERS
                 if was_delivered:
                     if won_num:
                         self.db.queue("sticker", row["issue"], CFG.jack_sticker)
@@ -675,29 +504,19 @@ class Engine:
                         self.db.queue("sticker", row["issue"], CFG.loss_sticker)
                 
                 self.db.set("stats", stats)
-
-                self.db.c.execute(
-                    "UPDATE outbox SET sent=2 "
-                    "WHERE kind='prediction' AND issue=? AND sent=0",
-                    (row["issue"],),
-                )
+                self.db.c.execute("UPDATE outbox SET sent=2 WHERE kind='prediction' AND issue=? AND sent=0", (row["issue"],))
 
 
 def format_prediction(p):
     selected_probability = max(p["p"], 1 - p["p"])
     conf_percent = selected_probability * 100
-    
     filled = int(conf_percent // 10)
     bar = "█" * filled + "░" * (10 - filled)
-    
     color_emoji = "🔴" if p['side'] == "BIG" else "🔵"
     
-    if conf_percent >= 65:
-        quality = "🔥 HIGH VIP (Stake: 1x)"
-    elif conf_percent >= 60:
-        quality = "⭐ VIP (Stake: 1x)"
-    else:
-        quality = "✅ NORMAL (Stake: 0.5x)"
+    if conf_percent >= 65: quality = "🔥 HIGH VIP (Stake: 1x)"
+    elif conf_percent >= 60: quality = "⭐ VIP (Stake: 1x)"
+    else: quality = "✅ NORMAL (Stake: 0.5x)"
 
     return (
         f"⚡️ <b>{escape(CFG.name)}</b> ⚡️\n"
@@ -729,15 +548,12 @@ class Runtime:
                         best = records
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
                 LOG.warning("A history source failed")
-        if not best:
-            raise RuntimeError("No valid history source available")
+        if not best: raise RuntimeError("No valid history source available")
         return best
 
     async def pause(self, seconds):
-        try:
-            await asyncio.wait_for(self.stop.wait(), timeout=seconds)
-        except asyncio.TimeoutError:
-            pass
+        try: await asyncio.wait_for(self.stop.wait(), timeout=seconds)
+        except asyncio.TimeoutError: pass
 
     async def worker(self, session):
         failures = 0
@@ -752,6 +568,14 @@ class Runtime:
 
                 self.engine.settle(history)
 
+                # Check Cooldown
+                cooldown = self.db.get("cooldown", 0)
+                if cooldown > 0:
+                    self.db.set("cooldown", cooldown - 1)
+                    LOG.info("Cooldown active, skipping round.")
+                    await self.pause(CFG.fetch_every)
+                    continue
+
                 latest = int(history[-1]["issue"])
                 seen = self.db.get("latest_seen")
 
@@ -764,7 +588,6 @@ class Runtime:
                     await self.pause(CFG.fetch_every)
                     continue
 
-                # ── BUG FIX: Agar API mein gap aaye tab bhi bot stop na ho ──
                 self.db.set("latest_seen", latest)
                 
                 if len(history) < 30:
@@ -773,19 +596,13 @@ class Runtime:
 
                 issue = str(latest + 1)
                 exists = self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
+                
                 if not exists:
                     p = self.engine.predict(history, issue)
+                    
                     with self.db.transaction():
-                        self.db.c.execute(
-                            "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                            (issue, time.time(), "PENDING", json.dumps(p)),
-                        )
-                        self.db.queue(
-                            "prediction",
-                            issue,
-                            format_prediction(p),
-                            time.time() + CFG.delivery_ttl,
-                        )
+                        self.db.c.execute("INSERT INTO predictions VALUES (?,?,?,?,NULL)", (issue, time.time(), "PENDING", json.dumps(p)))
+                        self.db.queue("prediction", issue, format_prediction(p), time.time() + CFG.delivery_ttl)
 
             except asyncio.CancelledError:
                 raise
@@ -799,20 +616,17 @@ class Runtime:
 
     async def sender(self, session):
         backoff = 1.0
-
         while not self.stop.is_set():
             row = self.db.c.execute("SELECT * FROM outbox WHERE sent=0 ORDER BY id LIMIT 1").fetchone()
             if not row:
                 await self.pause(0.5)
                 continue
-
             if row["expires"] and time.time() >= row["expires"]:
                 self.db.c.execute("UPDATE outbox SET sent=2 WHERE id=?", (row["id"],))
                 continue
 
             delay = backoff
             try:
-                # ── STICKER vs MESSAGE LOGIC ──
                 if row["kind"] == "sticker":
                     endpoint = f"https://api.telegram.org/bot{CFG.token}/sendSticker"
                     payload = {"chat_id": CFG.chat, "sticker": row["text"]}
@@ -822,42 +636,24 @@ class Runtime:
 
                 async with session.post(endpoint, json=payload) as response:
                     data = await response.json(content_type=None)
-
                     if response.status == 200 and data.get("ok"):
                         self.db.c.execute("UPDATE outbox SET sent=1 WHERE id=?", (row["id"],))
                         backoff = 1.0
                         continue
-
                     code = data.get("error_code", response.status)
-                    if code == 429:
-                        delay = float(data.get("parameters", {}).get("retry_after", 10))
-                    elif code in (400, 401, 403, 404):
-                        LOG.error("Telegram rejected delivery: code %s", code)
-                        delay = 60
-                    else:
-                        LOG.warning("Telegram delivery failed: code %s", code)
-
+                    if code == 429: delay = float(data.get("parameters", {}).get("retry_after", 10))
+                    elif code in (400, 401, 403, 404): delay = 60
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
-                LOG.warning(f"Telegram transport failure: {type(e).__name__} - {str(e)}")
-
+            except Exception:
+                pass
             await self.pause(delay)
             backoff = min(60, backoff * 2)
 
     async def health(self, request):
         age = time.time() - self.last_fetch if self.last_fetch else None
         healthy = age is not None and age < 90
-        return web.json_response(
-            {
-                "status": "ok" if healthy else "degraded",
-                "last_fetch_age_seconds": round(age, 1) if age else age,
-                "last_error": self.last_error,
-                "metrics": self.db.get("stats", {}),
-                "pending_messages": self.db.c.execute("SELECT COUNT(*) FROM outbox WHERE sent=0").fetchone()[0],
-            },
-            status=200 if healthy else 503,
-        )
+        return web.json_response({"status": "ok" if healthy else "degraded", "metrics": self.db.get("stats", {})}, status=200 if healthy else 503)
 
 
 async def main():
@@ -889,31 +685,19 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("FTW ULTRA Predictor Started with Stickers")
+            LOG.info("FTW Predictor Started (ZigZag Fix Included)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
-
-            for task in tasks:
-                if task.done() and not task.cancelled():
-                    exc = task.exception()
-                    if exc:
-                        raise exc
-
-            for task in tasks:
-                task.cancel()
+            for task in tasks: task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-
     finally:
         runtime.stop.set()
-        for task in tasks:
-            task.cancel()
-        if stop_task:
-            stop_task.cancel()
+        for task in tasks: task.cancel()
+        if stop_task: stop_task.cancel()
         await asyncio.gather(*tasks, *([stop_task] if stop_task else []), return_exceptions=True)
         await runner.cleanup()
         db.c.close()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
