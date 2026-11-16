@@ -1,4 +1,4 @@
-# bot.py — V5.1 ADVANCED CORE + SMART TREND + PATTERN ENSEMBLE + SIGNAL GATING
+# bot.py — V5.2 ADVANCED CORE + SMART TREND + PATTERN ENSEMBLE + NO SKIP
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -28,7 +28,7 @@ from aiohttp import web
 
 @dataclass(frozen=True)
 class Config:
-    token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAGjXkDekFYjUGgWRat_8OySdsRZANjdc9c").strip()
+    token: str = os.getenv("TELEGRAM_TOKEN", "8611789455:AAELjMCyFV74hmMMdETQ2J8-8DHHBBQ5nhE").strip()
     chat: str = os.getenv("CHAT_ID", "-1004485961768").strip()
     urls: tuple = tuple(
         x.strip()
@@ -47,7 +47,7 @@ class Config:
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "12"))
     min_edge: float = float(os.getenv("MIN_EDGE", "0.06"))
     cooldown_rounds: int = int(os.getenv("COOLDOWN_ROUNDS", "2"))
-    learning_rate: float = 0.04
+    learning_rate: float = 0.045
     decay: float = 0.985
     max_pattern: int = 14
     round_seconds: float = 60.0
@@ -71,6 +71,7 @@ class Config:
 CFG = Config()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 LOG = logging.getLogger("predictor")
+
 
 # -----------------------------
 # Helpers
@@ -199,15 +200,21 @@ def trend_features(seq):
     macd = (ema(12) - ema(26)) * 2
     slope = (mean(8) - mean(24)) * 4
     accel = (mean(8) - mean(96)) * 2
-    recent_vol = sum(abs(b - a) for a, b in zip(seq[-16:], seq[-15:])) / max(1, len(seq[-16:]) - 1) if len(seq) >= 2 else 0.0
+
+    recent_vol = 0.0
+    if len(seq) >= 2:
+        vals = list(seq[-16:])
+        recent_vol = sum(abs(b - a) for a, b in zip(vals, vals[1:])) / max(1, len(vals) - 1)
+
     entropy = 0.0
     if len(seq) >= 4:
         counts = {0: 0, 1: 0}
         for x in seq[-16:]:
             counts[int(x)] += 1
         total = sum(counts.values())
-        p_vals = [c / total for c in counts.values() if c > 0]
-        entropy = -sum(p * math.log(p, 2) for p in p_vals) / 2.0
+        if total:
+            p_vals = [c / total for c in counts.values() if c > 0]
+            entropy = -sum(p * math.log(p, 2) for p in p_vals) / 2.0
 
     return [
         1.0,
@@ -379,7 +386,7 @@ class Engine:
             observations = []
             last_index = -length - 1
             for i in range(length, size - length):
-                if tuple(seq[i - length:i]) != suffix:
+                if tuple(seq[i - length : i]) != suffix:
                     continue
                 if i - last_index < length + 1:
                     continue
@@ -428,7 +435,7 @@ class Engine:
         if len(regime_obs) >= CFG.min_support:
             experts["regime"] = weighted_probability(regime_obs)[0]
 
-        # 4) balance / bucket expert
+        # 4) base expert
         experts["base"] = weighted_probability([(y, weight(i)) for i, y in enumerate(seq)])[0]
 
         # 5) trend model
@@ -436,7 +443,7 @@ class Engine:
         weights = self.db.get("trend_weights", [0.0] * len(features))
         experts["trend"] = logistic(weights, features)
 
-        # 6) balance window (big picture)
+        # 6) balance window
         if size >= 120:
             window = 48
             pre = [0]
@@ -491,7 +498,7 @@ class Engine:
             if len(alt_obs) >= CFG.min_support:
                 experts["alternation"] = weighted_probability(alt_obs)[0]
 
-        # 9) block-repeat / rhythmic repetition
+        # 9) block-repeat / rhythm expert
         if size >= 16:
             rep_obs = []
             for i in range(12, size):
@@ -501,12 +508,12 @@ class Engine:
             if len(rep_obs) >= CFG.min_support:
                 experts["repeat"] = weighted_probability(rep_obs)[0]
 
-        # 10) last-3 momentum heuristic
+        # 10) momentum expert
         if size >= 12:
             momentum_obs = []
             for i in range(12, size):
                 recent = seq[max(0, i - 12) : i]
-                if abs((seq[-1] - recent[-1])) <= 1:
+                if abs(seq[-1] - recent[-1]) <= 1:
                     momentum_obs.append((seq[i], weight(i)))
             if len(momentum_obs) >= CFG.min_support:
                 experts["momentum"] = weighted_probability(momentum_obs)[0]
@@ -522,7 +529,6 @@ class Engine:
         def w(i):
             return 0.5 ** ((n - 1 - i) / 250)
 
-        # context tables of direct suffix matches
         def table(order):
             ctx = tuple(nums[-order:])
             counts, total, support = {c: 0.0 for c in cands}, 0.0, 0
@@ -542,7 +548,6 @@ class Engine:
         t1, s1 = table(1)
         t2, s2 = table(2)
 
-        # gap and recency
         gap = {}
         for c in cands:
             g = n
@@ -563,7 +568,6 @@ class Engine:
         gz2 = sum(gf.values()) or 1.0
         gf = {c: gf[c] / gz2 for c in cands}
 
-        # combine
         w1 = 0.45 * min(1.0, s1 / 25) if t1 else 0.0
         w2 = 0.35 * min(1.0, s2 / 12) if t2 else 0.0
         wg = 1.0 - w1 - w2
@@ -614,33 +618,6 @@ class Engine:
         pred_side = "BIG" if p >= 0.5 else "SMALL"
         pred_num = self.predict_number(nums, pred_side)
 
-        # signal gating
-        # skip weak or noisy predictions
-        should_signal = (
-            len(history) >= CFG.min_history
-            and edge >= CFG.min_edge
-            and disagreement <= 0.75
-        )
-
-        if not should_signal:
-            return {
-                "issue": issue,
-                "p": p,
-                "p_raw": p_raw,
-                "bucket": bucket,
-                "side": pred_side,
-                "num": pred_num,
-                "action": "SKIP",
-                "regime": current_regime,
-                "experts": experts,
-                "patterns": [{"key": key, "p": prob, "support": count} for _, key, prob, count, _ in patterns],
-                "features": features,
-                "disagreement": disagreement,
-                "flipped": flipped_models,
-                "edge": edge,
-                "skip_reason": "weak_edge_or_high_disagreement",
-            }
-
         return {
             "issue": issue,
             "p": p,
@@ -648,7 +625,7 @@ class Engine:
             "bucket": bucket,
             "side": pred_side,
             "num": pred_num,
-            "action": "SIGNAL",
+            "action": "SIGNAL",  # always signal
             "regime": current_regime,
             "experts": experts,
             "patterns": [{"key": key, "p": prob, "support": count} for _, key, prob, count, _ in patterns],
@@ -838,25 +815,18 @@ class Runtime:
                 exists = self.db.c.execute("SELECT 1 FROM predictions WHERE issue=?", (issue,)).fetchone()
 
                 if not exists:
-                    p = self.engine.predict(history, issue)
-
-                    if p["action"] == "SKIP":
-                        LOG.info(
-                            "Signal skipped for issue %s edge=%.3f disagreement=%.3f reason=%s",
-                            issue,
-                            p.get("edge", 0.0),
-                            p.get("disagreement", 0.0),
-                            p.get("skip_reason"),
-                        )
-                        await self.pause(CFG.fetch_every)
-                        continue
-
+                    prediction = self.engine.predict(history, issue)
                     with self.db.transaction():
                         self.db.c.execute(
                             "INSERT INTO predictions VALUES (?,?,?,?,NULL)",
-                            (issue, time.time(), "PENDING", json.dumps(p)),
+                            (issue, time.time(), "PENDING", json.dumps(prediction)),
                         )
-                        self.db.queue("prediction", issue, format_prediction(p), time.time() + CFG.delivery_ttl)
+                        self.db.queue(
+                            "prediction",
+                            issue,
+                            format_prediction(prediction),
+                            time.time() + CFG.delivery_ttl,
+                        )
 
             except asyncio.CancelledError:
                 raise
@@ -945,7 +915,7 @@ async def main():
                 asyncio.create_task(runtime.sender(session), name="sender"),
             ]
             stop_task = asyncio.create_task(runtime.stop.wait())
-            LOG.info("FTW Predictor Started (Advanced Smart Engine Online)")
+            LOG.info("FTW Predictor Started (Advanced Smart Engine Online — no skip)")
 
             await asyncio.wait([*tasks, stop_task], return_when=asyncio.FIRST_COMPLETED)
             runtime.stop.set()
