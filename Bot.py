@@ -1,4 +1,4 @@
-# bot.py — V5.2 ADVANCED CORE + SMART TREND + PATTERN ENSEMBLE + NO SKIP
+# bot.py — V5.2.1 FIXED CORE + SMART TREND + PATTERN ENSEMBLE + NO SKIP
 # Python 3.10+
 # Dependency: pip install aiohttp
 
@@ -47,6 +47,7 @@ class Config:
     min_support: int = int(os.getenv("MIN_PATTERN_SUPPORT", "12"))
     min_edge: float = float(os.getenv("MIN_EDGE", "0.06"))
     cooldown_rounds: int = int(os.getenv("COOLDOWN_ROUNDS", "2"))
+    loss_limit: int = int(os.getenv("LOSS_LIMIT", "3"))   # ✅ FIX: was missing
     learning_rate: float = 0.045
     decay: float = 0.985
     max_pattern: int = 14
@@ -66,6 +67,8 @@ class Config:
             raise ValueError("Invalid polling interval or history minimum.")
         if self.min_support < 3 or not 0 < self.min_edge < 0.5:
             raise ValueError("Invalid support or edge configuration.")
+        if self.loss_limit < 1:
+            raise ValueError("LOSS_LIMIT must be >= 1.")
 
 
 CFG = Config()
@@ -691,7 +694,7 @@ class Engine:
 
                 streak = 0 if won_side else self.db.get("loss_streak", 0) + 1
                 self.db.set("loss_streak", streak)
-                if streak >= CFG.loss_limit:
+                if streak >= CFG.loss_limit:   # ✅ now valid
                     self.db.set("cooldown", CFG.cooldown_rounds)
                     self.db.set("loss_streak", 0)
 
@@ -784,14 +787,11 @@ class Runtime:
                 self.last_error = None
                 failures = 0
 
-                self.engine.settle(history)
-
-                cooldown = self.db.get("cooldown", 0)
-                if cooldown > 0:
-                    self.db.set("cooldown", cooldown - 1)
-                    LOG.info("Cooldown active, skipping round.")
-                    await self.pause(CFG.fetch_every)
-                    continue
+                # ✅ FIX: settle must never kill the worker loop
+                try:
+                    self.engine.settle(history)
+                except Exception:
+                    LOG.exception("Settle failed — continuing worker")
 
                 latest = int(history[-1]["issue"])
                 seen = self.db.get("latest_seen")
@@ -805,7 +805,15 @@ class Runtime:
                     await self.pause(CFG.fetch_every)
                     continue
 
+                # New round detected → consume one cooldown tick here
                 self.db.set("latest_seen", latest)
+
+                cooldown = self.db.get("cooldown", 0)
+                if cooldown > 0:
+                    self.db.set("cooldown", cooldown - 1)
+                    LOG.info("Cooldown active (%s left), skipping round.", cooldown)
+                    await self.pause(CFG.fetch_every)
+                    continue
 
                 if len(history) < CFG.min_history:
                     await self.pause(CFG.fetch_every)
@@ -879,7 +887,10 @@ class Runtime:
     async def health(self, request):
         age = time.time() - self.last_fetch if self.last_fetch else None
         healthy = age is not None and age < 90
-        return web.json_response({"status": "ok" if healthy else "degraded", "metrics": self.db.get("stats", {})}, status=200 if healthy else 503)
+        return web.json_response(
+            {"status": "ok" if healthy else "degraded", "metrics": self.db.get("stats", {})},
+            status=200 if healthy else 503,
+        )
 
 
 # -----------------------------
