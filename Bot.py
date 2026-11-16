@@ -38,7 +38,7 @@ class Config:
         ).split(",")
         if x.strip()
     )
-    db_path: str = os.getenv("DB_PATH", "predictor_v5.db")
+    db_path: str = os.getenv("DB_PATH", "predictor_fv5.db")
     port: int = int(os.getenv("PORT", "8080"))
     fetch_every: float = float(os.getenv("FETCH_EVERY", "3"))
     timeout: float = 15.0
